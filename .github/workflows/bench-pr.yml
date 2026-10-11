@@ -1,0 +1,180 @@
+# Compare pull request benchmarks against the main-branch baseline with
+# Bencher, post the results as a PR comment and fail on regressions.
+# Setup: docs/development.md#continuous-benchmarking-bencher
+name: Benchmarks (PR)
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, edited]
+    paths:
+      - "**.rs"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".cargo/**"
+      - "scripts/bench-*.sh"
+      - "tests/test_bencher_baseline.py"
+      - ".github/workflows/bench-*.yml"
+
+concurrency:
+  # Metadata edits must not cancel an in-flight benchmark run.
+  group: ${{ github.workflow }}-${{ github.event.action == 'edited' && github.event.changes.base == null && github.run_id || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_INCREMENTAL: 0
+  RUST_MIN_STACK: 8388608
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    # Retargeting changes the baseline; title/body edits do not.
+    if: github.event.action != 'edited' || github.event.changes.base != null
+    runs-on: ubuntu-latest
+    outputs:
+      enabled: ${{ steps.check.outputs.enabled }}
+    steps:
+      - name: Check Bencher configuration
+        id: check
+        env:
+          BENCHER_SECRET: ${{ secrets.BENCHER_API_TOKEN }}
+          BENCHER_PROJECT: ${{ vars.BENCHER_PROJECT }}
+        run: |
+          if [ -n "$BENCHER_SECRET" ] && [ -n "$BENCHER_PROJECT" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::Bencher publishing is disabled (BENCHER_API_TOKEN secret or BENCHER_PROJECT variable missing); benchmarks and offline report checks still run."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  benchmark:
+    name: Benchmarks (${{ matrix.suite }})
+    needs: gate
+    env:
+      # Gungraun requires symbols; only Divan can omit debuginfo.
+      CARGO_PROFILE_BENCH_DEBUG: ${{ matrix.suite == 'callgrind' && '2' || '0' }}
+    # DO NOT REMOVE: secrets are unavailable to fork PRs, and a fork PR must
+    # never run with write permissions. See Bencher's fork PR guidance first.
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      checks: write # Bencher reports results as a GitHub Check
+      pull-requests: write # Bencher posts the results as a PR comment
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - suite: divan
+            adapter: json
+            output: bench-divan.json
+          - suite: callgrind
+            adapter: rust_gungraun
+            output: bench-callgrind.txt
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+      - name: Read Rust toolchain
+        id: rust-toolchain
+        run: |
+          channel="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
+          if [ -z "$channel" ]; then
+            echo "Could not read channel from rust-toolchain.toml" >&2
+            exit 1
+          fi
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: ${{ steps.rust-toolchain.outputs.channel }}
+      - name: Install mold and valgrind
+        env:
+          SUITE: ${{ matrix.suite }}
+        run: |
+          packages=(mold)
+          if [ "$SUITE" = callgrind ]; then
+            packages+=(valgrind)
+          fi
+          sudo apt-get update && sudo apt-get install -y "${packages[@]}"
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: bench-${{ matrix.suite }}
+          prefix-key: bench-${{ runner.os }}-rust-${{ hashFiles('rust-toolchain.toml') }}-
+          cache-on-failure: true
+      - name: Read gungraun version
+        if: matrix.suite == 'callgrind'
+        id: gungraun
+        run: |
+          version="$(awk '/^name = "gungraun"$/ { getline; gsub(/"/, "", $3); print $3; exit }' Cargo.lock)"
+          if [ -z "$version" ]; then
+            echo "Could not read gungraun version from Cargo.lock" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Install gungraun-runner
+        if: matrix.suite == 'callgrind'
+        uses: taiki-e/install-action@7a79fe8c3a13344501c80d99cae481c1c9085912 # v2
+        with:
+          tool: gungraun-runner@${{ steps.gungraun.outputs.version }}
+
+      - name: Run benchmarks
+        env:
+          SUITE: ${{ matrix.suite }}
+          OUTPUT: ${{ matrix.output }}
+        run: bash scripts/bench-ci.sh "$SUITE" "$OUTPUT"
+
+      - uses: bencherdev/bencher@f80847436d7157936b40525db4c2a1064124f04a # v0.6.13
+      # Dry-run checks CLI/report construction, not server-side adapter parsing.
+      - name: Check Bencher report construction without credentials
+        env:
+          ADAPTER: ${{ matrix.adapter }}
+          OUTPUT: ${{ matrix.output }}
+        run: |
+          env -u BENCHER_API_TOKEN -u BENCHER_API_KEY bencher run \
+            --dry-run --project validate --adapter "$ADAPTER" --file "$OUTPUT"
+
+      - name: Archive benchmark results
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: bench-${{ matrix.suite }}
+          path: ${{ matrix.output }}
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Track PR benchmarks with Bencher
+        if: needs.gate.outputs.enabled == 'true'
+        env:
+          BENCHER_SECRET: ${{ secrets.BENCHER_API_TOKEN }}
+          BENCHER_PROJECT: ${{ vars.BENCHER_PROJECT }}
+          GITHUB_TOKEN: ${{ github.token }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          SUITE: ${{ matrix.suite }}
+          ADAPTER: ${{ matrix.adapter }}
+          OUTPUT: ${{ matrix.output }}
+        # Each suite owns its branch so parallel resets cannot erase results
+        # from the other suite. Thresholds come from bench-main.yml.
+        run: |
+          # Accept either a current API key (bencher_*) or a legacy JWT token.
+          case "$BENCHER_SECRET" in
+            bencher_*) export BENCHER_API_KEY="$BENCHER_SECRET" ;;
+            *) export BENCHER_API_TOKEN="$BENCHER_SECRET" ;;
+          esac
+          bash scripts/bench-require-baseline.sh "$BENCHER_PROJECT" "$GITHUB_BASE_REF" "$BASE_SHA" "$ADAPTER"
+          bencher run \
+            --project "$BENCHER_PROJECT" \
+            --branch "$GITHUB_HEAD_REF/$SUITE" \
+            --start-point "$GITHUB_BASE_REF" \
+            --start-point-hash "$BASE_SHA" \
+            --start-point-clone-thresholds \
+            --start-point-reset \
+            --testbed ubuntu-latest \
+            --adapter "$ADAPTER" \
+            --file "$OUTPUT" \
+            --error-on-alert \
+            --ci-id "$SUITE" \
+            --github-actions "$GITHUB_TOKEN"
