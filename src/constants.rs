@@ -169,6 +169,14 @@ pub mod pool {
     /// Connection pool timeout for getting a connection
     pub const GET_TIMEOUT_SECS: u64 = 5;
 
+    /// Longest a per-command request waits for a pooled backend connection.
+    ///
+    /// A backend whose pool can't hand out a connection (every login refused,
+    /// or saturated) must not hold the request forever: after this long the
+    /// backend is skipped for the request and routing moves on, so a missing
+    /// article still gets its 430 promptly.
+    pub const PER_COMMAND_CHECKOUT_TIMEOUT: Duration = Duration::from_secs(3);
+
     /// Buffer size for TCP peek during health checks
     /// Only 1 byte needed to detect if connection is readable/closed
     pub const TCP_PEEK_BUFFER_SIZE: usize = 1;

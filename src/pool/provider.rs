@@ -556,6 +556,27 @@ impl DeadpoolConnectionProvider {
     /// # Errors
     /// Returns [`crate::connection_error::ConnectionError`] when no healthy backend
     /// connection can be acquired.
+    /// Like [`Self::checkout_connection_guard`], but gives up after `limit`.
+    ///
+    /// # Errors
+    /// Returns [`crate::connection_error::ConnectionError::PoolExhausted`] when
+    /// no connection becomes available within `limit`, or the checkout error.
+    pub async fn checkout_connection_guard_within(
+        &self,
+        limit: std::time::Duration,
+    ) -> Result<
+        crate::pool::connection_guard::IdleConnection,
+        crate::connection_error::ConnectionError,
+    > {
+        match tokio::time::timeout(limit, self.checkout_connection_guard()).await {
+            Ok(result) => result,
+            Err(_elapsed) => Err(crate::connection_error::ConnectionError::PoolExhausted {
+                backend: self.name.to_string(),
+                max_size: self.pool.status().max_size,
+            }),
+        }
+    }
+
     pub async fn checkout_connection_guard(
         &self,
     ) -> Result<
