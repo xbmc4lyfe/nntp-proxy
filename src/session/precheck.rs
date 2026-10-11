@@ -217,7 +217,8 @@ async fn query_backend(
 ///
 /// A backend that never answers must not stall the whole racing query, which
 /// waits for every backend in a tier before it can report an article missing.
-/// A timeout is a transport error (inconclusive), never a missing fact.
+/// A timeout is a transport error (`Err`, so the caller retries on a fresh
+/// connection once), never a missing fact.
 async fn bounded_backend_query(
     deps: &OwnedDeps,
     provider: &crate::pool::DeadpoolConnectionProvider,
@@ -229,7 +230,7 @@ async fn bounded_backend_query(
         execute_backend_query(deps, provider, backend, request),
     )
     .await
-    .unwrap_or(Ok(QueryAttemptResult::Error))
+    .unwrap_or(Err(()))
 }
 
 /// Execute a single backend query attempt
