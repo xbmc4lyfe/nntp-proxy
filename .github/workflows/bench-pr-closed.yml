@@ -1,0 +1,44 @@
+# Archive a pull request's Bencher branch once the PR is closed so the
+# project's branch list only holds open work.
+name: Benchmarks (PR closed)
+
+on:
+  pull_request:
+    types: [closed]
+
+permissions:
+  contents: read
+
+jobs:
+  archive:
+    # DO NOT REMOVE: see the fork PR note in bench-pr.yml.
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check Bencher configuration
+        id: check
+        env:
+          BENCHER_SECRET: ${{ secrets.BENCHER_API_TOKEN }}
+          BENCHER_PROJECT: ${{ vars.BENCHER_PROJECT }}
+        run: |
+          if [ -n "$BENCHER_SECRET" ] && [ -n "$BENCHER_PROJECT" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::Bencher is not configured; nothing to archive."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          fi
+      - if: steps.check.outputs.enabled == 'true'
+        uses: bencherdev/bencher@f80847436d7157936b40525db4c2a1064124f04a # v0.6.13
+      - name: Archive the PR branch with Bencher
+        if: steps.check.outputs.enabled == 'true'
+        # Cleanup only: a PR that never ran benchmarks has no branch to archive.
+        continue-on-error: true
+        env:
+          BENCHER_SECRET: ${{ secrets.BENCHER_API_TOKEN }}
+          BENCHER_PROJECT: ${{ vars.BENCHER_PROJECT }}
+        run: |
+          case "$BENCHER_SECRET" in
+            bencher_*) export BENCHER_API_KEY="$BENCHER_SECRET" ;;
+            *) export BENCHER_API_TOKEN="$BENCHER_SECRET" ;;
+          esac
+          bencher archive --project "$BENCHER_PROJECT" --branch "$GITHUB_HEAD_REF"

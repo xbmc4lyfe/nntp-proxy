@@ -149,6 +149,59 @@ When you want fresh numbers:
 
 Do not treat old README benchmark values as current project guarantees.
 
+### Continuous benchmarking (Bencher)
+
+CI tracks a hot-path benchmark subset with [Bencher](https://bencher.dev).
+`scripts/bench-ci.sh` defines the subset and runs it as two suites:
+
+- `divan`: wall-clock Divan benches for multiline framing, retained buffers,
+  client STAT, backend selection, yEnc line decoding, request classification and
+  the cache. The script converts Divan's output to Bencher Metric Format JSON,
+  because Bencher has no Divan adapter. Bencher tracks the median as the
+  `latency` Measure.
+- `callgrind`: the Gungraun benches (`*_callgrind`), tracked as `instructions`
+  and the other Callgrind Measures. Instruction counts don't depend on runner
+  noise, so this suite gates small regressions reliably.
+
+Workflows:
+
+- `bench-main.yml` runs on pushes to `main` and records the baseline. It sets
+  the Thresholds: a t-test on `latency` (upper boundary 0.999, at least 8 main
+  results before it alerts) and a 2% `percentage` limit on `instructions`.
+- `bench-pr.yml` runs on same-repository pull requests. It compares each
+  suite against the `main` result at the PR's base commit, posts a
+  `Bencher Report (divan)` / `Bencher Report (callgrind)` comment and check,
+  and fails when a Threshold raises an Alert.
+- `bench-pr-closed.yml` archives the PR's Bencher branch when the PR closes.
+
+These workflows skip themselves until the repository has both settings below.
+To turn them on:
+
+1. Create a project on [bencher.dev](https://bencher.dev/console) or on a
+   self-hosted Bencher server. To use a self-hosted server, add
+   `BENCHER_HOST` to the `bencher` steps' environment.
+2. Create a user API key under **Keys** in the Bencher console. A
+   project-scoped `bencher_run_*` key can upload results but might not be
+   allowed to archive branches.
+3. Store the key and the project slug in GitHub:
+
+   ```bash
+   gh secret set BENCHER_API_TOKEN -R xbmc4lyfe/nntp-proxy
+   gh variable set BENCHER_PROJECT -R xbmc4lyfe/nntp-proxy --body <project-slug>
+   ```
+
+4. Run **Benchmarks (main)** once (`gh workflow run bench-main.yml -R
+   xbmc4lyfe/nntp-proxy`) so pull requests have a baseline. The latency
+   t-test starts alerting after 8 `main` results; the instruction limit starts
+   after the first.
+
+To run a suite locally (the `callgrind` suite needs Linux, valgrind and the
+`gungraun-runner` version that matches `Cargo.lock`):
+
+```bash
+bash scripts/bench-ci.sh divan bench-divan.json
+```
+
 ## Manual smoke test
 
 ```bash
