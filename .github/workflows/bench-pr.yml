@@ -43,7 +43,7 @@ jobs:
           BENCHER_SECRET: ${{ secrets.BENCHER_API_TOKEN }}
           BENCHER_PROJECT: ${{ vars.BENCHER_PROJECT }}
         run: |
-          if [ -n "$BENCHER_SECRET" ] && [ -n "$BENCHER_PROJECT" ]; then
+          if true; then # TEMP-VALIDATION
             echo "enabled=true" >> "$GITHUB_OUTPUT"
           else
             echo "::notice::Bencher is not configured (BENCHER_API_TOKEN secret or BENCHER_PROJECT variable missing); skipping benchmarks."
@@ -142,7 +142,9 @@ jobs:
             bencher_*) export BENCHER_API_KEY="$BENCHER_SECRET" ;;
             *) export BENCHER_API_TOKEN="$BENCHER_SECRET" ;;
           esac
-          bencher run \
+          dry_run=() # TEMP-VALIDATION
+          if [ -z "$BENCHER_SECRET" ]; then dry_run=(--dry-run); BENCHER_PROJECT=validate; fi
+          bencher run "${dry_run[@]}" \
             --project "$BENCHER_PROJECT" \
             --branch "$GITHUB_HEAD_REF" \
             --start-point "$GITHUB_BASE_REF" \
