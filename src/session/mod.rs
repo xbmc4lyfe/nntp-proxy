@@ -176,6 +176,8 @@ mod handlers;
 mod metrics_ext;
 mod mode_state;
 pub(crate) mod multiline_framing;
+#[doc(hidden)]
+pub use multiline_framing::ResponseFixture;
 #[cfg(feature = "framing-bench")]
 pub use multiline_framing::{
     benchmark_framed_cache_response, benchmark_incremental_multiline_frame,

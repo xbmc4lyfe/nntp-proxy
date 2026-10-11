@@ -60,6 +60,13 @@ selection, overview ranges, numeric and argumentless article commands retain
 their pinned provider and current article pointer. A missing article on one
 provider does not permit skipping other eligible providers in the same tier.
 
+After the pinned provider returns `430`, a TTL-valid cached response is served
+when its payload variant satisfies the requested reader command. Otherwise,
+recovery follows the same availability and tier rules. The proxy transports and
+retries metadata; it does not run a PreDB matcher. See the
+[release-matching operator guide](release-matching.md) for consumer-side evidence
+and source-access guidance.
+
 ## What per-command mode supports
 
 Per-command mode is meant for stateless operations, especially message-ID

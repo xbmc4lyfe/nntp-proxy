@@ -7,7 +7,8 @@
 
 use divan::{Bencher, black_box};
 use nntp_proxy::config::{Cache, Config, Server};
-use nntp_proxy::protocol::{RequestContext, RequestKind};
+use nntp_proxy::protocol::{RequestContext, RequestKind, StatusCode};
+use nntp_proxy::session::ResponseFixture;
 use nntp_proxy::types::{CacheCapacity, MaxConnections, Port};
 use nntp_proxy::{NntpProxy, RoutingMode};
 use std::sync::Arc;
@@ -70,12 +71,17 @@ fn metadata_only_cache() -> Cache {
 }
 
 fn spawn_backend(listener: TcpListener, response: Arc<[u8]>) {
+    let group_response: Arc<[u8]> =
+        ResponseFixture::status(StatusCode::new(211), "1 42 42 alt.test")
+            .wire()
+            .into();
     tokio::spawn(async move {
         loop {
             let Ok((stream, _)) = listener.accept().await else {
                 break;
             };
             let response = Arc::clone(&response);
+            let group_response = Arc::clone(&group_response);
             tokio::spawn(async move {
                 let (read_half, mut write_half) = stream.into_split();
                 let mut reader = BufReader::new(read_half);
@@ -106,7 +112,7 @@ fn spawn_backend(listener: TcpListener, response: Arc<[u8]>) {
                     } else if RequestContext::parse(bytes)
                         .is_some_and(|request| request.kind() == RequestKind::Group)
                     {
-                        write_half.write_all(b"211 1 42 42 alt.test\r\n").await
+                        write_half.write_all(&group_response).await
                     } else if bytes.starts_with(b"DATE") {
                         write_half.write_all(b"111 20260503120000\r\n").await
                     } else if bytes.starts_with(b"QUIT") {
@@ -154,19 +160,23 @@ struct BenchProxy {
 
 impl BenchProxy {
     async fn start_reader(body_len: usize, enabled: bool, primary_miss: bool) -> Self {
-        let response: Arc<[u8]> = format!(
-            "220 0 {MSG_ID}\r\nSubject: Reader metadata\r\n\r\n{}\r\n.\r\n",
-            "x".repeat(body_len)
-        )
-        .into_bytes()
-        .into();
+        let response: Arc<[u8]> = ResponseFixture::reader(RequestKind::Article, 0, MSG_ID)
+            .header("Subject", "Reader metadata")
+            .body(vec![b'x'; body_len])
+            .wire()
+            .into();
         let primary = bind_localhost().await;
         let primary_port = primary.local_addr().unwrap().port();
         let mut config = bench_config(primary_port, None);
         config.servers[0].max_connections = MaxConnections::try_new(1).unwrap();
         config.routing.reader_message_id_failover = enabled;
         if primary_miss {
-            spawn_backend(primary, Arc::from(b"430 Missing primary\r\n".as_slice()));
+            spawn_backend(
+                primary,
+                ResponseFixture::status(StatusCode::new(430), "Missing primary")
+                    .wire()
+                    .into(),
+            );
             let secondary = TcpListener::bind("127.0.0.2:0").await.unwrap();
             config.servers.push(
                 Server::builder(
@@ -193,7 +203,10 @@ impl BenchProxy {
         read_line(&mut stream, &mut status).await;
         stream.write_all(b"GROUP alt.test\r\n").await.unwrap();
         read_line(&mut stream, &mut status).await;
-        assert_eq!(status, b"211 1 42 42 alt.test\r\n");
+        ResponseFixture::status(StatusCode::new(211), "1 42 42 alt.test")
+            .assert_received(&mut status.as_slice())
+            .await
+            .unwrap();
         Self {
             stream,
             response_buffer: vec![0; body_len * 2 + 1024].into_boxed_slice(),

@@ -20,6 +20,174 @@ const DOT_TERMINATOR: &[u8; 3] = b".\r\n";
 const TERMINATOR_TAIL_SIZE: usize = 4;
 const MAX_CAPTURED_MULTILINE_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 
+/// Framer-owned fixtures keep tests and benchmarks independent of wire boundaries.
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct ResponseFixture {
+    status: FixtureStatus,
+    detail: String,
+    kind: Option<crate::protocol::RequestKind>,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+}
+
+#[derive(Clone)]
+enum FixtureStatus {
+    Valid(crate::protocol::StatusCode),
+    Malformed,
+}
+
+impl ResponseFixture {
+    #[must_use]
+    pub fn status(status: crate::protocol::StatusCode, detail: impl Into<String>) -> Self {
+        Self {
+            status: FixtureStatus::Valid(status),
+            detail: detail.into(),
+            kind: None,
+            headers: Vec::new(),
+            body: Vec::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn malformed_status(detail: impl Into<String>) -> Self {
+        Self {
+            status: FixtureStatus::Malformed,
+            detail: detail.into(),
+            kind: None,
+            headers: Vec::new(),
+            body: Vec::new(),
+        }
+    }
+
+    /// Reader success variants select their own status and response shape.
+    #[must_use]
+    pub fn reader(kind: crate::protocol::RequestKind, number: u64, id: &str) -> Self {
+        use crate::protocol::RequestKind;
+        let code = match kind {
+            RequestKind::Article => 220,
+            RequestKind::Head => 221,
+            RequestKind::Body => 222,
+            RequestKind::Stat => 223,
+            _ => panic!("fixture requires a reader verb"),
+        };
+        crate::types::MessageId::from_borrowed(id).expect("fixture message-ID is valid");
+        Self {
+            kind: Some(kind),
+            ..Self::status(
+                crate::protocol::StatusCode::new(code),
+                format!("{number} {id}"),
+            )
+        }
+    }
+
+    #[must_use]
+    pub fn header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.headers.push((name.into(), value.into()));
+        self
+    }
+
+    #[must_use]
+    /// Accept semantic body bytes; the renderer stuffs line-leading dots.
+    /// Existing line endings are retained and a final CRLF is added when absent.
+    pub fn body(mut self, content: impl AsRef<[u8]>) -> Self {
+        self.body = content.as_ref().to_vec();
+        self
+    }
+
+    /// This is fixture data, not a framed/validated ownership capability.
+    #[must_use]
+    pub fn wire(&self) -> Vec<u8> {
+        use crate::protocol::RequestKind;
+        let mut bytes = match self.status {
+            FixtureStatus::Valid(status) => {
+                format!("{} {}\r\n", status.as_u16(), self.detail).into_bytes()
+            }
+            FixtureStatus::Malformed => format!("{}\r\n", self.detail).into_bytes(),
+        };
+        if matches!(self.kind, Some(RequestKind::Article | RequestKind::Head)) {
+            for (name, value) in &self.headers {
+                bytes.extend_from_slice(format!("{name}: {value}\r\n").as_bytes());
+            }
+        }
+        if self.kind == Some(RequestKind::Article) {
+            bytes.extend_from_slice(b"\r\n");
+        }
+        if matches!(self.kind, Some(RequestKind::Article | RequestKind::Body))
+            && !self.body.is_empty()
+        {
+            let mut at_line_start = true;
+            for &byte in &self.body {
+                if at_line_start && byte == b'.' {
+                    bytes.push(b'.');
+                }
+                bytes.push(byte);
+                at_line_start = byte == b'\n';
+            }
+            if !self.body.ends_with(b"\r\n") {
+                bytes.extend_from_slice(b"\r\n");
+            }
+        }
+        if matches!(
+            self.kind,
+            Some(RequestKind::Article | RequestKind::Head | RequestKind::Body)
+        ) {
+            bytes.extend_from_slice(DOT_TERMINATOR);
+        }
+        bytes
+    }
+
+    #[must_use]
+    pub fn wire_len(&self) -> usize {
+        self.wire().len()
+    }
+
+    pub async fn assert_status_received<R: tokio::io::AsyncRead + Unpin>(
+        &self,
+        reader: &mut R,
+    ) -> anyhow::Result<()> {
+        use tokio::io::AsyncReadExt;
+        let expected = self.wire();
+        let end = status_line_len(&expected).expect("fixture has a status line");
+        let mut actual = Vec::new();
+        loop {
+            anyhow::ensure!(
+                actual.len() < crate::constants::buffer::COMMAND,
+                "fixture status exceeds limit"
+            );
+            let mut byte = [0];
+            reader.read_exact(&mut byte).await?;
+            actual.push(byte[0]);
+            if status_line_len(&actual).is_some() {
+                break;
+            }
+        }
+        anyhow::ensure!(
+            actual == expected[..end],
+            "unexpected fixture status: {}",
+            String::from_utf8_lossy(&actual)
+        );
+        Ok(())
+    }
+
+    pub async fn assert_received<R: tokio::io::AsyncRead + Unpin>(
+        &self,
+        reader: &mut R,
+    ) -> anyhow::Result<()> {
+        use tokio::io::AsyncReadExt;
+        self.assert_status_received(reader).await?;
+        let expected = self.wire();
+        let end = status_line_len(&expected).expect("fixture has a status line");
+        let mut actual = vec![0; expected.len() - end];
+        reader.read_exact(&mut actual).await?;
+        anyhow::ensure!(
+            actual == expected[end..],
+            "fixture response content differs"
+        );
+        Ok(())
+    }
+}
+
 static TERMINATOR_FINDER: LazyLock<memchr::memmem::Finder<'static>> =
     LazyLock::new(|| memchr::memmem::Finder::new(TERMINATOR));
 
@@ -2753,6 +2921,52 @@ mod tests {
     use std::task::{Context, Poll};
     use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    #[test]
+    fn response_fixture_preserves_exact_reader_shapes() {
+        use crate::protocol::RequestKind;
+        let id = "<Case@Example.COM>";
+        for (kind, expected) in [
+            (RequestKind::Body, b"222 0 <Case@Example.COM>\r\noriginal body\r\n.\r\n".as_slice()),
+            (RequestKind::Head, b"221 0 <Case@Example.COM>\r\nSubject: Original title\r\n.\r\n"),
+            (RequestKind::Article, b"220 0 <Case@Example.COM>\r\nSubject: Original title\r\n\r\noriginal body\r\n.\r\n"),
+            (RequestKind::Stat, b"223 0 <Case@Example.COM>\r\n"),
+        ] {
+            let fixture = ResponseFixture::reader(kind, 0, id).header("Subject", "Original title").body("original body");
+            assert_eq!(fixture.wire(), expected);
+            assert_eq!(fixture.wire_len(), expected.len());
+        }
+        assert_eq!(
+            ResponseFixture::status(crate::protocol::StatusCode::new(430), "Missing").wire(),
+            b"430 Missing\r\n"
+        );
+        assert_eq!(
+            ResponseFixture::reader(RequestKind::Body, 0, id).wire(),
+            b"222 0 <Case@Example.COM>\r\n.\r\n"
+        );
+    }
+
+    #[test]
+    fn response_fixture_stuffs_semantic_body_dot_lines() {
+        let fixture =
+            ResponseFixture::reader(crate::protocol::RequestKind::Body, 0, "<fixture@reader>")
+                .body(b".first\r\n.second");
+        assert_eq!(
+            fixture.wire(),
+            b"222 0 <fixture@reader>\r\n..first\r\n..second\r\n.\r\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn response_fixture_reader_rejects_wrong_status_and_payload() {
+        let fixture =
+            ResponseFixture::reader(crate::protocol::RequestKind::Body, 0, "<fixture@reader>")
+                .body("expected");
+        let mut wrong_status = &b"430 Missing\r\n"[..];
+        assert!(fixture.assert_received(&mut wrong_status).await.is_err());
+        let mut wrong_body = &b"222 0 <fixture@reader>\r\nunwanted\r\n.\r\n"[..];
+        assert!(fixture.assert_received(&mut wrong_body).await.is_err());
+    }
 
     #[test]
     fn reader_failover_preserves_fragmented_invalid_status_bytes() {

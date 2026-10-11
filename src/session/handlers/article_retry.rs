@@ -59,23 +59,49 @@ impl ClientSession {
         let message_id = request
             .message_id_value()
             .expect("framer retry belongs to a validated message-ID lookup");
-        let mut availability = self
-            .cache
-            .get_request_message_id(request.message_id().unwrap())
-            .await
-            .map(|entry| entry.to_availability())
-            .unwrap_or_default();
         let slot = router.availability_slot(pinned_backend).ok_or_else(|| {
             SessionError::Backend(anyhow::anyhow!("pinned backend has no availability slot"))
         })?;
-        availability.record_missing_slot(slot);
         self.cache
             .record_availability_missing(message_id, slot)
             .await;
         self.metrics.record_error_4xx(pinned_backend);
+        // Fetch after mutation so an expired payload cannot be rescued by a
+        // stale clone, and partial-hit facts retain the pinned provider's miss.
+        let cached = self
+            .cache
+            .get_request_message_id(request.message_id().unwrap())
+            .await;
+        let mut availability = cached
+            .as_ref()
+            .map(crate::cache::CachedArticle::to_availability)
+            .unwrap_or_default();
+        availability.record_missing_slot(slot);
+        let mut backend_to_client_bytes = BackendToClientBytes::zero();
+        if self.cache.stores_payload_responses()
+            && matches!(
+                self.try_serve_from_cached(
+                    request,
+                    router,
+                    client_writer,
+                    &mut backend_to_client_bytes,
+                    cached
+                )
+                .await?,
+                CacheLookupResult::Hit
+            )
+        {
+            // The stateful caller merges already-reported transfers. Cache
+            // writes have no provider and must report the user's receipt here.
+            self.metrics
+                .user_bytes_received(self.username(), backend_to_client_bytes.as_u64());
+            return Ok(crate::types::TransferMetrics {
+                client_to_backend: ClientToBackendBytes::zero(),
+                backend_to_client: backend_to_client_bytes,
+            });
+        }
         let mut backend_connection = BatchBackendConnection::default();
         let mut client_to_backend_bytes = ClientToBackendBytes::zero();
-        let mut backend_to_client_bytes = BackendToClientBytes::zero();
         let result = self
             .execute_article_retry_loop(
                 router,
