@@ -75,6 +75,9 @@ fn spawn_backend(listener: TcpListener, response: Arc<[u8]>) {
         ResponseFixture::status(StatusCode::new(211), "1 42 42 alt.test")
             .wire()
             .into();
+    let stat_response: Arc<[u8]> = ResponseFixture::reader(RequestKind::Stat, 0, MSG_ID)
+        .wire()
+        .into();
     tokio::spawn(async move {
         loop {
             let Ok((stream, _)) = listener.accept().await else {
@@ -82,6 +85,7 @@ fn spawn_backend(listener: TcpListener, response: Arc<[u8]>) {
             };
             let response = Arc::clone(&response);
             let group_response = Arc::clone(&group_response);
+            let stat_response = Arc::clone(&stat_response);
             tokio::spawn(async move {
                 let (read_half, mut write_half) = stream.into_split();
                 let mut reader = BufReader::new(read_half);
@@ -107,6 +111,10 @@ fn spawn_backend(listener: TcpListener, response: Arc<[u8]>) {
                     let bytes = line.as_bytes();
                     let write = if bytes.starts_with(b"ARTICLE ") {
                         write_half.write_all(&response).await
+                    } else if RequestContext::parse(bytes)
+                        .is_some_and(|request| request.kind() == RequestKind::Stat)
+                    {
+                        write_half.write_all(&stat_response).await
                     } else if bytes.starts_with(b"MODE READER") {
                         write_half.write_all(b"200 Reader mode\r\n").await
                     } else if RequestContext::parse(bytes)
@@ -159,7 +167,12 @@ struct BenchProxy {
 }
 
 impl BenchProxy {
-    async fn start_reader(body_len: usize, enabled: bool, primary_miss: bool) -> Self {
+    async fn start_reader(
+        body_len: usize,
+        enabled: bool,
+        primary_miss: bool,
+        stat_missing: u8,
+    ) -> Self {
         let response: Arc<[u8]> = ResponseFixture::reader(RequestKind::Article, 0, MSG_ID)
             .header("Subject", "Reader metadata")
             .body(vec![b'x'; body_len])
@@ -185,6 +198,7 @@ impl BenchProxy {
                 )
                 .name("reader-secondary")
                 .max_connections(MaxConnections::try_new(1).unwrap())
+                .stat_missing(stat_missing)
                 .tier(1)
                 .build()
                 .unwrap(),
@@ -326,9 +340,20 @@ fn bench_stateful_window(bencher: Bencher, body_len: usize) {
     bench_window(bencher, body_len, RoutingMode::Stateful);
 }
 
-fn bench_reader_lookup(bencher: Bencher, body_len: usize, enabled: bool, primary_miss: bool) {
+fn bench_reader_lookup(
+    bencher: Bencher,
+    body_len: usize,
+    enabled: bool,
+    primary_miss: bool,
+    stat_missing: u8,
+) {
     let rt = Builder::new_current_thread().enable_all().build().unwrap();
-    let mut proxy = rt.block_on(BenchProxy::start_reader(body_len, enabled, primary_miss));
+    let mut proxy = rt.block_on(BenchProxy::start_reader(
+        body_len,
+        enabled,
+        primary_miss,
+        stat_missing,
+    ));
     bencher
         .counter(divan::counter::BytesCount::new(body_len))
         .bench_local(|| black_box(rt.block_on(proxy.article_roundtrip())));
@@ -339,27 +364,37 @@ mod reader_message_id_failover {
 
     #[divan::bench(sample_count = 50, sample_size = 10)]
     fn default_primary_hit_64k(bencher: Bencher) {
-        bench_reader_lookup(bencher, ARTICLE_64K, false, false);
+        bench_reader_lookup(bencher, ARTICLE_64K, false, false, 0);
     }
     #[divan::bench(sample_count = 50, sample_size = 10)]
     fn enabled_primary_hit_64k(bencher: Bencher) {
-        bench_reader_lookup(bencher, ARTICLE_64K, true, false);
+        bench_reader_lookup(bencher, ARTICLE_64K, true, false, 0);
     }
     #[divan::bench(sample_count = 50, sample_size = 10)]
     fn enabled_primary_miss_64k(bencher: Bencher) {
-        bench_reader_lookup(bencher, ARTICLE_64K, true, true);
+        bench_reader_lookup(bencher, ARTICLE_64K, true, true, 0);
     }
     #[divan::bench(sample_count = 50, sample_size = 5)]
     fn default_primary_hit_788k(bencher: Bencher) {
-        bench_reader_lookup(bencher, ARTICLE_AVG_788K, false, false);
+        bench_reader_lookup(bencher, ARTICLE_AVG_788K, false, false, 0);
     }
     #[divan::bench(sample_count = 50, sample_size = 5)]
     fn enabled_primary_hit_788k(bencher: Bencher) {
-        bench_reader_lookup(bencher, ARTICLE_AVG_788K, true, false);
+        bench_reader_lookup(bencher, ARTICLE_AVG_788K, true, false, 0);
     }
     #[divan::bench(sample_count = 50, sample_size = 5)]
     fn enabled_primary_miss_788k(bencher: Bencher) {
-        bench_reader_lookup(bencher, ARTICLE_AVG_788K, true, true);
+        bench_reader_lookup(bencher, ARTICLE_AVG_788K, true, true, 0);
+    }
+
+    #[divan::bench(sample_count = 50, sample_size = 10)]
+    fn enabled_primary_miss_with_probe_64k(bencher: Bencher) {
+        bench_reader_lookup(bencher, ARTICLE_64K, true, true, 1);
+    }
+
+    #[divan::bench(sample_count = 50, sample_size = 5)]
+    fn enabled_primary_miss_with_probe_788k(bencher: Bencher) {
+        bench_reader_lookup(bencher, ARTICLE_AVG_788K, true, true, 1);
     }
 }
 

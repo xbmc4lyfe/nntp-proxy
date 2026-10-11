@@ -84,10 +84,20 @@ pub(super) enum BackendAttemptResult {
 /// Groups the mutable parameters that track retry state across
 /// multiple `try_backend_for_article` calls.
 pub(super) struct ArticleAttemptState<'a> {
+    pub request_origin: ArticleRequestOrigin,
     pub availability: &'a mut crate::cache::ArticleAvailability,
     pub client_to_backend_bytes: &'a mut ClientToBackendBytes,
     pub backend_connection: &'a mut Option<BackendLease>,
     pub unavailable_backends: &'a mut SuppressedBackends,
+}
+
+/// A pinned miss has already consumed and accounted for the frontend command.
+/// Keeping its origin explicit also distinguishes retries from cached misses
+/// encountered by a new per-command request.
+#[derive(Clone, Copy)]
+pub(super) enum ArticleRequestOrigin {
+    Frontend,
+    ReaderAfterPinnedMiss,
 }
 
 #[derive(Clone, Copy)]
@@ -147,6 +157,7 @@ pub(super) struct ResponseWriteParams<'a> {
 /// caller from pairing a response with an independently supplied status.
 #[derive(Clone, Copy)]
 pub(super) struct ResponseWriteContext<'a> {
+    request_origin: ArticleRequestOrigin,
     request: &'a RequestContext,
     article_request: Option<crate::command::ArticleLookupRequest<'a>>,
 }
@@ -471,6 +482,7 @@ impl ClientSession {
                 attempt,
                 client_writer,
                 ResponseWriteContext {
+                    request_origin: state.request_origin,
                     request,
                     article_request: crate::command::CommandHandler::article_lookup_request(
                         request,
@@ -530,10 +542,6 @@ impl ClientSession {
             return Ok(());
         }
 
-        let Some(stat_request) = Self::stat_probe_request(request) else {
-            return Ok(());
-        };
-
         let mut candidates = Vec::new();
         for tier in router.tiers() {
             for backend_id in router.backend_ids_in_tier(tier) {
@@ -557,6 +565,11 @@ impl ClientSession {
         if candidates.len() < 2 {
             return Ok(());
         }
+        // Construct the probe only when a parallel sweep will actually run.
+        // Reader retries also enter here with STAT probes disabled.
+        let Some(stat_request) = Self::stat_probe_request(request) else {
+            return Ok(());
+        };
 
         let mut probes = FuturesUnordered::new();
         for (backend_id, provider) in candidates {
@@ -905,13 +918,7 @@ impl ClientSession {
             bytes_written,
             "Backend response write complete"
         );
-        self.record_response_metrics(
-            backend_id,
-            context.request,
-            status_code,
-            context.request.request_wire_len().as_u64(),
-            bytes_written,
-        );
+        self.record_response_metrics(backend_id, context, status_code, bytes_written);
         self.release_or_reuse_connection(
             exchange.into_connection(),
             backend_id,
@@ -1443,6 +1450,7 @@ impl ClientSession {
         }
 
         let context = ResponseWriteContext {
+            request_origin: ArticleRequestOrigin::Frontend,
             request,
             article_request: crate::command::CommandHandler::article_lookup_request(request),
         };
@@ -1476,13 +1484,7 @@ impl ClientSession {
                 ),
             ));
         }
-        self.record_response_metrics(
-            backend_id,
-            request,
-            written_status_code,
-            request.request_wire_len().as_u64(),
-            bytes_written,
-        );
+        self.record_response_metrics(backend_id, context, written_status_code, bytes_written);
         let response = RequestResponseMetadata::new(
             written_status_code,
             usize::try_from(bytes_written).unwrap_or(usize::MAX).into(),
@@ -1767,12 +1769,14 @@ impl ClientSession {
     fn record_response_metrics(
         &self,
         backend_id: crate::types::BackendId,
-        request: &RequestContext,
+        context: ResponseWriteContext<'_>,
         status_code: StatusCode,
-        cmd_bytes: u64,
         resp_bytes: u64,
     ) {
         use crate::types::MetricsBytes;
+
+        let request = context.request;
+        let cmd_bytes = request.request_wire_len().as_u64();
 
         match determine_metrics_action_for_request(request, status_code) {
             MetricsAction::Error4xx => self.metrics.record_error_4xx(backend_id),
@@ -1786,7 +1790,9 @@ impl ClientSession {
         let _ =
             self.metrics
                 .record_command_execution(backend_id, cmd_bytes_metric, resp_bytes_metric);
-        self.metrics.user_bytes_sent(self.username(), cmd_bytes);
+        if matches!(context.request_origin, ArticleRequestOrigin::Frontend) {
+            self.metrics.user_bytes_sent(self.username(), cmd_bytes);
+        }
         self.metrics
             .user_bytes_received(self.username(), resp_bytes);
     }
@@ -1795,6 +1801,7 @@ impl ClientSession {
 #[cfg(test)]
 mod tests {
     use super::ArticleAttemptState;
+    use super::ArticleRequestOrigin;
     use super::AuthoritativeArticleMissing;
     use super::BackendAttemptResult;
     use super::BackendLease;
@@ -2325,6 +2332,7 @@ mod tests {
             client_to_backend_bytes: &mut client_to_backend_bytes,
             backend_connection: &mut backend_connection,
             unavailable_backends: &mut unavailable_backends,
+            request_origin: ArticleRequestOrigin::Frontend,
         };
 
         let result = tokio::time::timeout(
@@ -2373,6 +2381,7 @@ mod tests {
             client_to_backend_bytes: &mut client_to_backend_bytes,
             backend_connection: &mut backend_connection,
             unavailable_backends: &mut unavailable_backends,
+            request_origin: ArticleRequestOrigin::Frontend,
         };
 
         let result = session
@@ -2459,6 +2468,7 @@ mod tests {
             client_to_backend_bytes: &mut client_to_backend_bytes,
             backend_connection: &mut backend_connection,
             unavailable_backends: &mut unavailable_backends,
+            request_origin: ArticleRequestOrigin::Frontend,
         };
         let result = session
             .try_backend_for_article(router, &mut request, &mut client_writer, &mut state, false)
@@ -2567,6 +2577,7 @@ mod tests {
             client_to_backend_bytes: &mut client_to_backend_bytes,
             backend_connection: &mut backend_connection,
             unavailable_backends: &mut unavailable_backends,
+            request_origin: ArticleRequestOrigin::Frontend,
         };
 
         session
@@ -2623,6 +2634,7 @@ mod tests {
                         client_to_backend_bytes: &mut sent,
                         backend_connection: &mut lease,
                         unavailable_backends: &mut suppressed,
+                        request_origin: ArticleRequestOrigin::Frontend,
                     },
                     None,
                 )
@@ -2708,6 +2720,7 @@ mod tests {
             client_to_backend_bytes: &mut client_to_backend_bytes,
             backend_connection: &mut backend_connection,
             unavailable_backends: &mut unavailable_backends,
+            request_origin: ArticleRequestOrigin::Frontend,
         };
 
         session
@@ -2766,6 +2779,7 @@ mod tests {
             client_to_backend_bytes: &mut client_to_backend_bytes,
             backend_connection: &mut backend_connection,
             unavailable_backends: &mut unavailable_backends,
+            request_origin: ArticleRequestOrigin::Frontend,
         };
 
         tokio::time::timeout(
@@ -3097,6 +3111,7 @@ mod tests {
                     client_to_backend_bytes: &mut sent,
                     backend_connection: &mut lease,
                     unavailable_backends: &mut suppressed,
+                    request_origin: ArticleRequestOrigin::Frontend,
                 },
                 prefetch,
             )
@@ -3166,6 +3181,7 @@ mod tests {
                     client_to_backend_bytes: &mut sent,
                     backend_connection: &mut lease,
                     unavailable_backends: &mut suppressed,
+                    request_origin: ArticleRequestOrigin::Frontend,
                 },
                 Some(prefetch),
             ),
@@ -3414,6 +3430,7 @@ mod tests {
             client_to_backend_bytes: &mut client_to_backend_bytes,
             backend_connection: &mut backend_connection,
             unavailable_backends: &mut unavailable_backends,
+            request_origin: ArticleRequestOrigin::Frontend,
         };
 
         let result = session
@@ -3490,6 +3507,7 @@ mod tests {
             client_to_backend_bytes: &mut client_to_backend_bytes,
             backend_connection: &mut backend_connection,
             unavailable_backends: &mut unavailable_backends,
+            request_origin: ArticleRequestOrigin::Frontend,
         };
 
         let result = tokio::time::timeout(
@@ -3534,6 +3552,7 @@ mod tests {
             client_to_backend_bytes: &mut client_to_backend_bytes,
             backend_connection: &mut backend_connection,
             unavailable_backends: &mut unavailable_backends,
+            request_origin: ArticleRequestOrigin::Frontend,
         };
 
         let result = tokio::time::timeout(
@@ -3591,6 +3610,7 @@ mod tests {
             client_to_backend_bytes: &mut client_to_backend_bytes,
             backend_connection: &mut backend_connection,
             unavailable_backends: &mut unavailable_backends,
+            request_origin: ArticleRequestOrigin::Frontend,
         };
 
         let first = session
@@ -3659,6 +3679,7 @@ mod tests {
             client_to_backend_bytes: &mut client_to_backend_bytes,
             backend_connection: &mut backend_connection,
             unavailable_backends: &mut unavailable_backends,
+            request_origin: ArticleRequestOrigin::Frontend,
         };
 
         let first = session
@@ -3774,6 +3795,7 @@ mod tests {
             client_to_backend_bytes: &mut client_to_backend_bytes,
             backend_connection: &mut backend_connection,
             unavailable_backends: &mut unavailable_backends,
+            request_origin: ArticleRequestOrigin::Frontend,
         };
 
         for (index, expected_mask) in [0b0000_0001, 0b0000_0011].into_iter().enumerate() {
@@ -3847,6 +3869,7 @@ mod tests {
                 &mut client_write,
                 ResponseWriteContext {
                     request: &request,
+                    request_origin: ArticleRequestOrigin::Frontend,
                     article_request: None,
                 },
                 None,
@@ -3944,6 +3967,7 @@ mod tests {
                 &mut client_write,
                 ResponseWriteContext {
                     request: &request,
+                    request_origin: ArticleRequestOrigin::Frontend,
                     article_request: crate::command::CommandHandler::article_lookup_request(
                         &request,
                     ),
@@ -4009,6 +4033,7 @@ mod tests {
                 &mut client_write,
                 ResponseWriteContext {
                     request: &request,
+                    request_origin: ArticleRequestOrigin::Frontend,
                     article_request: None,
                 },
                 None,

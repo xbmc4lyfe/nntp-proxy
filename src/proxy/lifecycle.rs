@@ -320,12 +320,8 @@ impl NntpProxy {
                     &m,
                 );
 
-                if let Some(bid) = backend_id {
-                    self.metrics
-                        .record_client_to_backend_bytes_for(bid, m.client_to_backend.as_u64());
-                    self.metrics
-                        .record_backend_to_client_bytes_for(bid, m.backend_to_client.as_u64());
-                }
+                // Successful loops already report provider byte deltas. The
+                // final transfer is for logging, not a second provider charge.
                 Ok(())
             }
             Err(e) => {

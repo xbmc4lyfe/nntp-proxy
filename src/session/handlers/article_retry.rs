@@ -15,7 +15,8 @@ use crate::session::handlers::cache_operations::{
     CacheLookupResult, write_cached_article_response,
 };
 use crate::session::handlers::command_execution::{
-    ArticleAttemptState, AuthoritativeArticleMissing, BackendAttemptResult, StatPrefetch,
+    ArticleAttemptState, ArticleRequestOrigin, AuthoritativeArticleMissing, BackendAttemptResult,
+    StatPrefetch,
 };
 use crate::types::{BackendToClientBytes, ClientToBackendBytes};
 use anyhow::Result;
@@ -28,6 +29,7 @@ use crate::session::precheck;
 
 /// Client-side write state shared across cache, precheck, and direct routing paths.
 pub(super) struct RequestExecutionIo<'a, W> {
+    pub(super) request_origin: ArticleRequestOrigin,
     pub(super) client_writer: &'a mut W,
     pub(super) backend_connection: &'a mut Option<BackendLease>,
     pub(super) client_to_backend_bytes: &'a mut ClientToBackendBytes,
@@ -109,6 +111,7 @@ impl ClientSession {
                 Some(availability),
                 None,
                 &mut RequestExecutionIo {
+                    request_origin: ArticleRequestOrigin::ReaderAfterPinnedMiss,
                     client_writer,
                     backend_connection: backend_connection.slot(),
                     client_to_backend_bytes: &mut client_to_backend_bytes,
@@ -145,6 +148,7 @@ impl ClientSession {
         self.log_route_request(request);
 
         let mut io = RequestExecutionIo {
+            request_origin: ArticleRequestOrigin::Frontend,
             client_writer,
             backend_connection,
             client_to_backend_bytes,
@@ -367,7 +371,10 @@ impl ClientSession {
 
         let mut availability = availability.unwrap_or_default();
         let mut unavailable_backends = SuppressedBackends::empty();
-        let mut is_retry_attempt = false;
+        let mut is_retry_attempt = matches!(
+            io.request_origin,
+            ArticleRequestOrigin::ReaderAfterPinnedMiss
+        );
         let mut retry_stat_sweep_done = false;
         trace!(
             "Client {} availability routing: missing_bits={:08b}, backend_count={}",
@@ -382,6 +389,7 @@ impl ClientSession {
                     router,
                     request,
                     &mut ArticleAttemptState {
+                        request_origin: io.request_origin,
                         availability: &mut availability,
                         client_to_backend_bytes: io.client_to_backend_bytes,
                         backend_connection: io.backend_connection,
@@ -399,6 +407,7 @@ impl ClientSession {
                     request,
                     io.client_writer,
                     &mut ArticleAttemptState {
+                        request_origin: io.request_origin,
                         availability: &mut availability,
                         client_to_backend_bytes: io.client_to_backend_bytes,
                         backend_connection: io.backend_connection,
@@ -522,7 +531,11 @@ mod tests {
         use tokio::net::TcpListener;
 
         let (probe_started, mut probes) = tokio::sync::mpsc::unbounded_channel();
-        let mut router = BackendSelector::new();
+        let mut router = BackendSelector::new().with_queue_backpressure(
+            true,
+            crate::config::QueuePressureLimits::default(),
+            60_000,
+        );
         // The framer has already proved provider 0 missing before this helper.
         router.add_backend(
             ServerName::try_new("pinned").unwrap(),
@@ -555,7 +568,18 @@ mod tests {
                                     .unwrap(),
                                 RequestKind::Stat => {
                                     signal.send(index).unwrap();
-                                    std::future::pending::<()>().await;
+                                    stream
+                                        .get_mut()
+                                        .write_all(
+                                            &crate::session::ResponseFixture::reader(
+                                                RequestKind::Stat,
+                                                0,
+                                                "<cancel@reader>",
+                                            )
+                                            .wire(),
+                                        )
+                                        .await
+                                        .unwrap();
                                 }
                                 RequestKind::Mode => stream
                                     .get_mut()
@@ -591,13 +615,24 @@ mod tests {
             .backend_provider(BackendId::from_index(1))
             .unwrap()
             .clone();
+        // Successful initial probes finish, then queue pressure on the lower
+        // tier leaves the completed secondary 430 lease cached while waiting.
+        let mut pressure_guards = Vec::new();
+        for index in 2..=3 {
+            for _ in 0..3 {
+                pressure_guards.push(BackendSelector::guard_for_manual_backend(
+                    router.clone(),
+                    BackendId::from_index(index),
+                ));
+            }
+        }
         let session = ClientSession::builder(
             ClientAddress::from("127.0.0.1:9999".parse::<std::net::SocketAddr>().unwrap()),
             BufferPool::new(BufferSize::try_new(8192).unwrap(), 4),
             Arc::new(AuthHandler::new(None, None).unwrap()),
             MetricsCollector::new(4),
         )
-        .with_router(router)
+        .with_router(router.clone())
         .with_routing_mode(RoutingMode::Hybrid)
         .build();
         let cache = session.cache.clone();
@@ -617,6 +652,34 @@ mod tests {
                 .unwrap()
                 .unwrap();
         }
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if cache
+                    .get_request_message_id("<cancel@reader>")
+                    .await
+                    .is_some_and(|entry| entry.availability().missing_bits() == 0b11)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        // Let the completed miss return into the loop's queue-pressure await.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(!retry.is_finished());
+        assert_eq!(
+            router.queue_backpressure_delay_for_article(
+                &cache
+                    .get_request_message_id("<cancel@reader>")
+                    .await
+                    .unwrap()
+                    .to_availability(),
+                crate::router::SuppressedBackends::empty(),
+            ),
+            Some(Duration::from_secs(60))
+        );
         assert_eq!(
             cache
                 .get_request_message_id("<cancel@reader>")
@@ -630,7 +693,7 @@ mod tests {
         assert_eq!(
             (cached.size, cached.available, cached.max_size),
             (1, 0, 2),
-            "secondary's completed 430 lease must still be cached during probes"
+            "secondary's completed 430 lease must stay cached during backpressure"
         );
         retry.abort();
         assert!(retry.await.unwrap_err().is_cancelled());
@@ -642,6 +705,7 @@ mod tests {
         for server in servers {
             server.abort();
         }
+        drop(pressure_guards);
     }
 
     #[tokio::test]
