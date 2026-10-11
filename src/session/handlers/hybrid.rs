@@ -174,10 +174,16 @@ impl ClientSession {
                 // Answer like stateful mode does. A silently closed socket
                 // looks like a network fault, so clients can't tell that a
                 // retry is the right response.
-                let _ = client_write
+                // A failed write means the client already left, which must be
+                // reported as a normal disconnect rather than a backend error.
+                client_write
                     .write_all(crate::protocol::BACKEND_UNAVAILABLE)
-                    .await;
-                let _ = client_write.flush().await;
+                    .await
+                    .map_err(|io| crate::session::SessionError::from(anyhow::Error::from(io)))?;
+                client_write
+                    .flush()
+                    .await
+                    .map_err(|io| crate::session::SessionError::from(anyhow::Error::from(io)))?;
                 return Err(crate::session::SessionError::from(
                     error.context("Failed to acquire backend for stateful mode"),
                 ));

@@ -25,6 +25,17 @@ impl Config {
     /// # Errors
     /// Returns an error if semantic validation fails after deserialization.
     pub fn validate(&self) -> Result<()> {
+        self.validate_for_mode(self.routing.routing_mode)
+    }
+
+    /// Validate against the routing mode the proxy actually runs with.
+    ///
+    /// Builders and command-line flags can override `routing.mode`, and the stateful
+    /// exclusion check depends on the effective mode.
+    ///
+    /// # Errors
+    /// Returns an error if semantic validation fails.
+    pub fn validate_for_mode(&self, routing_mode: super::types::RoutingMode) -> Result<()> {
         if self.servers.is_empty() {
             return Err(anyhow::anyhow!(
                 "Configuration must have at least one server"
@@ -56,7 +67,7 @@ impl Config {
             validate_server(server)?;
         }
 
-        if self.routing.routing_mode.supports_stateful_commands()
+        if routing_mode.supports_stateful_commands()
             && !self
                 .servers
                 .iter()
@@ -64,7 +75,7 @@ impl Config {
         {
             return Err(anyhow::anyhow!(
                 "routing mode \"{}\" needs at least one server with stateful_sessions = \"allowed\"",
-                self.routing.routing_mode.short_name()
+                routing_mode.short_name()
             ));
         }
 
@@ -182,6 +193,26 @@ mod tests {
             ..Default::default()
         };
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_for_mode_uses_the_effective_mode() {
+        let mut config = Config {
+            servers: vec![excluded_server("excluded")],
+            ..Default::default()
+        };
+        config.routing.routing_mode = crate::config::RoutingMode::PerCommand;
+        assert!(
+            config
+                .validate_for_mode(crate::config::RoutingMode::Stateful)
+                .is_err()
+        );
+        config.routing.routing_mode = crate::config::RoutingMode::Stateful;
+        assert!(
+            config
+                .validate_for_mode(crate::config::RoutingMode::PerCommand)
+                .is_ok()
+        );
     }
 
     #[test]

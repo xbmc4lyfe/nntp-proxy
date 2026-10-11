@@ -131,7 +131,7 @@ impl NntpProxyBuilder {
         if self.config.servers.is_empty() {
             anyhow::bail!("No servers configured in configuration");
         }
-        self.config.validate()?;
+        self.config.validate_for_mode(self.routing_mode)?;
 
         let memory = self.config.memory.clone();
         let buffer_count = self.buffer_count.unwrap_or(memory.buffer_pool_count);
