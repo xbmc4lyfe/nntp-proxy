@@ -132,8 +132,9 @@ pub mod timeout {
     pub const CONNECTION: Duration = Duration::from_secs(10);
 
     /// Timeout for adaptive precheck queries (STAT/HEAD)
-    /// If a backend doesn't respond within this time, treat as 430 (missing)
-    /// This prevents slow backends from blocking all client connections
+    /// If a backend doesn't respond within this time the attempt counts as a
+    /// transport error (inconclusive, never a 430 fact), so slow backends
+    /// cannot block all client connections
     pub const PRECHECK_QUERY: Duration = Duration::from_secs(2);
 
     /// Timeout for closing the cache during graceful shutdown
