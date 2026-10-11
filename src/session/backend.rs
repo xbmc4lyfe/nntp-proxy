@@ -257,7 +257,9 @@ pub(crate) type ProbeTimings = (u64, u64, u64);
 
 /// Account a STAT write before awaiting its reply, so cancellation cannot erase
 /// sent traffic. Framer-owned single-line length excludes any packed next reply.
-/// No frontend or command-summary counters are changed by this operation.
+/// Counts one provider command after a completed write, including requests
+/// whose replies fail or time out. Failed writes count no probe command, and
+/// no frontend counters are changed.
 pub(crate) async fn execute_stat_probe_exchange<'pool>(
     mut conn: crate::pool::ConnectionGuard,
     request: &RequestContext,
@@ -269,6 +271,7 @@ pub(crate) async fn execute_stat_probe_exchange<'pool>(
     anyhow::ensure!(request.is_stat(), "internal probe requires a STAT request");
     let start = matches!(timing, ProbeTiming::Sampled).then(std::time::Instant::now);
     request.write_wire_to(conn.stream_mut()).await?;
+    context.metrics.record_command(context.backend_id);
     context.metrics.record_client_to_backend_bytes_for(
         context.backend_id,
         request.request_wire_len().as_u64(),

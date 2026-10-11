@@ -53,6 +53,7 @@ struct ReaderBackend {
     commands: Arc<Mutex<Vec<String>>>,
     lookup: Arc<Mutex<ResponseFixture>>,
     probe: Arc<Mutex<Option<ResponseFixture>>>,
+    probe_gate: Arc<Mutex<Option<Arc<tokio::sync::Semaphore>>>>,
     task: tokio::task::AbortHandle,
 }
 impl Drop for ReaderBackend {
@@ -69,12 +70,15 @@ async fn reader_backend(host: &str, tier: u8, lookup: ResponseFixture) -> Result
     let responses = lookup.clone();
     let probe = Arc::new(Mutex::new(None::<ResponseFixture>));
     let probe_responses = probe.clone();
+    let probe_gate = Arc::new(Mutex::new(None::<Arc<tokio::sync::Semaphore>>));
+    let gates = probe_gate.clone();
     let task = tokio::spawn(async move {
         let mut clients = tokio::task::JoinSet::new();
         while let Ok((stream, _)) = listener.accept().await {
             let observed = observed.clone();
             let responses = responses.clone();
             let probe_responses = probe_responses.clone();
+            let gates = gates.clone();
             clients.spawn(async move {
                 let mut stream = BufReader::new(stream);
                 stream
@@ -90,6 +94,12 @@ async fn reader_backend(host: &str, tier: u8, lookup: ResponseFixture) -> Result
                     }
                     let command = line.trim_end();
                     observed.lock().unwrap().push(command.into());
+                    if command == "STAT <PAR2@Example.COM>" {
+                        let gate = gates.lock().unwrap().clone();
+                        if let Some(gate) = gate {
+                            gate.acquire().await.unwrap().forget();
+                        }
+                    }
                     let response = match command {
                         "GROUP alt.test" => {
                             pointer = 42;
@@ -135,6 +145,7 @@ async fn reader_backend(host: &str, tier: u8, lookup: ResponseFixture) -> Result
         commands,
         lookup,
         probe,
+        probe_gate,
         task,
     })
 }
@@ -920,10 +931,20 @@ async fn reader_retry_probes_do_not_unlock_lower_body_without_same_tier_430() ->
             &if missing {
                 metadata(RequestKind::Body)
             } else {
-                status(430, "No such article")
+                status(412, "No group peer")
             },
         )
         .await?;
+        assert_eq!(
+            peer.commands
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|command| command.as_str() == "BODY <PAR2@Example.COM>")
+                .count(),
+            usize::from(!missing),
+            "selected503 permits the original same-tier BODY but never a lower-tier BODY"
+        );
         assert_eq!(
             lower
                 .commands
@@ -977,12 +998,12 @@ async fn reader_retry_stat_lookup_does_not_probe_stat_again() -> Result<()> {
 #[tokio::test]
 async fn reader_internal_stat_traffic_is_provider_only() -> Result<()> {
     let mut body_user_commands = None;
-    for (verb, kind, stat_missing, probe_code, fetched) in [
-        ("BODY", RequestKind::Body, 1, 223, true),
-        ("ARTICLE", RequestKind::Article, 1, 430, false),
-        ("BODY", RequestKind::Body, 1, 503, true),
-        ("BODY", RequestKind::Body, 0, 430, true),
-        ("STAT", RequestKind::Stat, 1, 223, true),
+    for (verb, kind, stat_missing, probe_code, fetched, provider_commands) in [
+        ("BODY", RequestKind::Body, 1, 223, true, 3),
+        ("ARTICLE", RequestKind::Article, 1, 430, false, 1),
+        ("BODY", RequestKind::Body, 1, 503, true, 3),
+        ("BODY", RequestKind::Body, 0, 430, true, 2),
+        ("STAT", RequestKind::Stat, 1, 223, true, 2),
     ] {
         let primary = reader_backend("127.0.0.1", 0, status(430, "Missing primary")).await?;
         let mut secondary = reader_backend("127.0.0.2", 1, metadata(kind)).await?;
@@ -1006,6 +1027,12 @@ async fn reader_internal_stat_traffic_is_provider_only() -> Result<()> {
         exchange(&mut client, "QUIT", &status(205, "Goodbye")).await?;
         assert_eq!(client.read(&mut [0]).await?, 0);
         let after = proxy.metrics().snapshot(None);
+        // Retain ordinary lookup counter semantics; internal STAT adds one.
+        assert_eq!(
+            after.backend_stats[1].total_commands.get()
+                - before.backend_stats[1].total_commands.get(),
+            provider_commands
+        );
         let commands: Vec<String> = secondary
             .commands
             .lock()
@@ -1097,5 +1124,59 @@ async fn reader_internal_stat_traffic_is_provider_only() -> Result<()> {
             }
         );
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn reader_current_tier_hit_does_not_wait_for_held_lower_stat() -> Result<()> {
+    let primary = reader_backend("127.0.0.1", 0, status(430, "Missing primary")).await?;
+    let mut current = reader_backend("127.0.0.2", 0, metadata(RequestKind::Body)).await?;
+    current.config.stateful_sessions = nntp_proxy::config::StatefulSessions::Excluded;
+    current.config.stat_missing = 1;
+    *current.probe.lock().unwrap() = Some(metadata(RequestKind::Stat));
+    let mut lower = reader_backend("127.0.0.3", 1, metadata(RequestKind::Body)).await?;
+    lower.config.stateful_sessions = nntp_proxy::config::StatefulSessions::Excluded;
+    lower.config.stat_missing = 1;
+    *lower.probe.lock().unwrap() = Some(metadata(RequestKind::Stat));
+    let held_reply = Arc::new(tokio::sync::Semaphore::new(0));
+    *lower.probe_gate.lock().unwrap() = Some(held_reply.clone());
+    let (_proxy, mut client) = reader_proxy(&[&primary, &current, &lower], true).await?;
+    exchange(&mut client, "GROUP alt.test", &group()).await?;
+    send(&mut client, &format!("BODY {ID}")).await?;
+    // This is a bounded liveness guard, not a throughput threshold: the actual
+    // lower reply stays held until the complete current-tier response arrives.
+    let recovered = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        metadata(RequestKind::Body).assert_received(&mut client),
+    )
+    .await;
+    assert_eq!(held_reply.available_permits(), 0);
+    assert!(
+        matches!(recovered, Ok(Ok(()))),
+        "current-tier response waited for held lower STAT; current={:?}, lower={:?}",
+        current.commands.lock().unwrap(),
+        lower.commands.lock().unwrap()
+    );
+    held_reply.add_permits(1);
+    let current_commands: Vec<String> = current
+        .commands
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|command| command.ends_with(ID))
+        .cloned()
+        .collect();
+    assert_eq!(
+        current_commands,
+        [format!("STAT {ID}"), format!("BODY {ID}")]
+    );
+    assert!(
+        !lower
+            .commands
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|command| command == &format!("BODY {ID}"))
+    );
     Ok(())
 }

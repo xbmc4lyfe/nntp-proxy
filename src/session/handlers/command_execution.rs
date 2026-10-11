@@ -1313,7 +1313,6 @@ impl ClientSession {
                 "Running STAT miss probe before backend article fetch"
             );
 
-            self.metrics.record_command(backend_id);
             let timing = if should_sample_backend_timing() {
                 backend::ProbeTiming::Sampled
             } else {
@@ -2709,6 +2708,11 @@ mod tests {
                 let snapshot = metrics.snapshot(None);
                 for index in 0..2 {
                     assert_eq!(
+                        snapshot.backend_stats[index].total_commands.get(),
+                        1,
+                        "prefetch={prefetch}, code={code}"
+                    );
+                    assert_eq!(
                         snapshot.backend_stats[index].bytes_sent.as_u64(),
                         b"STAT <missing@example.com>\r\n".len() as u64,
                         "prefetch={prefetch}, code={code}"
@@ -2730,6 +2734,7 @@ mod tests {
                     snapshot.client_to_backend_bytes.as_u64(),
                     2 * b"STAT <missing@example.com>\r\n".len() as u64
                 );
+                assert_eq!(snapshot.total_commands(), 2);
                 assert_eq!(
                     snapshot.backend_to_client_bytes.as_u64(),
                     2 * fixture.wire_len() as u64
@@ -2820,6 +2825,7 @@ mod tests {
         attempt.abort();
         assert!(matches!(attempt.await, Err(error) if error.is_cancelled()));
         let snapshot = metrics.snapshot(None);
+        assert_eq!(snapshot.backend_stats[0].total_commands.get(), 1);
         assert_eq!(
             snapshot.backend_stats[0].bytes_sent.as_u64(),
             b"STAT <cancel@example.com>\r\n".len() as u64
@@ -2861,6 +2867,7 @@ mod tests {
             super::RetryStatProbeOutcome::Unavailable(_)
         ));
         let snapshot = metrics.snapshot(None);
+        assert_eq!(snapshot.backend_stats[0].total_commands.get(), 0);
         assert_eq!(snapshot.backend_stats[0].bytes_sent.as_u64(), 0);
         assert_eq!(snapshot.backend_stats[0].bytes_received.as_u64(), 0);
         assert_eq!(snapshot.client_to_backend_bytes.as_u64(), 0);

@@ -375,7 +375,13 @@ impl ClientSession {
             io.request_origin,
             ArticleRequestOrigin::ReaderAfterPinnedMiss
         );
-        let mut retry_stat_sweep_done = false;
+        // Reader recovery probes each selected provider before its lookup.
+        // An unrelated speculative provider must not gate a current-tier hit,
+        // even after another selected provider proves the message-ID missing.
+        let mut retry_stat_sweep_done = matches!(
+            io.request_origin,
+            ArticleRequestOrigin::ReaderAfterPinnedMiss
+        );
         trace!(
             "Client {} availability routing: missing_bits={:08b}, backend_count={}",
             self.client_addr,
@@ -530,7 +536,6 @@ mod tests {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         use tokio::net::TcpListener;
 
-        let (probe_started, mut probes) = tokio::sync::mpsc::unbounded_channel();
         let mut router = BackendSelector::new().with_queue_backpressure(
             true,
             crate::config::QueuePressureLimits::default(),
@@ -546,11 +551,9 @@ mod tests {
         for index in 1..=3 {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let port = listener.local_addr().unwrap().port();
-            let signal = probe_started.clone();
             servers.push(tokio::spawn(async move {
                 let mut clients = tokio::task::JoinSet::new();
                 while let Ok((stream, _)) = listener.accept().await {
-                    let signal = signal.clone();
                     clients.spawn(async move {
                         let mut stream = BufReader::new(stream);
                         stream.get_mut().write_all(b"200 Ready\r\n").await.unwrap();
@@ -567,7 +570,6 @@ mod tests {
                                     .await
                                     .unwrap(),
                                 RequestKind::Stat => {
-                                    signal.send(index).unwrap();
                                     stream
                                         .get_mut()
                                         .write_all(
@@ -615,8 +617,8 @@ mod tests {
             .backend_provider(BackendId::from_index(1))
             .unwrap()
             .clone();
-        // Successful initial probes finish, then queue pressure on the lower
-        // tier leaves the completed secondary 430 lease cached while waiting.
+        // Queue pressure on the lower tier leaves the completed secondary 430
+        // lease cached while waiting, without requiring speculative probes.
         let mut pressure_guards = Vec::new();
         for index in 2..=3 {
             for _ in 0..3 {
@@ -646,12 +648,6 @@ mod tests {
                 )
                 .await
         });
-        for _ in 0..2 {
-            tokio::time::timeout(Duration::from_secs(3), probes.recv())
-                .await
-                .unwrap()
-                .unwrap();
-        }
         tokio::time::timeout(Duration::from_secs(3), async {
             loop {
                 if cache
