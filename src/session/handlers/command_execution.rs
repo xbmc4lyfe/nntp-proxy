@@ -201,7 +201,7 @@ enum RetryStatProbeOutcome {
 /// Any client write failure after response ownership is established is terminal.
 ///
 /// This must retire the backend connection to prevent protocol desync from
-/// partially-written client responses.
+/// partially written client responses.
 const fn classify_response_write_err(e: std::io::Error) -> ResponseTransferError {
     ResponseTransferError::ClientWrite(e)
 }

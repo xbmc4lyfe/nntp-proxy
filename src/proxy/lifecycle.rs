@@ -332,7 +332,7 @@ impl NntpProxy {
                     self.metrics.record_error(bid);
                 }
 
-                // Only log backend errors — client disconnects are normal operation
+                // Only log backend errors—client disconnects are normal operation
                 if let SessionError::Backend(ref inner) = e {
                     warn!("Session error for client {}: {:?}", client_addr, inner);
                 }
@@ -599,7 +599,7 @@ mod tests {
         // Should not panic
         proxy.record_connection_if_unauthenticated(&session);
 
-        // Connection should be recorded (we can't easily verify without exposing internals)
+        // Connection should be recorded (this can't easily be verified without exposing internals)
     }
 
     #[test]
@@ -1025,11 +1025,11 @@ mod tests {
         };
         let proxy = NntpProxy::new_sync(config, RoutingMode::Stateful).unwrap();
 
-        // Store a very old last_activity (1ns from proxy start)
-        // Any subsequent check will see idle_duration >> 1ns timeout
+        // Store a very old last_activity (1 ns from proxy start)
+        // Any subsequent check sees idle_duration >> 1 ns timeout
         proxy.last_activity_nanos.store(1, Ordering::Relaxed);
 
-        // Give the clock at least 1ms to advance past the 1ns timeout
+        // Give the clock at least 1 ms to advance past the 1 ns timeout
         std::thread::sleep(std::time::Duration::from_millis(1));
 
         let cleared = proxy.check_and_clear_stale_pools();
@@ -1041,7 +1041,7 @@ mod tests {
         use crate::config::{Config, Server};
         use crate::types::{MaxConnections, Port};
 
-        // Only one backend with a short timeout — should clear
+        // Only one backend with a short timeout—should clear
         let config = Config {
             servers: vec![
                 Server::builder("server1.example.com", Port::try_new(119).unwrap())
@@ -1064,13 +1064,13 @@ mod tests {
         use crate::config::{Config, Server};
         use crate::types::{MaxConnections, Port};
 
-        // Only one backend with a very long timeout — should NOT clear
+        // Only one backend with a very long timeout—should NOT clear
         let config = Config {
             servers: vec![
                 Server::builder("server2.example.com", Port::try_new(119).unwrap())
                     .name("Long Timeout")
                     .max_connections(MaxConnections::try_new(2).unwrap())
-                    .backend_idle_timeout(Duration::from_secs(24 * 60 * 60)) // 24h
+                    .backend_idle_timeout(Duration::from_secs(24 * 60 * 60)) // 24 hours
                     .build()
                     .unwrap(),
             ],
@@ -1079,7 +1079,7 @@ mod tests {
         let proxy = NntpProxy::new_sync(config, RoutingMode::Stateful).unwrap();
         proxy.last_activity_nanos.store(1, Ordering::Relaxed);
 
-        // Even though activity was long ago, the 24h timeout hasn't passed
+        // Even though activity was long ago, the 24-hour timeout hasn't passed
         let cleared = proxy.check_and_clear_stale_pools();
         assert!(
             !cleared,
@@ -1092,7 +1092,7 @@ mod tests {
         use crate::config::{Config, Server};
         use crate::types::{MaxConnections, Port};
 
-        // Two backends: one exceeded, one not — returns true (something was cleared)
+        // Two backends: one exceeded, one not—returns true (something was cleared)
         let config = Config {
             servers: vec![
                 Server::builder("server1.example.com", Port::try_new(119).unwrap())

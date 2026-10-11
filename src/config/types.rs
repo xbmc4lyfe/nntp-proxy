@@ -196,7 +196,7 @@ pub struct Proxy {
     /// Validate yEnc structure and checksums (default: true)
     pub validate_yenc: bool,
     /// Filter directives for the optional local-TUI `debug.log` appender (default: "warn")
-    /// Accepts tracing filter directives: "error", "warn", "info", "debug", "trace"
+    /// Accepts tracing filter directives: `error`, `warn`, `info`, `debug`, and `trace`
     #[serde(default = "super::defaults::log_file_level")]
     pub log_file_level: String,
     /// Interval in seconds for response/hot-path metrics logging. `None` disables it.
@@ -501,7 +501,7 @@ impl std::fmt::Display for CompressionCodec {
 pub struct DiskCache {
     /// Path to disk cache directory
     ///
-    /// Directory will be created if it doesn't exist.
+    /// The directory is created if it doesn't exist.
     /// Recommended: Use a fast SSD or `NVMe` drive.
     #[serde(default = "super::defaults::disk_cache_path")]
     pub path: std::path::PathBuf,
@@ -660,10 +660,10 @@ pub struct Server {
         skip_serializing_if = "Option::is_none"
     )]
     pub connection_keepalive: Option<Duration>,
-    /// How long to wait before replacing an actively-removed connection.
+    /// How long to wait before replacing an actively removed connection.
     /// This can damp backend connection churn after repeated failures, but it
     /// also temporarily reduces pool capacity on backend-error removals.
-    /// Default: 30 seconds. Set to 0 to disable.
+    /// Default: 30 seconds. Set to 0 to turn off.
     #[serde(
         with = "option_duration_serde",
         default = "super::defaults::replacement_cooldown_option",
@@ -690,7 +690,7 @@ pub struct Server {
     #[serde(default)]
     pub stateful_sessions: StatefulSessions,
     /// Wire compression for backend connections (RFC 8054 COMPRESS DEFLATE)
-    /// None (default) = auto-detect, Some(true) = require, Some(false) = disable
+    /// None (default) = auto-detect, Some(true) = require, Some(false) = off
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compress: Option<bool>,
     /// Compression level (0-9). None = fast (level 1). Higher = better ratio, more CPU.
@@ -699,7 +699,7 @@ pub struct Server {
 
     /// Duration of proxy-wide inactivity after which this backend's idle connections are cleared.
     /// Prevents stale connections from accumulating during overnight idle periods.
-    /// Default: 600 seconds (10 minutes). Set to 0 to disable.
+    /// Default: 600 seconds (10 minutes). Set to 0 to turn off.
     #[serde(
         with = "duration_serde",
         default = "super::defaults::backend_idle_timeout"
@@ -814,7 +814,7 @@ impl ServerBuilder {
         self
     }
 
-    /// Enable/disable `STAT` pre-probe for article-missing retries.
+    /// Turns the `STAT` pre-probe for article-missing retries on or off.
     ///
     /// `0` disables probing; non-zero enables it.
     #[must_use]
@@ -897,7 +897,7 @@ impl ServerBuilder {
     ///
     /// # Panics
     ///
-    /// Panics if `level` is greater than 9.
+    /// This panics if `level` is greater than 9.
     #[must_use]
     pub fn compress_level(mut self, level: u32) -> Self {
         assert!(level <= 9, "compress_level must be 0-9, got {level}");
