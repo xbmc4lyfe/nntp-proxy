@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to this project will be documented in this file.
+All notable changes to this project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
@@ -27,7 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Added per-backend `stat_missing` retry probing, so backends that correctly answer `STAT` with `430` can help retry missing articles faster.
 - Runtime CPU pinning support is now available for multi-threaded workloads via a new `CpuPinning` runtime mode, using worker-thread startup hooks so pinned threads are the ones running proxy work.
-- Linux CPU pinning now uses [`rustix`](https://docs.rs/rustix)-based affinity handling, so we can remove the direct `nix` pinning dependency path.
+- Linux CPU pinning now uses [`rustix`](https://docs.rs/rustix)-based affinity handling, so the direct `nix` pinning dependency path can be removed.
 - Added TUI session/user-count lifecycle fixes so active sessions stay tied to the session-owned gauge instead of drifting or disappearing.
 
 ### Changed
@@ -37,9 +37,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `[routing.queue.backpressure]` in operator configuration docs.
 - Finalized v0.5.2 release metadata and config coverage, including response-write and
   client-writer lock contention interval settings.
-- Removed legacy CLI compatibility aliases and aliases that are now obsolete after the cleanup pass: `--no-tui`, `--backend-strategy`, `--cache-capacity`, `--cache-ttl`, `--ttl-secs`, `--cache-articles`, `--store-articles`, and legacy `NNTP_PROXY_CACHE_*` env fallbacks.
-- Removed the dead ordered large-transfer pipeline path and associated retry gate/feature code now that it is permanently disabled.
-- Replaced visibility and internal API cleanup work from the Rust 1.88/private-first pass, including module privacy tightening and simplification of small conditional branches.
+- Removed legacy command-line compatibility aliases and aliases that are now obsolete after the cleanup pass: `--no-tui`, `--backend-strategy`, `--cache-capacity`, `--cache-ttl`, `--ttl-secs`, `--cache-articles`, `--store-articles`, and legacy `NNTP_PROXY_CACHE_*` env fallbacks.
+- Removed the dead ordered large-transfer pipeline path and associated retry gate/feature code now that it is permanently turned off.
+- Replaced visibility and internal API cleanup work from the Rust 1.88/private-first pass. This includes module privacy tightening and simplification of small conditional branches.
 - Replaced `ResponseTransferError::into_anyhow` and `duration_polyfill` with idiomatic Rust 1.88-safe error and duration handling at call sites.
 - Adopted private-first encapsulation by tightening crate module visibility where public re-exports already provide the intended external surface.
 - Pushed the session-count model through typed metrics snapshots, dashboard conversions, and TUI rendering so count mixups become compile-time errors instead of runtime bugs.
@@ -51,7 +51,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Hardened retry-path routing and guard handling around pending counts, capacity-weighted initial article probing, and idle-pool preference.
 - Fixed a user-active connection-count regression that could diverge from true active-session totals; the dashboard now consistently reports active sessions from typed user-metric counters.
 - Migrated user/session metric collection to typed newtypes (including `ZERO` constructors) and arithmetic helpers so typed counters are incremented at source and cannot be accidentally mixed.
-- Fixed metric and stats storage consistency by updating update paths to use typed metrics throughout collection, reducing drift in user gauges and totals.
+- Fixed metric and stats storage consistency by updating update paths to use typed metrics throughout collection. This reduces drift in user gauges and totals.
 - Reduced TUI render allocations by writing directly into the buffer, borrowing chart-label names, and using stack-backed formatting where possible.
 
 ### Docs
@@ -116,16 +116,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Breaking: article-body caching now defaults off**
   - `[cache].store_article_bodies` now defaults to `false`; backend availability is still tracked in the availability index.
-  - Existing deployments with a `[cache]` section that omitted `store_article_bodies` will switch from full article-body caching to availability-only tracking after upgrade.
+  - Existing deployments with a `[cache]` section that omitted `store_article_bodies` switch from full article-body caching to availability-only tracking after upgrade.
   - Operators who rely on memory or disk article-body cache hits should set `store_article_bodies = true` explicitly. `[cache.disk]` only stores article bodies when body caching is enabled.
 
 - **Near-complete internal rewrite since 0.4.0**
   - Rebuilt the proxy internals around typed request contexts, request-scoped response metadata, explicit cache metadata, backend pipeline queues, framer-owned multiline response handling, pooled-buffer forwarding, persisted metrics, persisted availability state, and config migration helpers.
   - The public goal is still the same NNTP proxy, but the routing, caching, response forwarding, connection lifecycle, persistence, dashboard/runtime, and operator-facing configuration paths are substantially new compared to 0.4.0.
 
-- **Configuration and CLI naming refresh**
+- **Configuration and command-line naming refresh**
   - Reorganized config around `[routing]`, `[memory]`, `[cache]`, and `[health_check]` with clearer canonical names such as `article_cache_capacity`, `article_cache_ttl_secs`, and `store_article_bodies`.
-  - Config loading now migrates older layouts in place and CLI parsing keeps legacy flag aliases for compatibility.
+  - Config loading now migrates older layouts in place and command-line parsing keeps legacy flag aliases for compatibility.
 
 - **Runtime binary presentation**
   - Current docs and release packaging describe a single `nntp-proxy` executable with selectable dashboard/headless UI behavior.
@@ -147,7 +147,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Oversized article cache-retention handling**
   - Full article/body/head cache retention now stops owning payload data once a response exceeds the cache section size limit, streams the response through to the client, and skips cache insertion for that response.
-  - Disk-cache section encoding now rejects sections above the same limit during writes as well as reads.
+  - Disk-cache section encoding now rejects sections that exceed the same limit during writes as well as reads.
 
 - **Article retry fallback behavior** ([#67](https://github.com/mjc/nntp-proxy/pull/67))
   - `ARTICLE`/`BODY` requests that are already known missing across eligible backends now return `430` instead of disconnecting the client.
@@ -182,7 +182,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Performance
 
 - Large cache-miss forwarding now reaches multi-GiB/s throughput while using much less transient memory than the old full-response buffering path. With one client connection, one proxy thread, and one backend connection, current release checks measured 4.60 GiB/s on the Ryzen 9 5950X system and 3.13 GiB/s on the Apple M1 system; see [release benchmarks](docs/archive/release-benchmarks.md) for the archived note and regeneration pointers.
-- Per-command direct forwarding and cache-hit serving are now built around borrowed buffers and vectored writes, so the steady-state hot path is intended to be allocation-free after buffer-pool warmup when configured pools have capacity. Stateful mode, payload retention/cache ingest, connection setup, logging, metrics snapshots, pool exhaustion, and oversized-retention fallbacks can still allocate.
+- Per-command direct forwarding and cache-hit serving are now built around borrowed buffers and vectored writes, so the steady-state hot path is intended to be allocation-free after buffer-pool warmup when configured pools have capacity. Stateful mode, payload retention/cache population, connection setup, logging, metrics snapshots, pool exhaustion, and oversized-retention fallbacks can still allocate.
 - Sequential article fetches benefit from backend command pipelining, response batching, fewer request re-parses, and reduced connection churn.
 
 ### Testing
@@ -229,13 +229,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **⚠️ Breaking: Default Backend Selection Strategy** ([#47](https://github.com/mjc/nntp-proxy/pull/47))
+- **⚠️ Breaking: default backend selection strategy** ([#47](https://github.com/mjc/nntp-proxy/pull/47))
   - Default changed from `WeightedRoundRobin` to `LeastLoaded`
   - Existing deployments relying on previous default should explicitly set `backend_selection = "WeightedRoundRobin"` in config
 
 - **Metrics Always Enabled** ([#47](https://github.com/mjc/nntp-proxy/pull/47)) - Metrics collection is no longer optional for better observability
 
-- **⚠️ Breaking: Disk Cache Format** ([#48](https://github.com/mjc/nntp-proxy/pull/48)) - Existing disk cache will be discarded on upgrade due to format changes for tier-aware TTL
+- **⚠️ Breaking: disk cache format** ([#48](https://github.com/mjc/nntp-proxy/pull/48)) - Existing disk cache is discarded on upgrade due to format changes for tier-aware TTL
 
 - **Release Binary Optimization** - Enabled aggressive binary size optimizations (strip, LTO, single codegen-unit) reducing release artifacts by ~90% (4.5-4.9M vs 41-43M). Release builds now take ~10x longer due to full LTO, but significantly faster downloads and lower disk usage for deployments.
 
@@ -254,7 +254,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Terminal User Interface (TUI)** ([#38](https://github.com/mjc/nntp-proxy/pull/38), [#40](https://github.com/mjc/nntp-proxy/pull/40))
   - New `nntp-proxy-tui` binary with real-time monitoring dashboard
   - Live metrics: connections, throughput, backend health, user activity
-  - System resource monitoring: CPU usage, memory usage, peak tracking
+  - System resource monitoring that covers CPU usage, memory usage, and peak tracking
   - Interactive log viewer with fullscreen mode ('L' hotkey)
   - Per-user statistics tracking with article counts
   - Per-backend statistics with load balancing visualization
@@ -290,7 +290,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - New test suites: routing modes, session handling, metrics, cache helpers
 
 - **API Improvements**
-  - Shared CLI args module (`args.rs`) with `CommonArgs` and `CacheArgs`
+  - Shared command-line args module (`args.rs`) with `CommonArgs` and `CacheArgs`
   - `PooledBuffer::as_mut_slice()` for better API discoverability
   - `BufferPool::acquire()` replacing `get_buffer()` for clearer semantics
   - Type-safe directional byte tracking (`BytesSentToBackend`, `BytesReceivedFromBackend`)
@@ -336,10 +336,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **TUI Optimizations** - Eliminated snapshot cloning, optimized data conversions
 - **Buffer Tuning** - Optimized for real-world article sizes (724KB average)
 
-### Technical Details
+### Technical details
 
-- **Test Infrastructure**: Reusable test macros, property-based testing, MockNntpServer builder
-- **Metrics Architecture**: Modular design with snapshot isolation, lock-free recording
+- **Test infrastructure**: reusable test macros, property-based testing, MockNntpServer builder
+- **Metrics architecture**: modular design with snapshot isolation, lock-free recording
 - **TUI Stack**: ratatui + crossterm, system stats via sysinfo crate
 - **Code Reduction**: 571 lines of test code eliminated while increasing coverage 100x
 - **New Files**: 25+ new modules (metrics, TUI, test infrastructure)
@@ -378,7 +378,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **Critical: Greeting Flush Bug** ([#37](https://github.com/mjc/nntp-proxy/pull/37))
+- **Critical: greeting flush bug** ([#37](https://github.com/mjc/nntp-proxy/pull/37))
   - Fixed connection resets for NNTP clients that send commands immediately after connecting
   - Root cause: greetings buffered in TCP send buffer without flush
   - Added `flush()` immediately after all greeting writes
@@ -413,11 +413,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Clarified greeting flow in code comments
   - Updated function documentation for greeting handling
 
-### Technical Details
+### Technical details
 
-- **Greeting Flow**: Backend greetings consumed when connections created in pool; proxy sends own greeting with immediate flush to client
-- **Type Safety**: All domain values now use validated newtypes (Username, Password, StatusCode, TransferMetrics, etc.)
-- **Testing**: Added MockNntpServer builder, cargo-nextest CI, 25 config validation tests, random ports for parallel execution
+- **Greeting flow**: backend greetings consumed when connections created in pool; proxy sends own greeting with immediate flush to client
+- **Type safety**: all domain values now use validated newtypes (Username, Password, StatusCode, TransferMetrics, etc.)
+- **Testing**: added MockNntpServer builder, cargo-nextest CI, 25 config validation tests, random ports for parallel execution
 
 ## [0.2.2] - 2025-11-07
 
@@ -435,7 +435,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Performance Optimizations**
   - Introduced `PooledBuffer` type to eliminate repeated 64KB Vec allocations
-  - Optimized authentication hot path to restore 80MB/s throughput
+  - Optimized authentication hot path to restore 80 MB/s throughput
   - Eliminated Vec allocations in streaming functions
   - Reduced buffer allocation overhead with smarter initialization tracking
   
@@ -473,7 +473,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Code quality and maintainability**
   - Refactored per-command routing handler to eliminate nested helper functions
   - Reduced `per_command.rs` from 620 to 550 lines (-11%)
-  - Flattened main command loop from 4-5 nesting levels to 2 maximum
+  - Flattened main command loop nesting to a maximum of 2 levels (previously 4-5)
   - Simplified error handling with inline logic instead of jumping between functions
   - Added `ErrorClassifier` utility for consistent error classification across codebase
   - Enhanced `ConnectionError` with classification methods (`is_client_disconnect()`, `is_authentication_error()`, `is_network_error()`)
@@ -487,7 +487,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Test coverage**
   - Added 8 tests for ConnectionError classification
-  - Added 7 tests for ErrorClassifier functionality
+  - Added 7 ErrorClassifier tests
   - Added 3 tests for streaming error scenarios
   - Added 10 tests for message ID extraction
   - All 378 tests passing with 74.08% overall coverage
@@ -536,11 +536,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Line buffer reuse in streaming to avoid allocations
   - Optimized cache session memory operations
   - Capacity hints for allocations
-  - Inline hints for frequently-called functions
+  - Inline hints for frequently called functions
   - Iterator combinators instead of manual loops
 
 - **Configuration**
-  - Added environment variable support for CLI and backend servers
+  - Added environment variable support for command-line options and backend servers
   - Comprehensive configuration validation with error messages
   - Removed duplicate buffer constants
 
@@ -570,7 +570,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Core NNTP Proxy Functionality**
+- **Core NNTP proxy features**
   - High-performance NNTP proxy server
   - Connection pooling with deadpool
   - Multiple routing modes (standard, per-command, hybrid)

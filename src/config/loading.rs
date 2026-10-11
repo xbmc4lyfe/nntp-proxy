@@ -277,7 +277,7 @@ impl EnvProvider for StdEnvProvider {
 /// Parse server configuration from environment variables (pure function, easily testable)
 ///
 /// # Arguments
-/// * `index` - Server index (0, 1, 2, ...)
+/// * `index` - Server index (0, 1, 2, and so on)
 /// * `env` - Environment variable provider
 ///
 /// # Returns
@@ -625,7 +625,7 @@ pub fn load_config_with_fallback(config_path: &str) -> Result<(Config, ConfigSou
 #[must_use]
 ///
 /// # Panics
-/// Panics only if the hard-coded example hostname, port, or server name stop
+/// This panics only if the hard-coded example hostname, port, or server name stop
 /// satisfying their validated newtype constructors.
 pub fn create_default_config() -> Config {
     Config {

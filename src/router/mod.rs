@@ -420,7 +420,7 @@ impl TrafficShare {
 ///
 /// Prevents TUI in-flight count drift when error paths forget to call `complete_command()`.
 /// On success paths, call [`CommandGuard::complete`] to explicitly finalize.
-/// On error/early-return paths, `Drop` handles cleanup automatically.
+/// On error paths and early returns, `Drop` handles cleanup automatically.
 pub struct CommandGuard {
     router: Arc<BackendSelector>,
     backend_id: BackendId,
@@ -428,7 +428,7 @@ pub struct CommandGuard {
 }
 
 impl CommandGuard {
-    /// Create a new guard that will call `complete_command` on drop.
+    /// Create a new guard that calls `complete_command` on drop.
     const fn new(router: Arc<BackendSelector>, backend_id: BackendId) -> Self {
         Self {
             router,
@@ -506,7 +506,7 @@ pub struct BackendSelector {
     initial_article_probe_counter: AtomicUsize,
     /// Bitmap of distinct configured article-availability identities.
     availability_mask: AvailabilityMask,
-    /// Enable/disable per-connection queue-pressure filtering.
+    /// Whether per-connection queue-pressure filtering is on.
     queue_backpressure_enabled: bool,
     /// Validated soft and hard thresholds for queued requests per connection.
     queue_backpressure_limits: QueuePressureLimits,
@@ -732,9 +732,9 @@ impl BackendSelector {
                 && availability.is_none_or(|avail| avail.should_try_slot(backend.availability_slot))
         };
 
-        // H4: Tier filtering enabled - try tiers in order 0, 1, 2, ...
+        // H4: Tier filtering enabled - try tiers in order 0, 1, 2, and so on
         // Use pre-computed sorted tiers (no allocation)
-        // Try each tier until we find an available backend
+        // Try each tier until an available backend is found
         for &tier in &self.sorted_tiers {
             // Only count available backends if debug logging is enabled (avoid O(n) scan)
             if tracing::enabled!(tracing::Level::DEBUG) {
@@ -1442,8 +1442,8 @@ mod tests {
         guard.complete();
         // After complete(), count should be 0; drop should be a no-op
         assert_eq!(router.backend_load(backend_id).unwrap().get(), 0);
-        // If double-decrement happened, we'd see wrapping (very large number)
-        // Since we're at 0 already and drop is a no-op, this confirms correctness
+        // A double-decrement would show up as wrapping (very large number)
+        // Since the count is already 0 and drop is a no-op, this confirms correctness
     }
 
     #[test]

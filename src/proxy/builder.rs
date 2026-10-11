@@ -113,9 +113,9 @@ impl NntpProxyBuilder {
         self
     }
 
-    /// Restore metrics from a previously-saved store
+    /// Restore metrics from a previously saved store
     ///
-    /// If provided, the builder will initialize the `MetricsCollector` with this store,
+    /// If provided, the builder initializes the `MetricsCollector` with this store,
     /// allowing metrics to persist across proxy restarts.
     #[must_use]
     pub fn with_metrics_store(mut self, store: crate::metrics::MetricsStore) -> Self {
@@ -356,7 +356,7 @@ impl NntpProxyBuilder {
     /// Build the `NntpProxy` instance (synchronous version)
     ///
     /// This version only supports memory-only cache. If disk cache is configured
-    /// in the config, it will be ignored and a warning will be logged.
+    /// in the config, it is ignored and a warning is logged.
     /// Use `build()` for full disk cache support.
     ///
     /// # Errors

@@ -7,7 +7,7 @@
 1. `--config <FILE>` / `NNTP_PROXY_CONFIG` if the file exists
 2. `NNTP_SERVER_*` backend variables override `[[servers]]` from the file
 3. `NNTP_PROXY_CREDENTIALS_FILE` can overlay backend and client-auth secrets
-4. Selected CLI flags override the loaded config
+4. Selected command-line flags override the loaded config
 
 If no config file exists and no backend environment variables are present, the proxy creates a default `config.toml`.
 
@@ -55,8 +55,8 @@ See [../../config.full.toml](../../config.full.toml) for a complete example.
 | Field | Default | Notes |
 | --- | --- | --- |
 | `enabled` | `true` | Enable queue-pressure-aware backend filtering |
-| `soft_waiters_per_connection_percent` | `25` | Penalize backends above this queued-requests-per-connection threshold |
-| `hard_waiters_per_connection_percent` | `50` | Filter backends above this threshold while alternatives exist in the tier |
+| `soft_waiters_per_connection_percent` | `25` | Penalize backends that exceed this queued-requests-per-connection threshold |
+| `hard_waiters_per_connection_percent` | `50` | Filter backends that exceed this threshold while alternatives exist in the tier |
 | `all_busy_sleep_ms` | `1` | Sleep before retrying when every eligible backend in the preferred tier is hard-saturated |
 
 ### `[memory]`
@@ -131,7 +131,7 @@ password = "reader-password"
 | `tls_verify_cert` | `true` | Keep enabled in production |
 | `tls_cert_path` | unset | Additional PEM CA certificate |
 | `connection_keepalive` | unset | Sends `DATE` on idle backend connections |
-| `replacement_cooldown` | `30` seconds | Set `0` to disable |
+| `replacement_cooldown` | `30` seconds | Set `0` to turn off |
 | `health_check_max_per_cycle` | `5` | Per-backend health-check acquisition cap |
 | `health_check_pool_timeout` | `100ms` | Wait time when health-checking the pool |
 | `compress` | auto-detect | RFC 8054 backend `COMPRESS DEFLATE` |
