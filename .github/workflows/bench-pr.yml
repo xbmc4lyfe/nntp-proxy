@@ -5,27 +5,25 @@ name: Benchmarks (PR)
 
 on:
   pull_request:
-    # `edited` is left out on purpose: re-running the suites for a title or
-    # body edit costs a full benchmark run.
-    types: [opened, reopened, synchronize]
+    types: [opened, reopened, synchronize, edited]
     paths:
       - "**.rs"
       - "Cargo.toml"
       - "Cargo.lock"
       - "rust-toolchain.toml"
       - ".cargo/**"
-      - "scripts/bench-ci.sh"
+      - "scripts/bench-*.sh"
+      - "tests/test_bencher_baseline.py"
       - ".github/workflows/bench-*.yml"
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  # Metadata edits must not cancel an in-flight benchmark run.
+  group: ${{ github.workflow }}-${{ github.event.action == 'edited' && github.event.changes.base == null && github.run_id || github.ref }}
   cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: never
   CARGO_INCREMENTAL: 0
-  # Debuginfo does not change the measured code; dropping it shortens linking.
-  CARGO_PROFILE_BENCH_DEBUG: 0
   RUST_MIN_STACK: 8388608
 
 permissions:
@@ -33,6 +31,8 @@ permissions:
 
 jobs:
   gate:
+    # Retargeting changes the baseline; title/body edits do not.
+    if: github.event.action != 'edited' || github.event.changes.base != null
     runs-on: ubuntu-latest
     outputs:
       enabled: ${{ steps.check.outputs.enabled }}
@@ -43,19 +43,22 @@ jobs:
           BENCHER_SECRET: ${{ secrets.BENCHER_API_TOKEN }}
           BENCHER_PROJECT: ${{ vars.BENCHER_PROJECT }}
         run: |
-          if true; then # TEMP-VALIDATION
+          if [ -n "$BENCHER_SECRET" ] && [ -n "$BENCHER_PROJECT" ]; then
             echo "enabled=true" >> "$GITHUB_OUTPUT"
           else
-            echo "::notice::Bencher is not configured (BENCHER_API_TOKEN secret or BENCHER_PROJECT variable missing); skipping benchmarks."
+            echo "::notice::Bencher publishing is disabled (BENCHER_API_TOKEN secret or BENCHER_PROJECT variable missing); benchmarks and offline report checks still run."
             echo "enabled=false" >> "$GITHUB_OUTPUT"
           fi
 
   benchmark:
     name: Benchmarks (${{ matrix.suite }})
     needs: gate
+    env:
+      # Gungraun requires symbols; only Divan can omit debuginfo.
+      CARGO_PROFILE_BENCH_DEBUG: ${{ matrix.suite == 'callgrind' && '2' || '0' }}
     # DO NOT REMOVE: secrets are unavailable to fork PRs, and a fork PR must
     # never run with write permissions. See Bencher's fork PR guidance first.
-    if: needs.gate.outputs.enabled == 'true' && github.event.pull_request.head.repo.full_name == github.repository
+    if: github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:
@@ -126,7 +129,25 @@ jobs:
         run: bash scripts/bench-ci.sh "$SUITE" "$OUTPUT"
 
       - uses: bencherdev/bencher@f80847436d7157936b40525db4c2a1064124f04a # v0.6.13
+      # Dry-run checks CLI/report construction, not server-side adapter parsing.
+      - name: Check Bencher report construction without credentials
+        env:
+          ADAPTER: ${{ matrix.adapter }}
+          OUTPUT: ${{ matrix.output }}
+        run: |
+          env -u BENCHER_API_TOKEN -u BENCHER_API_KEY bencher run \
+            --dry-run --project validate --adapter "$ADAPTER" --file "$OUTPUT"
+
+      - name: Archive benchmark results
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: bench-${{ matrix.suite }}
+          path: ${{ matrix.output }}
+          if-no-files-found: error
+          retention-days: 7
+
       - name: Track PR benchmarks with Bencher
+        if: needs.gate.outputs.enabled == 'true'
         env:
           BENCHER_SECRET: ${{ secrets.BENCHER_API_TOKEN }}
           BENCHER_PROJECT: ${{ vars.BENCHER_PROJECT }}
@@ -135,18 +156,18 @@ jobs:
           SUITE: ${{ matrix.suite }}
           ADAPTER: ${{ matrix.adapter }}
           OUTPUT: ${{ matrix.output }}
-        # Thresholds are cloned from the base branch (set in bench-main.yml).
+        # Each suite owns its branch so parallel resets cannot erase results
+        # from the other suite. Thresholds come from bench-main.yml.
         run: |
           # Accept either a current API key (bencher_*) or a legacy JWT token.
           case "$BENCHER_SECRET" in
             bencher_*) export BENCHER_API_KEY="$BENCHER_SECRET" ;;
             *) export BENCHER_API_TOKEN="$BENCHER_SECRET" ;;
           esac
-          dry_run=() # TEMP-VALIDATION
-          if [ -z "$BENCHER_SECRET" ]; then dry_run=(--dry-run); BENCHER_PROJECT=validate; fi
-          bencher run "${dry_run[@]}" \
+          bash scripts/bench-require-baseline.sh "$BENCHER_PROJECT" "$GITHUB_BASE_REF" "$BASE_SHA" "$ADAPTER"
+          bencher run \
             --project "$BENCHER_PROJECT" \
-            --branch "$GITHUB_HEAD_REF" \
+            --branch "$GITHUB_HEAD_REF/$SUITE" \
             --start-point "$GITHUB_BASE_REF" \
             --start-point-hash "$BASE_SHA" \
             --start-point-clone-thresholds \

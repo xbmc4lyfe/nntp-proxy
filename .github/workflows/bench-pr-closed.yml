@@ -13,6 +13,10 @@ jobs:
   archive:
     # DO NOT REMOVE: see the fork PR note in bench-pr.yml.
     if: github.event.pull_request.head.repo.full_name == github.repository
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [divan, callgrind]
     runs-on: ubuntu-latest
     steps:
       - name: Check Bencher configuration
@@ -29,11 +33,12 @@ jobs:
           fi
       - if: steps.check.outputs.enabled == 'true'
         uses: bencherdev/bencher@f80847436d7157936b40525db4c2a1064124f04a # v0.6.13
-      - name: Archive the PR branch with Bencher
+      - name: Archive the PR suite branch with Bencher
         if: steps.check.outputs.enabled == 'true'
-        # Cleanup only: a PR that never ran benchmarks has no branch to archive.
+        # Cleanup only: a PR that never published has no branch to archive.
         continue-on-error: true
         env:
+          SUITE: ${{ matrix.suite }}
           BENCHER_SECRET: ${{ secrets.BENCHER_API_TOKEN }}
           BENCHER_PROJECT: ${{ vars.BENCHER_PROJECT }}
         run: |
@@ -41,4 +46,4 @@ jobs:
             bencher_*) export BENCHER_API_KEY="$BENCHER_SECRET" ;;
             *) export BENCHER_API_TOKEN="$BENCHER_SECRET" ;;
           esac
-          bencher archive --project "$BENCHER_PROJECT" --branch "$GITHUB_HEAD_REF"
+          bencher archive --project "$BENCHER_PROJECT" --branch "$GITHUB_HEAD_REF/$SUITE"
