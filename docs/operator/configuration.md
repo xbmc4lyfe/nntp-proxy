@@ -149,7 +149,9 @@ tracking its position in each group) gets numbers that don't match.
 Set `stateful_sessions = "excluded"` on every backend whose numbering differs
 from the one your client tracks. Excluded backends keep serving message-ID
 requests (`ARTICLE <id>`, `BODY <id>`, `HEAD <id>`, `STAT <id>`) in their tier,
-so they still add download capacity:
+so they still add download capacity. Every other per-command request, such as
+`LIST ACTIVE` and `LIST COUNTS` (whose replies carry high and low article
+numbers), only goes to allowed backends:
 
 ```toml
 [[servers]]
@@ -166,7 +168,10 @@ tier = 0
 stateful_sessions = "excluded"
 ```
 
-If every backend in a tier is excluded, stateful sessions use the next tier.
+If every backend in a tier is excluded, stateful sessions and numbered replies
+use the next tier. When a hybrid session can't get a backend for its first
+stateful command, the client receives `400 Backend server unavailable`, the same
+reply stateful mode sends.
 Startup fails when `hybrid` or `stateful` mode has no allowed backend at all.
 
 ## Environment-based backend configuration

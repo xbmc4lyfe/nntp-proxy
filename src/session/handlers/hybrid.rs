@@ -20,7 +20,7 @@
 use crate::session::ClientSession;
 use crate::types::TransferMetrics;
 use anyhow::{Context, Result};
-use tokio::io::BufReader;
+use tokio::io::{AsyncWriteExt, BufReader};
 use tracing::info;
 
 /// Error context for hybrid mode operations
@@ -159,7 +159,7 @@ impl ClientSession {
     pub(super) async fn switch_to_stateful_mode<R, W>(
         &mut self,
         client_reader: BufReader<R>,
-        client_write: W,
+        mut client_write: W,
         initial_request: crate::command::StatefulHandoff,
         client_to_backend_bytes: u64,
         backend_to_client_bytes: u64,
@@ -168,10 +168,21 @@ impl ClientSession {
         R: tokio::io::AsyncRead + Unpin,
         W: tokio::io::AsyncWrite + Unpin,
     {
-        let mut backend = self
-            .acquire_stateful_backend()
-            .await
-            .context("Failed to acquire backend for stateful mode")?;
+        let mut backend = match self.acquire_stateful_backend().await {
+            Ok(backend) => backend,
+            Err(error) => {
+                // Answer like stateful mode does. A silently closed socket
+                // looks like a network fault, so clients can't tell that a
+                // retry is the right response.
+                let _ = client_write
+                    .write_all(crate::protocol::BACKEND_UNAVAILABLE)
+                    .await;
+                let _ = client_write.flush().await;
+                return Err(crate::session::SessionError::from(
+                    error.context("Failed to acquire backend for stateful mode"),
+                ));
+            }
+        };
 
         // Start stateful session metrics tracking
         let _session_guard = StatefulSessionGuard::start(&self.metrics);
@@ -344,12 +355,13 @@ mod tests {
             RoutingMode::Hybrid,
         )
         .expect("GROUP starts a hybrid stateful handoff");
-        let (client_write, client_read) = tokio::io::duplex(64);
+        let (_client_input, session_input) = tokio::io::duplex(64);
+        let (session_output, mut client_output) = tokio::io::duplex(64);
 
         let result = session
             .switch_to_stateful_mode(
-                BufReader::new(client_read),
-                client_write,
+                BufReader::new(session_input),
+                session_output,
                 stateful_request,
                 0,
                 0,
@@ -358,5 +370,11 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(session.mode(), SessionMode::PerCommand);
+
+        let mut reply = vec![0; crate::protocol::BACKEND_UNAVAILABLE.len()];
+        tokio::io::AsyncReadExt::read_exact(&mut client_output, &mut reply)
+            .await
+            .expect("client receives a status line after the failed handoff");
+        assert_eq!(reply, crate::protocol::BACKEND_UNAVAILABLE);
     }
 }
