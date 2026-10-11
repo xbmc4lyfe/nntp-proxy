@@ -43,8 +43,8 @@ enum CommandResult {
 enum SingleCommandResult {
     /// Continue processing commands
     Continue,
-    /// Client sent QUIT command (bytes already added to `backend_to_client_bytes`)
-    Quit,
+    /// A local command requires closing after its response has been written.
+    CloseConnection,
 }
 
 /// A classified command plan whose request-borrowing evidence has been reduced
@@ -321,6 +321,9 @@ impl ClientSession {
         debug!("Client {} decision: Reject", self.client_addr);
         let client_write = client_writer.get_mut();
         client_write.write_all(response.as_bytes()).await?;
+        if response.closes_connection() {
+            client_write.flush().await?;
+        }
         request.record_local_response(response.metadata());
         *backend_to_client_bytes = backend_to_client_bytes.add(response.len());
         Ok(CommandResult::Continue)
@@ -337,8 +340,10 @@ impl ClientSession {
             "Client {} decision: InterceptCapabilities",
             self.client_addr
         );
-        let capabilities =
-            crate::session::backend::capabilities_response(!auth_access.can_access_backend());
+        let capabilities = crate::session::backend::capabilities_response(
+            !auth_access.can_access_backend(),
+            self.mode_state.routing_mode(),
+        );
         let client_write = client_writer.get_mut();
         client_write.write_all(capabilities).await?;
         record_local_response(request, codes::CAPABILITY_LIST, capabilities);
@@ -412,7 +417,7 @@ impl ClientSession {
                 crate::protocol::CONNECTION_CLOSING,
             );
             *backend_to_client_bytes = backend_to_client_bytes.add_u64(bytes.into());
-            return Ok(SingleCommandResult::Quit);
+            return Ok(SingleCommandResult::CloseConnection);
         }
 
         match plan {
@@ -456,7 +461,13 @@ impl ClientSession {
             ExecutableCommandPlan::Reject(response) => self
                 .handle_rejected_request(request, response, client_writer, backend_to_client_bytes)
                 .await
-                .map(|CommandResult::Continue| SingleCommandResult::Continue),
+                .map(|CommandResult::Continue| {
+                    if response.closes_connection() {
+                        SingleCommandResult::CloseConnection
+                    } else {
+                        SingleCommandResult::Continue
+                    }
+                }),
             ExecutableCommandPlan::InterceptCapabilities => self
                 .handle_capabilities_request(
                     request,
@@ -769,7 +780,7 @@ impl ClientSession {
             })?;
         match command_result? {
             SingleCommandResult::Continue => {}
-            SingleCommandResult::Quit => {
+            SingleCommandResult::CloseConnection => {
                 return Err(SessionError::Backend(anyhow::anyhow!(
                     "pipelineable request unexpectedly terminated the session"
                 )));
@@ -1240,7 +1251,7 @@ impl ClientSession {
             .await?
         {
             SingleCommandResult::Continue => Ok(BatchLoopAction::Continue),
-            SingleCommandResult::Quit => Ok(BatchLoopAction::Break),
+            SingleCommandResult::CloseConnection => Ok(BatchLoopAction::Break),
         }
     }
 }

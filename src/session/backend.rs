@@ -84,11 +84,24 @@ where
 
 /// Capabilities response for the local proxy capability command.
 #[must_use]
-pub(crate) const fn capabilities_response(auth_enabled: bool) -> &'static [u8] {
-    if auth_enabled {
-        crate::session::multiline_framing::CAPABILITIES_WITH_AUTHINFO_RESPONSE
-    } else {
-        crate::session::multiline_framing::CAPABILITIES_WITHOUT_AUTHINFO_RESPONSE
+pub(crate) const fn capabilities_response(
+    auth_enabled: bool,
+    mode: crate::config::RoutingMode,
+) -> &'static [u8] {
+    use crate::session::multiline_framing as framing;
+    match (mode, auth_enabled) {
+        (crate::config::RoutingMode::PerCommand, true) => {
+            framing::PER_COMMAND_CAPABILITIES_WITH_AUTHINFO_RESPONSE
+        }
+        (crate::config::RoutingMode::PerCommand, false) => {
+            framing::PER_COMMAND_CAPABILITIES_WITHOUT_AUTHINFO_RESPONSE
+        }
+        (crate::config::RoutingMode::Hybrid | crate::config::RoutingMode::Stateful, true) => {
+            framing::CAPABILITIES_WITH_AUTHINFO_RESPONSE
+        }
+        (crate::config::RoutingMode::Hybrid | crate::config::RoutingMode::Stateful, false) => {
+            framing::CAPABILITIES_WITHOUT_AUTHINFO_RESPONSE
+        }
     }
 }
 

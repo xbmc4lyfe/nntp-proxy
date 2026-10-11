@@ -17,7 +17,7 @@ fn capabilities_body(lines: &[String]) -> String {
     lines.concat()
 }
 
-fn assert_proxy_capabilities_are_synthetic(body: &str, expect_authinfo: bool) {
+fn assert_proxy_capabilities_are_synthetic(body: &str, expect_authinfo: bool, reader: bool) {
     assert_eq!(
         body.contains("AUTHINFO USER PASS\r\n"),
         expect_authinfo,
@@ -30,9 +30,9 @@ fn assert_proxy_capabilities_are_synthetic(body: &str, expect_authinfo: bool) {
         "Proxy CAPABILITIES should not leak backend-only extensions, got: {body:?}"
     );
     assert!(body.contains("VERSION 2\r\n"));
-    assert!(body.contains("READER\r\n"));
-    assert!(body.contains("OVER\r\n"));
-    assert!(body.contains("HDR\r\n"));
+    for capability in ["READER\r\n", "OVER\r\n", "HDR\r\n"] {
+        assert_eq!(body.contains(capability), reader, "{capability}: {body:?}");
+    }
 }
 
 #[tokio::test]
@@ -51,7 +51,7 @@ async fn test_capabilities_before_auth_advertises_authinfo_not_backend_extension
     .await?;
 
     let body = capabilities_body(&client.expect_multiline("CAPABILITIES", "101").await?);
-    assert_proxy_capabilities_are_synthetic(&body, true);
+    assert_proxy_capabilities_are_synthetic(&body, true, false);
 
     Ok(())
 }
@@ -74,7 +74,41 @@ async fn test_capabilities_after_auth_omits_authinfo() -> Result<()> {
     client.authenticate("alice", "wonderland").await?;
 
     let body = capabilities_body(&client.expect_multiline("CAPABILITIES", "101").await?);
-    assert_proxy_capabilities_are_synthetic(&body, false);
+    assert_proxy_capabilities_are_synthetic(&body, false, true);
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_capabilities_follow_reader_command_support() -> Result<()> {
+    for mode in [
+        RoutingMode::PerCommand,
+        RoutingMode::Hybrid,
+        RoutingMode::Stateful,
+    ] {
+        let mut client = RfcTestClient::spawn(mode, "caps-reader-backend", |_port| {
+            MockNntpServer::new()
+                .on_command("GROUP", "211 1 1 1 alt.test\r\n")
+                .on_command("OVER", "224 Overview follows\r\n.\r\n")
+                .on_command("HDR", "225 Headers follow\r\n.\r\n")
+                .on_command("STAT", "223 0 <present@example.com>\r\n")
+        })
+        .await?;
+        let reader = mode != RoutingMode::PerCommand;
+        let body = capabilities_body(&client.expect_multiline("CAPABILITIES", "101").await?);
+        assert_proxy_capabilities_are_synthetic(&body, false, reader);
+        if reader {
+            client.expect_status("GROUP alt.test", "211").await?;
+            client.expect_multiline("OVER 1-1", "224").await?;
+            client.expect_multiline("HDR Subject 1-1", "225").await?;
+        } else {
+            for command in ["GROUP alt.test", "OVER 1-1", "HDR Subject 1-1"] {
+                client.expect_status(command, "503").await?;
+            }
+        }
+        client
+            .expect_status("STAT <present@example.com>", "223")
+            .await?;
+    }
     Ok(())
 }

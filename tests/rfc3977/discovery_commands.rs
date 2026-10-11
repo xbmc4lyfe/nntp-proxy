@@ -61,16 +61,60 @@ async fn test_newnews_returns_multiline_in_hybrid_without_stateful_switch() -> R
 }
 
 #[tokio::test]
-async fn test_mode_reader_is_forwarded_statelessly_and_session_continues() -> Result<()> {
-    let mut client = RfcTestClient::spawn(
-        RoutingMode::PerCommand,
-        "discovery-backend",
-        discovery_backend,
-    )
-    .await?;
+async fn test_mode_reader_is_forwarded_in_reader_modes_and_session_continues() -> Result<()> {
+    for mode in [RoutingMode::Hybrid, RoutingMode::Stateful] {
+        let mut client = RfcTestClient::spawn(mode, "discovery-backend", discovery_backend).await?;
+        client.expect_status("MODE READER", "200").await?;
+        client.expect_status("DATE", "111").await?;
+    }
 
-    client.expect_status("MODE READER", "200").await?;
-    client.expect_status("DATE", "111").await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_mode_reader_rejects_and_closes_in_per_command_mode() -> Result<()> {
+    use nntp_proxy::command::AuthenticationAccess;
+    use tokio::io::AsyncReadExt;
+
+    for access in [
+        AuthenticationAccess::Unrestricted,
+        AuthenticationAccess::Required,
+        AuthenticationAccess::Authenticated,
+    ] {
+        for command in ["MODE READER", "mOdE\t ReAdEr  "] {
+            let mut client = if access == AuthenticationAccess::Unrestricted {
+                RfcTestClient::spawn(
+                    RoutingMode::PerCommand,
+                    "discovery-backend",
+                    discovery_backend,
+                )
+                .await?
+            } else {
+                RfcTestClient::spawn_with_auth(
+                    RoutingMode::PerCommand,
+                    "discovery-backend",
+                    "reader",
+                    "test-password",
+                    discovery_backend,
+                )
+                .await?
+            };
+            if access == AuthenticationAccess::Authenticated {
+                client.authenticate("reader", "test-password").await?;
+            }
+            client.expect_status(command, "502").await?;
+            let mut byte = [0];
+            let read = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                client.stream_mut().read(&mut byte),
+            )
+            .await??;
+            assert_eq!(
+                read, 0,
+                "MODE READER must immediately close the connection: {access:?}"
+            );
+        }
+    }
 
     Ok(())
 }
