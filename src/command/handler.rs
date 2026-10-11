@@ -372,7 +372,9 @@ fn rejection_for(request: &RequestContext) -> RejectResponse {
     match request.kind() {
         RequestKind::Post => POST_REJECT,
         RequestKind::Ihave => TRANSIT_REJECT,
-        RequestKind::Compress | RequestKind::StartTls => TRANSPORT_REJECT,
+        RequestKind::Compress | RequestKind::StartTls | RequestKind::XfeatureCompressGzip => {
+            TRANSPORT_REJECT
+        }
         _ => match request.route_class() {
             RequestRouteClass::Stateful => STATEFUL_REJECT,
             _ => TRANSIT_REJECT,
@@ -593,6 +595,59 @@ mod tests {
                 response.to_string(),
                 "503 Transport-changing command not supported\r\n"
             );
+        }
+    }
+
+    #[test]
+    fn xfeature_gzip_is_rejected_without_stateful_handoff() {
+        for command in [
+            "XFEATURE COMPRESS GZIP\r\n",
+            "xfeature compress gzip\r\n",
+            "XfEaTuRe\t CoMpReSs\tGzIp  \r\n",
+        ] {
+            let request = RequestContext::parse(command.as_bytes()).unwrap();
+            assert_eq!(
+                request.route_class(),
+                RequestRouteClass::Reject,
+                "{command}"
+            );
+            for mode in [
+                RoutingMode::PerCommand,
+                RoutingMode::Hybrid,
+                RoutingMode::Stateful,
+            ] {
+                let plan = CommandHandler::classify_request(
+                    &request,
+                    AuthenticationAccess::Authenticated,
+                    mode,
+                );
+                let CommandPlan::Reject(response) = plan else {
+                    panic!(
+                        "unsupported overview compression must be rejected in {mode:?}: {plan:?}"
+                    );
+                };
+                assert_eq!(response.status().as_u16(), 503);
+            }
+        }
+    }
+
+    #[test]
+    fn other_xfeature_extensions_keep_stateful_routing() {
+        for command in [
+            "XFEATURE TEST",
+            "XFEATURE COMPRESS OTHER",
+            "XFEATURE COMPRESS GZIP EXTRA",
+        ] {
+            let request = RequestContext::parse(command.as_bytes()).unwrap();
+            assert_eq!(request.route_class(), RequestRouteClass::Stateful);
+            assert!(matches!(
+                CommandHandler::classify_request(
+                    &request,
+                    AuthenticationAccess::Authenticated,
+                    RoutingMode::Hybrid,
+                ),
+                CommandPlan::SwitchToStateful(_)
+            ));
         }
     }
 

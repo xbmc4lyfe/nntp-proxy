@@ -40,6 +40,7 @@ pub enum RequestKind {
     AuthInfo,
     StartTls,
     Compress,
+    XfeatureCompressGzip,
     Unknown,
 }
 
@@ -273,7 +274,7 @@ impl<'a> RequestLine<'a> {
         };
 
         Self {
-            kind: classify_verb(verb),
+            kind: classify_request_kind(verb, args),
             verb,
             args,
             message_id: find_message_id(args),
@@ -434,7 +435,7 @@ impl RequestContext {
     pub(crate) fn from_verb_args(verb: &[u8], args: &[u8]) -> Self {
         let verb = SmallVec::from_slice(verb);
         let args = SmallVec::from_slice(args);
-        let kind = classify_verb(&verb);
+        let kind = classify_request_kind(&verb, &args);
         let message_id = find_message_id(&args);
 
         Self::from_parts(kind, verb, args, message_id)
@@ -448,7 +449,7 @@ impl RequestContext {
         for part in args {
             joined_args.extend_from_slice(part);
         }
-        let kind = classify_verb(&verb);
+        let kind = classify_request_kind(&verb, &joined_args);
         let message_id = find_message_id(&joined_args);
 
         Self::from_parts(kind, verb, joined_args, message_id)
@@ -836,7 +837,8 @@ const fn route_class(kind: RequestKind, has_message_id: bool) -> RequestRouteCla
         | RequestKind::Check
         | RequestKind::TakeThis
         | RequestKind::StartTls
-        | RequestKind::Compress => RequestRouteClass::Reject,
+        | RequestKind::Compress
+        | RequestKind::XfeatureCompressGzip => RequestRouteClass::Reject,
         RequestKind::Article | RequestKind::Body | RequestKind::Head | RequestKind::Stat
             if has_message_id =>
         {
@@ -862,6 +864,29 @@ const fn route_class(kind: RequestKind, has_message_id: bool) -> RequestRouteCla
         | RequestKind::NewGroups
         | RequestKind::NewNews => RequestRouteClass::Stateless,
     }
+}
+
+fn classify_request_kind(verb: &[u8], args: &[u8]) -> RequestKind {
+    let kind = classify_verb(verb);
+    if kind == RequestKind::Unknown && verb.eq_ignore_ascii_case(b"XFEATURE") {
+        let mut args = args
+            .split(u8::is_ascii_whitespace)
+            .filter(|arg| !arg.is_empty());
+        // This extension changes overview framing to a zlib stream, which the
+        // transparent text framer cannot safely track. Other extensions still
+        // retain their existing stateful fallback.
+        if args
+            .next()
+            .is_some_and(|arg| arg.eq_ignore_ascii_case(b"COMPRESS"))
+            && args
+                .next()
+                .is_some_and(|arg| arg.eq_ignore_ascii_case(b"GZIP"))
+            && args.next().is_none()
+        {
+            return RequestKind::XfeatureCompressGzip;
+        }
+    }
+    kind
 }
 
 const fn classify_verb(verb: &[u8]) -> RequestKind {

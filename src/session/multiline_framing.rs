@@ -41,6 +41,12 @@ pub(crate) const CAPABILITIES_WITHOUT_AUTHINFO_RESPONSE: &[u8] =
 pub(crate) const CAPABILITIES_WITH_AUTHINFO_RESPONSE: &[u8] =
     b"101 Capability list:\r\nVERSION 2\r\nREADER\r\nAUTHINFO USER PASS\r\nOVER\r\nHDR\r\n.\r\n";
 
+pub(crate) const PER_COMMAND_CAPABILITIES_WITHOUT_AUTHINFO_RESPONSE: &[u8] =
+    b"101 Capability list:\r\nVERSION 2\r\n.\r\n";
+
+pub(crate) const PER_COMMAND_CAPABILITIES_WITH_AUTHINFO_RESPONSE: &[u8] =
+    b"101 Capability list:\r\nVERSION 2\r\nAUTHINFO USER PASS\r\n.\r\n";
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct ResponseWriteStats {
     chunk_count: usize,
@@ -2633,6 +2639,158 @@ mod tests {
     }
 
     const EXHAUSTIVE_BYTES: [u8; 4] = *b"\r\n.x";
+
+    #[tokio::test]
+    async fn xfeature_gzip_is_rejected_before_a_backend_can_compress_overview() -> anyhow::Result<()>
+    {
+        use crate::config::{Config, RoutingMode, Server};
+        use crate::protocol::StatusCode;
+        use crate::types::Port;
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        use tokio::net::TcpStream;
+
+        const OVERVIEW_ROW: &[u8] = b"1\tRelease.Title-GROUP\tPoster\t11 Oct 2026 10:00:00 GMT\t<CaseSensitive@example.com>\t\t123\t1\tXref: news alt.test:1\r\n";
+        let mut encoder =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut encoder, OVERVIEW_ROW)?;
+        let compressed_overview = encoder.finish()?;
+
+        for mode in [RoutingMode::Hybrid, RoutingMode::Stateful] {
+            let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
+            let backend_port = backend_listener.local_addr()?.port();
+            let compressed_overview = compressed_overview.clone();
+            let backend_task = tokio::spawn(async move {
+                while let Ok((stream, _)) = backend_listener.accept().await {
+                    let compressed_overview = compressed_overview.clone();
+                    tokio::spawn(async move {
+                        let mut backend = BufReader::new(stream);
+                        backend
+                            .get_mut()
+                            .write_all(b"201 Compression backend ready\r\n")
+                            .await
+                            .unwrap();
+                        let mut compression_enabled = false;
+                        loop {
+                            let mut command = String::new();
+                            if backend.read_line(&mut command).await.unwrap() == 0 {
+                                return;
+                            }
+                            match command.trim().to_ascii_uppercase().as_str() {
+                                "MODE READER" => backend
+                                    .get_mut()
+                                    .write_all(b"201 Reader ready\r\n")
+                                    .await
+                                    .unwrap(),
+                                "XFEATURE COMPRESS GZIP" => {
+                                    compression_enabled = true;
+                                    backend
+                                        .get_mut()
+                                        .write_all(b"290 Compression enabled\r\n")
+                                        .await
+                                        .unwrap();
+                                }
+                                "GROUP ALT.TEST" => backend
+                                    .get_mut()
+                                    .write_all(b"211 1 1 1 alt.test\r\n")
+                                    .await
+                                    .unwrap(),
+                                "XOVER 1-1" => {
+                                    let payload = if compression_enabled {
+                                        backend
+                                            .get_mut()
+                                            .write_all(b"224 Overview follows (COMPRESS=GZIP)\r\n")
+                                            .await
+                                            .unwrap();
+                                        compressed_overview.as_slice()
+                                    } else {
+                                        backend
+                                            .get_mut()
+                                            .write_all(b"224 Overview follows\r\n")
+                                            .await
+                                            .unwrap();
+                                        OVERVIEW_ROW
+                                    };
+                                    backend.get_mut().write_all(payload).await.unwrap();
+                                    backend.get_mut().write_all(DOT_TERMINATOR).await.unwrap();
+                                }
+                                _ => backend
+                                    .get_mut()
+                                    .write_all(b"500 Unsupported\r\n")
+                                    .await
+                                    .unwrap(),
+                            }
+                        }
+                    });
+                }
+            });
+            let config = Config {
+                servers: vec![
+                    Server::builder("127.0.0.1", Port::try_new(backend_port)?)
+                        .compress(Some(false))
+                        .build()?,
+                ],
+                ..Config::default()
+            };
+            let proxy = crate::NntpProxy::new(config, mode).await?;
+            let proxy_listener = TcpListener::bind("127.0.0.1:0").await?;
+            let proxy_addr = proxy_listener.local_addr()?;
+            let proxy_task = tokio::spawn(async move {
+                let (stream, addr) = proxy_listener.accept().await.unwrap();
+                if mode == RoutingMode::Hybrid {
+                    proxy
+                        .handle_client_per_command_routing(stream, addr.into())
+                        .await
+                } else {
+                    proxy.handle_client(stream, addr.into()).await
+                }
+            });
+            let mut client = BufReader::new(TcpStream::connect(proxy_addr).await?);
+            let mut line = String::new();
+            client.read_line(&mut line).await?;
+            for (command, expected_status) in [
+                ("XFEATURE COMPRESS GZIP\r\n", 503),
+                ("GROUP alt.test\r\n", 211),
+                ("XFEATURE COMPRESS GZIP\r\n", 503),
+                ("XOVER 1-1\r\n", 224),
+            ] {
+                client.get_mut().write_all(command.as_bytes()).await?;
+                line.clear();
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    client.read_line(&mut line),
+                )
+                .await??;
+                assert_eq!(
+                    StatusCode::parse(line.as_bytes()),
+                    Some(StatusCode::new(expected_status)),
+                    "{mode:?}: {command}"
+                );
+            }
+            let mut payload = vec![0; OVERVIEW_ROW.len() + DOT_TERMINATOR.len()];
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                client.read_exact(&mut payload),
+            )
+            .await??;
+            assert_eq!(&payload[..OVERVIEW_ROW.len()], OVERVIEW_ROW);
+            assert_eq!(&payload[OVERVIEW_ROW.len()..], DOT_TERMINATOR);
+            client.get_mut().write_all(b"CAPABILITIES\r\n").await?;
+            line.clear();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                client.read_line(&mut line),
+            )
+            .await??;
+            assert_eq!(
+                StatusCode::parse(line.as_bytes()),
+                Some(StatusCode::new(101)),
+                "CAPABILITIES must remain usable after overview"
+            );
+            proxy_task.abort();
+            backend_task.abort();
+        }
+        Ok(())
+    }
 
     struct FailingWriter;
 

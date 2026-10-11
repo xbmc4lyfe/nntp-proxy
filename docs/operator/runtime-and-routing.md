@@ -63,6 +63,15 @@ lookups such as:
 
 Commands that depend on selected group or current article state are not a good fit for `per-command` mode.
 
+`CAPABILITIES` omits `READER`, `OVER`, and `HDR` in `per-command` mode because
+those commands require reader state. Hybrid and stateful modes retain their
+reader capability list.
+
+Client `XFEATURE COMPRESS GZIP` requests return `503`: compressed overview
+responses use zlib stream boundaries that the proxy's text framer cannot track.
+Backend RFC 8054 `COMPRESS DEFLATE` negotiation remains available through the
+server `compress` setting.
+
 ## Response Handling
 
 Routing code works with typed request metadata, not raw command strings. The
