@@ -228,6 +228,74 @@ pub(crate) async fn execute_request_exchange_timed<'pool>(
     ))
 }
 
+/// Probe bytes belong to the provider, not to the initiating frontend request.
+#[derive(Clone, Copy)]
+pub(crate) struct ProbeMetrics<'a> {
+    metrics: &'a crate::metrics::MetricsCollector,
+    backend_id: crate::types::BackendId,
+}
+
+impl<'a> ProbeMetrics<'a> {
+    pub(crate) const fn new(
+        metrics: &'a crate::metrics::MetricsCollector,
+        backend_id: crate::types::BackendId,
+    ) -> Self {
+        Self {
+            metrics,
+            backend_id,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum ProbeTiming {
+    Unmeasured,
+    Sampled,
+}
+
+pub(crate) type ProbeTimings = (u64, u64, u64);
+
+/// Account a STAT write before awaiting its reply, so cancellation cannot erase
+/// sent traffic. Framer-owned single-line length excludes any packed next reply.
+/// Counts one provider command after a completed write, including requests
+/// whose replies fail or time out. Failed writes count no probe command, and
+/// no frontend counters are changed.
+pub(crate) async fn execute_stat_probe_exchange<'pool>(
+    mut conn: crate::pool::ConnectionGuard,
+    request: &RequestContext,
+    mut buffer: PooledBuffer,
+    pool: &'pool crate::pool::BufferPool,
+    context: ProbeMetrics<'_>,
+    timing: ProbeTiming,
+) -> Result<(BackendResponseExchange<'pool>, Option<ProbeTimings>)> {
+    anyhow::ensure!(request.is_stat(), "internal probe requires a STAT request");
+    let start = matches!(timing, ProbeTiming::Sampled).then(std::time::Instant::now);
+    request.write_wire_to(conn.stream_mut()).await?;
+    context.metrics.record_command(context.backend_id);
+    context.metrics.record_client_to_backend_bytes_for(
+        context.backend_id,
+        request.request_wire_len().as_u64(),
+    );
+    let after_send = start.map(|_| std::time::Instant::now());
+    read_first_chunk(&mut buffer, &mut conn).await?;
+    let exchange =
+        BackendResponseExchange::read(conn, request, buffer, pool, context.backend_id).await?;
+    if let Some(bytes) = exchange.single_line_bytes() {
+        context
+            .metrics
+            .record_backend_to_client_bytes_for(context.backend_id, bytes.len() as u64);
+    }
+    let timings = start.zip(after_send).map(|(start, after_send)| {
+        let after_recv = std::time::Instant::now();
+        (
+            duration_micros_u64(after_recv.duration_since(start)),
+            duration_micros_u64(after_send.duration_since(start)),
+            duration_micros_u64(after_recv.duration_since(after_send)),
+        )
+    });
+    Ok((exchange, timings))
+}
+
 #[cfg(response_contract = "exchange_constructor")]
 #[allow(dead_code)]
 fn exchange_constructor_is_not_a_caller_api() {

@@ -212,6 +212,13 @@ impl ClientSession {
             return Err(crate::session::SessionError::from(error));
         }
 
+        // The handoff carries already-accounted commands only. Report its
+        // triggering command once before advancing the stateful watermarks.
+        let trigger_bytes = initial_request.request().request_wire_len().as_u64();
+        self.metrics
+            .record_client_to_backend_bytes_for(backend.backend_id(), trigger_bytes);
+        self.metrics.user_bytes_sent(self.username(), trigger_bytes);
+
         // Build initial state with carried-over byte counts
         let initial_bytes =
             stateful_initial_client_bytes(client_to_backend_bytes, &initial_request);

@@ -1218,9 +1218,6 @@ impl ClientSession {
                 safe_command_log_label(&trailing_context)
             );
         }
-        state.client_to_backend_bytes = state
-            .client_to_backend_bytes
-            .add(trailing_context.request_wire_len().get());
         state.auth_access = self.authentication_access(state.auth_access);
 
         let trailing_plan = ExecutableCommandPlan::from(CommandHandler::classify_request(
@@ -1233,6 +1230,11 @@ impl ClientSession {
                 crate::command::StatefulHandoff::new(trailing_context),
             ));
         }
+        // Handoff adds its triggering command after the successful write;
+        // carry only preceding commands so its transfer is not added twice.
+        state.client_to_backend_bytes = state
+            .client_to_backend_bytes
+            .add(trailing_context.request_wire_len().get());
         let mut trailing_context = trailing_context;
         match self
             .process_single_command_with_plan(
