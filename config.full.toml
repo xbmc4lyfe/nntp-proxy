@@ -32,6 +32,8 @@ mode = "hybrid"
 backend_selection = "least-loaded"
 # Enable adaptive availability prechecking for STAT/HEAD commands
 adaptive_precheck = false
+# Retry authoritative 430s for ARTICLE/BODY/HEAD/STAT message IDs after GROUP in hybrid mode.
+reader_message_id_failover = false
 
 # Queue backpressure keeps article routing from piling more work onto
 # already-saturated backend connection pools.

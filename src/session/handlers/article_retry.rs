@@ -5,6 +5,7 @@
 //! skipped until the entry expires.
 
 use super::BackendLease;
+use super::per_command::BatchBackendConnection;
 
 use crate::cache::ArticleAvailability;
 use crate::router::{BackendSelector, SuppressedBackends};
@@ -26,8 +27,8 @@ use crate::protocol::RequestContext;
 use crate::session::precheck;
 
 /// Client-side write state shared across cache, precheck, and direct routing paths.
-pub(super) struct RequestExecutionIo<'a> {
-    pub(super) client_writer: &'a mut crate::session::ClientWriter,
+pub(super) struct RequestExecutionIo<'a, W> {
+    pub(super) client_writer: &'a mut W,
     pub(super) backend_connection: &'a mut Option<BackendLease>,
     pub(super) client_to_backend_bytes: &'a mut ClientToBackendBytes,
     pub(super) backend_to_client_bytes: &'a mut BackendToClientBytes,
@@ -45,15 +46,98 @@ pub(super) enum PreparedRequest {
 }
 
 impl ClientSession {
+    /// Continue a pinned reader lookup only after its provider proved the ID missing.
+    pub(super) async fn retry_reader_message_id<W: AsyncWrite + Unpin>(
+        &self,
+        request: &mut RequestContext,
+        client_writer: &mut W,
+        pinned_backend: crate::types::BackendId,
+    ) -> Result<crate::types::TransferMetrics, SessionError> {
+        let router = self.router.as_ref().ok_or_else(|| {
+            SessionError::Backend(anyhow::anyhow!("reader failover requires a router"))
+        })?;
+        let message_id = request
+            .message_id_value()
+            .expect("framer retry belongs to a validated message-ID lookup");
+        let slot = router.availability_slot(pinned_backend).ok_or_else(|| {
+            SessionError::Backend(anyhow::anyhow!("pinned backend has no availability slot"))
+        })?;
+        self.cache
+            .record_availability_missing(message_id, slot)
+            .await;
+        self.metrics.record_error_4xx(pinned_backend);
+        // Fetch after mutation so an expired payload cannot be rescued by a
+        // stale clone, and partial-hit facts retain the pinned provider's miss.
+        let cached = self
+            .cache
+            .get_request_message_id(request.message_id().unwrap())
+            .await;
+        let mut availability = cached
+            .as_ref()
+            .map(crate::cache::CachedArticle::to_availability)
+            .unwrap_or_default();
+        availability.record_missing_slot(slot);
+        let mut backend_to_client_bytes = BackendToClientBytes::zero();
+        if self.cache.stores_payload_responses()
+            && matches!(
+                self.try_serve_from_cached(
+                    request,
+                    router,
+                    client_writer,
+                    &mut backend_to_client_bytes,
+                    cached
+                )
+                .await?,
+                CacheLookupResult::Hit
+            )
+        {
+            // The stateful caller merges already-reported transfers. Cache
+            // writes have no provider and must report the user's receipt here.
+            self.metrics
+                .user_bytes_received(self.username(), backend_to_client_bytes.as_u64());
+            return Ok(crate::types::TransferMetrics {
+                client_to_backend: ClientToBackendBytes::zero(),
+                backend_to_client: backend_to_client_bytes,
+            });
+        }
+        let mut backend_connection = BatchBackendConnection::default();
+        let mut client_to_backend_bytes = ClientToBackendBytes::zero();
+        let result = self
+            .execute_article_retry_loop(
+                router,
+                request,
+                Some(availability),
+                None,
+                &mut RequestExecutionIo {
+                    client_writer,
+                    backend_connection: backend_connection.slot(),
+                    client_to_backend_bytes: &mut client_to_backend_bytes,
+                    backend_to_client_bytes: &mut backend_to_client_bytes,
+                },
+            )
+            .await;
+        result?;
+        backend_connection.complete_success();
+        if request.response_metadata().is_none() {
+            // Synthetic exhaustion/error replies have no supplying provider.
+            self.metrics
+                .user_bytes_received(self.username(), backend_to_client_bytes.as_u64());
+        }
+        Ok(crate::types::TransferMetrics {
+            client_to_backend: client_to_backend_bytes,
+            backend_to_client: backend_to_client_bytes,
+        })
+    }
+
     /// Route a single lookup request to a backend and execute it.
     ///
     /// This function is `pub(super)` to allow reuse of per-command routing logic by sibling handler modules
     /// (such as `hybrid.rs`) that also need to route commands.
-    pub(super) async fn route_and_execute_request(
+    pub(super) async fn route_and_execute_request<W: AsyncWrite + Unpin>(
         &self,
         router: Arc<BackendSelector>,
         request: &mut RequestContext,
-        client_writer: &mut crate::session::ClientWriter,
+        client_writer: &mut W,
         backend_connection: &mut Option<BackendLease>,
         client_to_backend_bytes: &mut ClientToBackendBytes,
         backend_to_client_bytes: &mut BackendToClientBytes,
@@ -109,16 +193,16 @@ impl ClientSession {
         );
     }
 
-    pub(super) async fn prepare_request_execution(
+    pub(super) async fn prepare_request_execution<W: AsyncWrite + Unpin>(
         &self,
         router: &Arc<BackendSelector>,
         request: &mut RequestContext,
-        io: &mut RequestExecutionIo<'_>,
+        io: &mut RequestExecutionIo<'_, W>,
         preloaded_cache: Option<crate::cache::CachedArticle>,
         preloaded_availability: Option<ArticleAvailability>,
     ) -> Result<PreparedRequest, SessionError> {
         let availability = {
-            let client_write = io.client_writer.get_mut();
+            let client_write = &mut *io.client_writer;
             match self
                 .try_serve_from_cached(
                     request,
@@ -169,11 +253,11 @@ impl ClientSession {
         ArticleAvailability::from_missing_bits(availability.missing_bits())
     }
 
-    async fn try_adaptive_precheck(
+    async fn try_adaptive_precheck<W: AsyncWrite + Unpin>(
         &self,
         router: &Arc<BackendSelector>,
         request: &RequestContext,
-        io: &mut RequestExecutionIo<'_>,
+        io: &mut RequestExecutionIo<'_, W>,
         availability: Option<&ArticleAvailability>,
     ) -> Result<bool, SessionError> {
         if !self.adaptive_precheck || !(request.is_stat() || request.is_head()) {
@@ -194,7 +278,7 @@ impl ClientSession {
             return Ok(false);
         };
 
-        let client_write = io.client_writer.get_mut();
+        let client_write = &mut *io.client_writer;
         let bytes_written = match response {
             precheck::PrecheckResponse::Cached(entry) => {
                 if let Some(write) = write_cached_article_response(
@@ -266,13 +350,13 @@ impl ClientSession {
             .map_err(|e| SessionError::from(anyhow::Error::from(e)))
     }
 
-    async fn execute_article_retry_loop(
+    async fn execute_article_retry_loop<W: AsyncWrite + Unpin>(
         &self,
         router: &Arc<BackendSelector>,
         request: &mut RequestContext,
         availability: Option<ArticleAvailability>,
         mut stat_prefetch: Option<StatPrefetch>,
-        io: &mut RequestExecutionIo<'_>,
+        io: &mut RequestExecutionIo<'_, W>,
     ) -> Result<(), SessionError> {
         trace!(
             "Client {} starting availability routing for request kind={:?}, verb={:?}",
@@ -354,13 +438,13 @@ impl ClientSession {
                             self.client_addr,
                             request.message_id_value()
                         );
-                        let client_write = io.client_writer.get_mut();
+                        let client_write = &mut *io.client_writer;
                         self.send_430_to_client(client_write, io.backend_to_client_bytes)
                             .await?;
                         return Ok(());
                     }
                     let bytes_written = {
-                        let client_write = io.client_writer.get_mut();
+                        let client_write = &mut *io.client_writer;
                         Self::write_backend_error_response(client_write).await?
                     };
                     *io.backend_to_client_bytes = io.backend_to_client_bytes.add(bytes_written);
@@ -390,7 +474,7 @@ impl ClientSession {
             request.message_id_value()
         );
         {
-            let client_write = io.client_writer.get_mut();
+            let client_write = &mut *io.client_writer;
             self.send_430_to_client(client_write, io.backend_to_client_bytes)
                 .await?;
         }
@@ -423,6 +507,142 @@ mod tests {
     use crate::session::ClientSession;
     use crate::types::{BackendId, MessageId};
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn cancelled_reader_retry_preserves_capacity_of_cached_completed_lease() {
+        use crate::auth::AuthHandler;
+        use crate::config::{RoutingMode, Server};
+        use crate::metrics::MetricsCollector;
+        use crate::pool::{BufferPool, DeadpoolConnectionProvider};
+        use crate::protocol::{RequestContext, RequestKind};
+        use crate::router::BackendSelector;
+        use crate::types::{BufferSize, ClientAddress, MaxConnections, Port, ServerName};
+        use std::sync::Arc;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::TcpListener;
+
+        let (probe_started, mut probes) = tokio::sync::mpsc::unbounded_channel();
+        let mut router = BackendSelector::new();
+        // The framer has already proved provider 0 missing before this helper.
+        router.add_backend(
+            ServerName::try_new("pinned").unwrap(),
+            DeadpoolConnectionProvider::new("127.0.0.1".into(), 1, "pinned".into(), 2, None, None),
+            0,
+        );
+        let mut servers = Vec::new();
+        for index in 1..=3 {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let signal = probe_started.clone();
+            servers.push(tokio::spawn(async move {
+                let mut clients = tokio::task::JoinSet::new();
+                while let Ok((stream, _)) = listener.accept().await {
+                    let signal = signal.clone();
+                    clients.spawn(async move {
+                        let mut stream = BufReader::new(stream);
+                        stream.get_mut().write_all(b"200 Ready\r\n").await.unwrap();
+                        loop {
+                            let mut line = String::new();
+                            if stream.read_line(&mut line).await.unwrap_or(0) == 0 {
+                                break;
+                            }
+                            let request = RequestContext::parse(line.as_bytes()).unwrap();
+                            match request.kind() {
+                                RequestKind::Body => stream
+                                    .get_mut()
+                                    .write_all(b"430 Missing secondary\r\n")
+                                    .await
+                                    .unwrap(),
+                                RequestKind::Stat => {
+                                    signal.send(index).unwrap();
+                                    std::future::pending::<()>().await;
+                                }
+                                RequestKind::Mode => stream
+                                    .get_mut()
+                                    .write_all(b"200 Reader mode\r\n")
+                                    .await
+                                    .unwrap(),
+                                _ => stream
+                                    .get_mut()
+                                    .write_all(b"502 Unsupported\r\n")
+                                    .await
+                                    .unwrap(),
+                            }
+                        }
+                    });
+                }
+            }));
+            let tier = u8::from(index != 1);
+            let config = Server::builder("127.0.0.1", Port::try_new(port).unwrap())
+                .name(format!("provider-{index}"))
+                .max_connections(MaxConnections::try_new(2).unwrap())
+                .compress(Some(false))
+                .stat_missing(u8::from(index != 1))
+                .replacement_cooldown(Duration::from_secs(60))
+                .tier(tier)
+                .build()
+                .unwrap();
+            let provider =
+                DeadpoolConnectionProvider::from_server_config(&config, 8192, 8192).unwrap();
+            router.add_backend(config.name.clone(), provider, tier);
+        }
+        let router = Arc::new(router);
+        let cached_provider = router
+            .backend_provider(BackendId::from_index(1))
+            .unwrap()
+            .clone();
+        let session = ClientSession::builder(
+            ClientAddress::from("127.0.0.1:9999".parse::<std::net::SocketAddr>().unwrap()),
+            BufferPool::new(BufferSize::try_new(8192).unwrap(), 4),
+            Arc::new(AuthHandler::new(None, None).unwrap()),
+            MetricsCollector::new(4),
+        )
+        .with_router(router)
+        .with_routing_mode(RoutingMode::Hybrid)
+        .build();
+        let cache = session.cache.clone();
+        let retry = tokio::spawn(async move {
+            let mut request = RequestContext::parse(b"BODY <cancel@reader>\r\n").unwrap();
+            session
+                .retry_reader_message_id(
+                    &mut request,
+                    &mut tokio::io::sink(),
+                    BackendId::from_index(0),
+                )
+                .await
+        });
+        for _ in 0..2 {
+            tokio::time::timeout(Duration::from_secs(3), probes.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        assert_eq!(
+            cache
+                .get_request_message_id("<cancel@reader>")
+                .await
+                .unwrap()
+                .availability()
+                .missing_bits(),
+            0b11
+        );
+        let cached = cached_provider.status_counts();
+        assert_eq!(
+            (cached.size, cached.available, cached.max_size),
+            (1, 0, 2),
+            "secondary's completed 430 lease must still be cached during probes"
+        );
+        retry.abort();
+        assert!(retry.await.unwrap_err().is_cancelled());
+        assert_eq!(
+            cached_provider.status_counts().max_size,
+            2,
+            "cancelling a completed cached lease must not trigger replacement cooldown"
+        );
+        for server in servers {
+            server.abort();
+        }
+    }
 
     #[tokio::test]
     async fn status_fact_preserves_missing_backend_without_payload() {

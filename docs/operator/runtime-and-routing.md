@@ -47,6 +47,26 @@ The config surface and CLI expose three modes:
 
 Hybrid is the default routing mode. `per-command` and `stateful` remain available as explicit modes, and the runtime honors the configured mode.
 
+Set `[routing] reader_message_id_failover = true` to recover message-ID
+`ARTICLE`, `BODY`, `HEAD`, and `STAT` requests after a hybrid reader selects
+a group. The pinned provider is always tried first. An authoritative `430`
+then enables the existing tier-aware retry path, including providers excluded
+from stateful sessions. This helps indexers that select a group before fetching
+PAR2/NFO metadata by message-ID. The secondary provider's response is forwarded
+in the original request's position in the pipeline.
+
+The option defaults to `false` and applies only to hybrid sessions. Group
+selection, overview ranges, numeric and argumentless article commands retain
+their pinned provider and current article pointer. A missing article on one
+provider does not permit skipping other eligible providers in the same tier.
+
+After the pinned provider returns `430`, a TTL-valid cached response is served
+when its payload variant satisfies the requested reader command. Otherwise,
+recovery follows the same availability and tier rules. The proxy transports and
+retries metadata; it does not run a PreDB matcher. See the
+[release-matching operator guide](release-matching.md) for consumer-side evidence
+and source-access guidance.
+
 ## What per-command mode supports
 
 Per-command mode is meant for stateless operations, especially message-ID

@@ -7,6 +7,8 @@
 
 use divan::{Bencher, black_box};
 use nntp_proxy::config::{Cache, Config, Server};
+use nntp_proxy::protocol::{RequestContext, RequestKind, StatusCode};
+use nntp_proxy::session::ResponseFixture;
 use nntp_proxy::types::{CacheCapacity, MaxConnections, Port};
 use nntp_proxy::{NntpProxy, RoutingMode};
 use std::sync::Arc;
@@ -69,12 +71,17 @@ fn metadata_only_cache() -> Cache {
 }
 
 fn spawn_backend(listener: TcpListener, response: Arc<[u8]>) {
+    let group_response: Arc<[u8]> =
+        ResponseFixture::status(StatusCode::new(211), "1 42 42 alt.test")
+            .wire()
+            .into();
     tokio::spawn(async move {
         loop {
             let Ok((stream, _)) = listener.accept().await else {
                 break;
             };
             let response = Arc::clone(&response);
+            let group_response = Arc::clone(&group_response);
             tokio::spawn(async move {
                 let (read_half, mut write_half) = stream.into_split();
                 let mut reader = BufReader::new(read_half);
@@ -102,6 +109,10 @@ fn spawn_backend(listener: TcpListener, response: Arc<[u8]>) {
                         write_half.write_all(&response).await
                     } else if bytes.starts_with(b"MODE READER") {
                         write_half.write_all(b"200 Reader mode\r\n").await
+                    } else if RequestContext::parse(bytes)
+                        .is_some_and(|request| request.kind() == RequestKind::Group)
+                    {
+                        write_half.write_all(&group_response).await
                     } else if bytes.starts_with(b"DATE") {
                         write_half.write_all(b"111 20260503120000\r\n").await
                     } else if bytes.starts_with(b"QUIT") {
@@ -148,6 +159,61 @@ struct BenchProxy {
 }
 
 impl BenchProxy {
+    async fn start_reader(body_len: usize, enabled: bool, primary_miss: bool) -> Self {
+        let response: Arc<[u8]> = ResponseFixture::reader(RequestKind::Article, 0, MSG_ID)
+            .header("Subject", "Reader metadata")
+            .body(vec![b'x'; body_len])
+            .wire()
+            .into();
+        let primary = bind_localhost().await;
+        let primary_port = primary.local_addr().unwrap().port();
+        let mut config = bench_config(primary_port, None);
+        config.servers[0].max_connections = MaxConnections::try_new(1).unwrap();
+        config.routing.reader_message_id_failover = enabled;
+        if primary_miss {
+            spawn_backend(
+                primary,
+                ResponseFixture::status(StatusCode::new(430), "Missing primary")
+                    .wire()
+                    .into(),
+            );
+            let secondary = TcpListener::bind("127.0.0.2:0").await.unwrap();
+            config.servers.push(
+                Server::builder(
+                    "127.0.0.2",
+                    Port::try_new(secondary.local_addr().unwrap().port()).unwrap(),
+                )
+                .name("reader-secondary")
+                .max_connections(MaxConnections::try_new(1).unwrap())
+                .tier(1)
+                .build()
+                .unwrap(),
+            );
+            spawn_backend(secondary, response.clone());
+        } else {
+            spawn_backend(primary, response.clone());
+        }
+        let listener = bind_localhost().await;
+        let address = listener.local_addr().unwrap();
+        let proxy = NntpProxy::new(config, RoutingMode::Hybrid).await.unwrap();
+        spawn_proxy(listener, proxy, RoutingMode::Hybrid);
+        let mut stream = TcpStream::connect(address).await.unwrap();
+        stream.set_nodelay(true).unwrap();
+        let mut status = Vec::new();
+        read_line(&mut stream, &mut status).await;
+        stream.write_all(b"GROUP alt.test\r\n").await.unwrap();
+        read_line(&mut stream, &mut status).await;
+        ResponseFixture::status(StatusCode::new(211), "1 42 42 alt.test")
+            .assert_received(&mut status.as_slice())
+            .await
+            .unwrap();
+        Self {
+            stream,
+            response_buffer: vec![0; body_len * 2 + 1024].into_boxed_slice(),
+            response_len: response.len(),
+        }
+    }
+
     async fn start(body_len: usize, cache: Option<Cache>, mode: RoutingMode) -> Self {
         let backend_listener = bind_localhost().await;
         let backend_port = backend_listener.local_addr().unwrap().port();
@@ -258,6 +324,43 @@ fn bench_window(bencher: Bencher, body_len: usize, mode: RoutingMode) {
 
 fn bench_stateful_window(bencher: Bencher, body_len: usize) {
     bench_window(bencher, body_len, RoutingMode::Stateful);
+}
+
+fn bench_reader_lookup(bencher: Bencher, body_len: usize, enabled: bool, primary_miss: bool) {
+    let rt = Builder::new_current_thread().enable_all().build().unwrap();
+    let mut proxy = rt.block_on(BenchProxy::start_reader(body_len, enabled, primary_miss));
+    bencher
+        .counter(divan::counter::BytesCount::new(body_len))
+        .bench_local(|| black_box(rt.block_on(proxy.article_roundtrip())));
+}
+
+mod reader_message_id_failover {
+    use super::{ARTICLE_64K, ARTICLE_AVG_788K, Bencher, bench_reader_lookup};
+
+    #[divan::bench(sample_count = 50, sample_size = 10)]
+    fn default_primary_hit_64k(bencher: Bencher) {
+        bench_reader_lookup(bencher, ARTICLE_64K, false, false);
+    }
+    #[divan::bench(sample_count = 50, sample_size = 10)]
+    fn enabled_primary_hit_64k(bencher: Bencher) {
+        bench_reader_lookup(bencher, ARTICLE_64K, true, false);
+    }
+    #[divan::bench(sample_count = 50, sample_size = 10)]
+    fn enabled_primary_miss_64k(bencher: Bencher) {
+        bench_reader_lookup(bencher, ARTICLE_64K, true, true);
+    }
+    #[divan::bench(sample_count = 50, sample_size = 5)]
+    fn default_primary_hit_788k(bencher: Bencher) {
+        bench_reader_lookup(bencher, ARTICLE_AVG_788K, false, false);
+    }
+    #[divan::bench(sample_count = 50, sample_size = 5)]
+    fn enabled_primary_hit_788k(bencher: Bencher) {
+        bench_reader_lookup(bencher, ARTICLE_AVG_788K, true, false);
+    }
+    #[divan::bench(sample_count = 50, sample_size = 5)]
+    fn enabled_primary_miss_788k(bencher: Bencher) {
+        bench_reader_lookup(bencher, ARTICLE_AVG_788K, true, true);
+    }
 }
 
 fn bench_per_command_pair(bencher: Bencher, body_len: usize) {

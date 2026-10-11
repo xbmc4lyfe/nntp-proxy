@@ -254,6 +254,9 @@ pub struct Routing {
     /// Queue behavior for routing decisions.
     #[serde(default)]
     pub queue: RoutingQueue,
+    /// Retry message-ID reader misses after a hybrid session has selected a group.
+    #[serde(default)]
+    pub reader_message_id_failover: bool,
 }
 
 impl Default for Routing {
@@ -263,6 +266,7 @@ impl Default for Routing {
             backend_selection: BackendSelectionStrategy::default(),
             adaptive_precheck: defaults::adaptive_precheck(),
             queue: RoutingQueue::default(),
+            reader_message_id_failover: false,
         }
     }
 }

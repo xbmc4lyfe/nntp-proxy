@@ -7,7 +7,9 @@ use crate::command::AuthenticationAccess;
 use crate::protocol::RequestKind;
 use crate::session::ClientAuthState;
 use crate::session::backend::BackendResponseOrder;
-use crate::session::multiline_framing::{OrderedClientWrites, ReadyDeferredReplies};
+use crate::session::multiline_framing::{
+    OrderedClientActions, OrderedClientWrites, ReadyDeferredReplies,
+};
 use crate::types::{BackendToClientBytes, ClientToBackendBytes, TransferMetrics};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -182,6 +184,33 @@ impl SessionLoopState {
     #[inline]
     pub fn mark_backend_request_sent(&mut self, kind: RequestKind) {
         self.backend_replies.push_request(kind);
+    }
+
+    pub(in crate::session) fn mark_retryable_backend_request_sent(
+        &mut self,
+        request: crate::protocol::RequestContext,
+    ) {
+        self.backend_replies.push_retryable_request(request);
+    }
+
+    pub(in crate::session) fn client_actions_for_backend_read<'a>(
+        &mut self,
+        bytes: &'a [u8],
+    ) -> OrderedClientActions<'a> {
+        self.backend_replies.client_actions_for_backend_read(bytes)
+    }
+
+    /// Routed exchanges already report their provider/user metrics separately.
+    /// Callers first flush pinned deltas so advancing these marks cannot hide them.
+    pub(in crate::session) fn add_reported_transfer(&mut self, transfer: TransferMetrics) {
+        self.client_to_backend = self
+            .client_to_backend
+            .add_u64(transfer.client_to_backend.as_u64());
+        self.backend_to_client = self
+            .backend_to_client
+            .add_u64(transfer.backend_to_client.as_u64());
+        self.last_reported_c2b = self.client_to_backend;
+        self.last_reported_b2c = self.backend_to_client;
     }
 
     /// Whether earlier forwarded backend replies are still ahead of any deferred local replies.

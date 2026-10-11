@@ -182,6 +182,7 @@ impl NntpProxyBuilder {
         };
 
         let adaptive_precheck = self.config.routing.adaptive_precheck;
+        let reader_message_id_failover = self.config.routing.reader_message_id_failover;
         let queue_backpressure = self.config.routing.queue.backpressure.clone();
 
         let backend_strategy = self.config.routing.backend_selection;
@@ -254,6 +255,7 @@ impl NntpProxyBuilder {
             auth_handler,
             adaptive_precheck,
             routing_mode: self.routing_mode,
+            reader_message_id_failover,
             memory,
             availability_layout,
         };
@@ -420,6 +422,7 @@ pub(super) struct BuildContext {
     router: Arc<router::BackendSelector>,
     auth_handler: Arc<AuthHandler>,
     adaptive_precheck: bool,
+    reader_message_id_failover: bool,
     routing_mode: RoutingMode,
     memory: Memory,
     availability_layout: crate::cache::AvailabilityLayout,
@@ -440,6 +443,7 @@ impl BuildContext {
             cache,
             memory: self.memory,
             adaptive_precheck: self.adaptive_precheck,
+            reader_message_id_failover: self.reader_message_id_failover,
             last_activity_nanos: Arc::new(AtomicU64::new(0)),
             active_clients: Arc::new(AtomicUsize::new(0)),
             start_instant: Instant::now(),

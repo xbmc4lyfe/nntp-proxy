@@ -253,7 +253,7 @@ fn classify_authenticated_stateful_action(
 impl ClientSession {
     async fn handle_authenticated_stateful_request<W, BW>(
         &self,
-        request: &RequestContext,
+        request: RequestContext,
         client_write: &mut W,
         backend_write: &mut BW,
         state: &mut crate::session::state::SessionLoopState,
@@ -262,14 +262,22 @@ impl ClientSession {
         W: tokio::io::AsyncWrite + Unpin,
         BW: tokio::io::AsyncWrite + Unpin,
     {
-        match classify_authenticated_stateful_action(request, state.auth_access) {
+        match classify_authenticated_stateful_action(&request, state.auth_access) {
             AuthenticatedStatefulAction::Forward => {
                 request
                     .write_wire_to(backend_write)
                     .await
                     .map_err(|error| StatefulLoopError::backend(error.into()))?;
                 state.add_client_to_backend(request.request_wire_len().get());
-                state.mark_backend_request_sent(request.kind());
+                if self.reader_message_id_failover
+                    && self.mode_state.routing_mode() == crate::config::RoutingMode::Hybrid
+                    && self.router.is_some()
+                    && CommandHandler::article_lookup_request(&request).is_some()
+                {
+                    state.mark_retryable_backend_request_sent(request);
+                } else {
+                    state.mark_backend_request_sent(request.kind());
+                }
             }
             AuthenticatedStatefulAction::RejectAuthAlreadyAuthenticated => {
                 use crate::protocol::AUTH_ALREADY_AUTHENTICATED;
@@ -345,16 +353,45 @@ impl ClientSession {
         buffer: &crate::pool::PooledBuffer,
         len: usize,
         state: &mut crate::session::state::SessionLoopState,
+        backend_id: crate::types::BackendId,
     ) -> std::result::Result<(), StatefulLoopError>
     where
         W: tokio::io::AsyncWrite + Unpin,
     {
-        for write in state.client_writes_for_backend_read(&buffer[..len]) {
+        if !self.reader_message_id_failover {
+            for write in state.client_writes_for_backend_read(&buffer[..len]) {
+                client_write
+                    .write_all(write.as_ref())
+                    .await
+                    .map_err(|error| StatefulLoopError::client(error.into()))?;
+                state.add_backend_to_client(write.len() as u64);
+            }
             client_write
-                .write_all(write.as_ref())
+                .flush()
                 .await
                 .map_err(|error| StatefulLoopError::client(error.into()))?;
-            state.add_backend_to_client(write.len() as u64);
+            return Ok(());
+        }
+        for action in state.client_actions_for_backend_read(&buffer[..len]) {
+            match action {
+                crate::session::multiline_framing::OrderedClientAction::Write(write) => {
+                    client_write
+                        .write_all(write.as_ref())
+                        .await
+                        .map_err(|error| StatefulLoopError::client(error.into()))?;
+                    state.add_backend_to_client(write.len() as u64);
+                }
+                crate::session::multiline_framing::OrderedClientAction::RetryMissing(
+                    mut request,
+                ) => {
+                    state.flush_byte_deltas(&self.metrics, backend_id, self.username());
+                    let transfer = self
+                        .retry_reader_message_id(&mut request, client_write, backend_id)
+                        .await
+                        .map_err(|error| StatefulLoopError::client(error.into()))?;
+                    state.add_reported_transfer(transfer);
+                }
+            }
         }
         client_write
             .flush()
@@ -504,6 +541,7 @@ impl ClientSession {
                             &buffer,
                             len,
                             &mut state,
+                            backend_id,
                         )
                         .await?;
                         if state.backend_acknowledged_quit() {
@@ -561,7 +599,7 @@ impl ClientSession {
 
                             if state.auth_access.can_access_backend() {
                                 self.handle_authenticated_stateful_request(
-                                    &request,
+                                    request,
                                     &mut client_write,
                                     &mut backend_write,
                                     &mut state,
@@ -615,6 +653,7 @@ impl ClientSession {
                                 &buffer,
                                 len,
                                 &mut state,
+                                backend_id,
                             )
                             .await?;
                             if state.backend_acknowledged_quit() {
