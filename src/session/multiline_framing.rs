@@ -2958,6 +2958,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stat_probe_accounting_excludes_packed_next_reply_bytes() {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let framed = b"223 0 <probe@test>\r\n";
+        let mut packet = framed.to_vec();
+        packet.extend_from_slice(b"211 unexpected suffix\r\n");
+        let packet_len = packet.len();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut stream = BufReader::new(stream);
+            stream.get_mut().write_all(b"200 Ready\r\n").await.unwrap();
+            let mut line = String::new();
+            loop {
+                line.clear();
+                stream.read_line(&mut line).await.unwrap();
+                if crate::protocol::RequestContext::parse(line.as_bytes())
+                    .unwrap()
+                    .is_stat()
+                {
+                    stream.get_mut().write_all(&packet).await.unwrap();
+                    break;
+                }
+                stream.get_mut().write_all(b"200 Ready\r\n").await.unwrap();
+            }
+            std::future::pending::<()>().await;
+        });
+        let provider = crate::pool::DeadpoolConnectionProvider::builder("127.0.0.1", port)
+            .max_connections(1)
+            .build()
+            .unwrap();
+        let guard = provider
+            .checkout_connection_guard()
+            .await
+            .unwrap()
+            .activate();
+        let request = crate::protocol::RequestContext::parse(b"STAT <probe@test>\r\n").unwrap();
+        let pool = make_pool();
+        let metrics = crate::metrics::MetricsCollector::new(1);
+        let (exchange, _) = crate::session::backend::execute_stat_probe_exchange(
+            guard,
+            &request,
+            pool.acquire(),
+            &pool,
+            crate::session::backend::ProbeMetrics::new(
+                &metrics,
+                crate::types::BackendId::from_index(0),
+            ),
+            crate::session::backend::ProbeTiming::Unmeasured,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            exchange.received_len(),
+            packet_len,
+            "fixture must exercise a coalesced read"
+        );
+        assert_eq!(exchange.single_line_bytes(), Some(framed.as_slice()));
+        let snapshot = metrics.snapshot(None);
+        assert_eq!(
+            snapshot.backend_stats[0].bytes_sent.as_u64(),
+            b"STAT <probe@test>\r\n".len() as u64
+        );
+        assert_eq!(
+            snapshot.backend_stats[0].bytes_received.as_u64(),
+            framed.len() as u64
+        );
+        assert_eq!(
+            snapshot.backend_to_client_bytes.as_u64(),
+            framed.len() as u64
+        );
+        assert!(snapshot.user_stats.is_empty());
+        exchange.fail_backend();
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn response_fixture_reader_rejects_wrong_status_and_payload() {
         let fixture =
             ResponseFixture::reader(crate::protocol::RequestKind::Body, 0, "<fixture@reader>")

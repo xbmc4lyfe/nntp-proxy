@@ -67,6 +67,11 @@ retries metadata; it does not run a PreDB matcher. See the
 [release-matching operator guide](release-matching.md) for consumer-side evidence
 and source-access guidance.
 
+Internal `STAT` probes contribute their completed request writes and framed
+single-line replies to provider/global byte counters, not user request or
+receipt counters. These counters do not include TCP/TLS overhead or partial,
+unclassifiable probe replies. Probe accounting does not change retry policy.
+
 ## What per-command mode supports
 
 Per-command mode is meant for stateless operations, especially message-ID

@@ -973,3 +973,129 @@ async fn reader_retry_stat_lookup_does_not_probe_stat_again() -> Result<()> {
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn reader_internal_stat_traffic_is_provider_only() -> Result<()> {
+    let mut body_user_commands = None;
+    for (verb, kind, stat_missing, probe_code, fetched) in [
+        ("BODY", RequestKind::Body, 1, 223, true),
+        ("ARTICLE", RequestKind::Article, 1, 430, false),
+        ("BODY", RequestKind::Body, 1, 503, true),
+        ("BODY", RequestKind::Body, 0, 430, true),
+        ("STAT", RequestKind::Stat, 1, 223, true),
+    ] {
+        let primary = reader_backend("127.0.0.1", 0, status(430, "Missing primary")).await?;
+        let mut secondary = reader_backend("127.0.0.2", 1, metadata(kind)).await?;
+        secondary.config.stateful_sessions = nntp_proxy::config::StatefulSessions::Excluded;
+        secondary.config.stat_missing = stat_missing;
+        let probe = if probe_code == 223 {
+            metadata(RequestKind::Stat)
+        } else {
+            status(probe_code, "Probe outcome")
+        };
+        *secondary.probe.lock().unwrap() = Some(probe.clone());
+        let (proxy, mut client) = reader_proxy(&[&primary, &secondary], true).await?;
+        let before = proxy.metrics().snapshot(None);
+        exchange(&mut client, "GROUP alt.test", &group()).await?;
+        let response = if fetched {
+            metadata(kind)
+        } else {
+            status(430, "No such article")
+        };
+        exchange(&mut client, &format!("{verb} {ID}"), &response).await?;
+        exchange(&mut client, "QUIT", &status(205, "Goodbye")).await?;
+        assert_eq!(client.read(&mut [0]).await?, 0);
+        let after = proxy.metrics().snapshot(None);
+        let commands: Vec<String> = secondary
+            .commands
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|command| command.ends_with(ID))
+            .cloned()
+            .collect();
+        let internal_probe = stat_missing != 0 && kind != RequestKind::Stat;
+        let expected_commands = match (internal_probe, fetched) {
+            (true, true) => vec![format!("STAT {ID}"), format!("{verb} {ID}")],
+            (true, false) => vec![format!("STAT {ID}")],
+            (false, true) => vec![format!("{verb} {ID}")],
+            (false, false) => unreachable!(),
+        };
+        assert_eq!(
+            commands, expected_commands,
+            "verb={verb}, probe={probe_code}"
+        );
+        let provider_sent = expected_commands
+            .iter()
+            .map(|command| command.len() as u64 + 2)
+            .sum::<u64>();
+        let provider_received = if internal_probe {
+            probe.wire_len() as u64
+                + if fetched {
+                    metadata(kind).wire_len() as u64
+                } else {
+                    0
+                }
+        } else {
+            metadata(kind).wire_len() as u64
+        };
+        assert_eq!(
+            after.backend_stats[1].bytes_sent.as_u64()
+                - before.backend_stats[1].bytes_sent.as_u64(),
+            provider_sent,
+            "verb={verb}, probe={probe_code}"
+        );
+        assert_eq!(
+            after.backend_stats[1].bytes_received.as_u64()
+                - before.backend_stats[1].bytes_received.as_u64(),
+            provider_received,
+            "verb={verb}, probe={probe_code}"
+        );
+        let frontend_sent = format!("GROUP alt.test\r\n{verb} {ID}\r\nQUIT\r\n").len() as u64;
+        assert_eq!(
+            after.user_stats[0].bytes_sent.as_u64() - before.user_stats[0].bytes_sent.as_u64(),
+            frontend_sent
+        );
+        let frontend_received =
+            (group().wire_len() + response.wire_len() + status(205, "Goodbye").wire_len()) as u64;
+        assert_eq!(
+            after.user_stats[0].bytes_received.as_u64()
+                - before.user_stats[0].bytes_received.as_u64(),
+            frontend_received
+        );
+        if kind == RequestKind::Body && fetched {
+            let commands = after.user_stats[0].total_commands.get()
+                - before.user_stats[0].total_commands.get();
+            if let Some(previous) = body_user_commands {
+                assert_eq!(
+                    commands, previous,
+                    "internal probes must not add USER commands"
+                );
+            }
+            body_user_commands = Some(commands);
+        }
+        assert_eq!(
+            after.client_to_backend_bytes.as_u64() - before.client_to_backend_bytes.as_u64(),
+            frontend_sent + provider_sent
+        );
+        assert_eq!(
+            after.backend_to_client_bytes.as_u64() - before.backend_to_client_bytes.as_u64(),
+            (group().wire_len() + status(205, "Goodbye").wire_len()) as u64 + provider_received
+        );
+        assert_eq!(
+            proxy
+                .cache()
+                .get_request_message_id(ID)
+                .await
+                .unwrap()
+                .availability()
+                .missing_bits(),
+            if internal_probe && probe_code == 430 {
+                0b11
+            } else {
+                0b01
+            }
+        );
+    }
+    Ok(())
+}
