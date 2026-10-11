@@ -14,6 +14,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Successful retry and background `STAT` probes now return their completed connections to the pool instead of closing them and reducing pool capacity for the replacement cooldown.
+- Uncached article requests no longer start duplicate background `STAT` probes on backup backends.
+- Stateful sessions that receive a complete `205` reply to `QUIT` no longer treat the expected backend closure as a failure or reduce pool capacity.
 - A backend that refuses a login (for example `502 connection limit reached`, a bad greeting, or a failed `AUTHINFO`) is no longer retried on every request. Pool creation for that backend now fails locally for 5 s, doubling up to 60 s while the refusals continue, and when each window closes a single probe login decides whether to resume; it resets after a successful login. Routing moves to the next backend meanwhile, and the provider no longer sees a stream of failed logins that can lead to account-wide blocking.
 - Per-command requests that aren't message-ID lookups (for example `LIST ACTIVE` and `LIST COUNTS`) no longer reach backends with `stateful_sessions = "excluded"`, so their high and low article numbers match the numbering that stateful sessions see.
 - A hybrid session that can't get a backend for its first stateful command now receives `400 Backend server unavailable` instead of a silently closed connection.

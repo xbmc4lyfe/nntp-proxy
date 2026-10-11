@@ -276,7 +276,6 @@ impl ClientSession {
         let mut availability = availability.unwrap_or_default();
         let mut unavailable_backends = SuppressedBackends::empty();
         let mut is_retry_attempt = false;
-        let mut non_primary_tier_prefetch_started = false;
         let mut retry_stat_sweep_done = false;
         trace!(
             "Client {} availability routing: missing_bits={:08b}, backend_count={}",
@@ -286,16 +285,6 @@ impl ClientSession {
         );
 
         while !availability.all_exhausted(router.availability_mask()) {
-            if !is_retry_attempt && !non_primary_tier_prefetch_started {
-                self.spawn_non_primary_tier_stat_prefetch(
-                    router,
-                    request,
-                    &availability,
-                    unavailable_backends,
-                );
-                non_primary_tier_prefetch_started = true;
-            }
-
             if is_retry_attempt && !retry_stat_sweep_done {
                 self.parallel_retry_stat_sweep(
                     router,

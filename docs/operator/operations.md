@@ -65,6 +65,13 @@ nntp-proxy --port 8120
 - Check `[routing].mode` first when behavior does not match your workload.
 - `hybrid` starts per-command and switches to a dedicated backend for stateful commands.
 
+### STAT probe failures
+
+Set `RUST_LOG=info,nntp_proxy::stat_probe=debug` to see why a retry or background
+`STAT` probe failed. These messages include the backend and error without logging
+request text or credentials. Failed probes still retire their dirty connections;
+successful probes return their connections to the pool.
+
 ### TLS failures
 
 - Keep `tls_verify_cert = true` in production.

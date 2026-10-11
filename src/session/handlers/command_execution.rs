@@ -31,6 +31,32 @@ const BACKEND_TIMING_SAMPLE_MASK: u64 = 0x0f;
 const STAT_PROBE_CHECKOUT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 static BACKEND_TIMING_SAMPLE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// A complete STAT reply only permits reuse when it confirms present or missing.
+/// Terminal or unexpected statuses must still retire the backend connection.
+async fn finish_stat_probe(exchange: backend::BackendResponseExchange<'_>) -> Result<StatusCode> {
+    let parsed_status = exchange.status_code();
+    let status = parsed_status.filter(|status| {
+        matches!(
+            status.as_u16(),
+            crate::protocol::codes::ARTICLE_EXISTS | crate::protocol::codes::NO_SUCH_ARTICLE_ID
+        )
+    });
+    let Some(status) = status else {
+        exchange.fail_backend();
+        anyhow::bail!("STAT returned an unexpected or terminal status: {parsed_status:?}");
+    };
+
+    let conn = exchange.observe_and_reuse().await?;
+    if conn.has_pending_bytes() {
+        conn.fail_backend();
+        anyhow::bail!("STAT left unexpected queued backend bytes");
+    }
+    // Observing proves completion but leaves pool ownership with this caller.
+    // Dropping the guard instead would close a healthy socket and apply cooldown.
+    let _ = conn.complete_success();
+    Ok(status)
+}
+
 #[inline]
 pub(crate) fn should_sample_backend_timing() -> bool {
     BACKEND_TIMING_SAMPLE_COUNTER.fetch_add(1, Ordering::Relaxed) & BACKEND_TIMING_SAMPLE_MASK == 0
@@ -476,15 +502,21 @@ impl ClientSession {
                 .await
                 {
                     Ok(exchange) => exchange,
-                    Err(_) => return RetryStatProbeOutcome::Unavailable(backend_id),
+                    Err(error) => {
+                        debug!(target: "nntp_proxy::stat_probe", backend = backend_id.as_index(), pool = %provider.name(), error = %error, "Retry STAT exchange failed");
+                        return RetryStatProbeOutcome::Unavailable(backend_id);
+                    }
                 };
 
-                let status_code = exchange.status_code();
-                if exchange.observe_and_reuse().await.is_err() {
-                    return RetryStatProbeOutcome::Unavailable(backend_id);
-                }
+                let status_code = match finish_stat_probe(exchange).await {
+                    Ok(status) => status,
+                    Err(error) => {
+                        debug!(target: "nntp_proxy::stat_probe", backend = backend_id.as_index(), pool = %provider.name(), error = %error, "Retry STAT response could not be consumed");
+                        return RetryStatProbeOutcome::Unavailable(backend_id);
+                    }
+                };
 
-                if status_code.is_some_and(|status| status.as_u16() == 430) {
+                if status_code.as_u16() == crate::protocol::codes::NO_SUCH_ARTICLE_ID {
                     RetryStatProbeOutcome::Missing(backend_id)
                 } else {
                     RetryStatProbeOutcome::Present
@@ -602,14 +634,20 @@ impl ClientSession {
                     .await
                     {
                         Ok(exchange) => exchange,
-                        Err(_) => return,
+                        Err(error) => {
+                            debug!(target: "nntp_proxy::stat_probe", backend = backend_id.as_index(), pool = %provider.name(), error = %error, "Background STAT exchange failed");
+                            return;
+                        }
                     };
-                    let status_code = exchange.status_code();
-                    if exchange.observe_and_reuse().await.is_err() {
-                        return;
-                    }
+                    let status_code = match finish_stat_probe(exchange).await {
+                        Ok(status) => status,
+                        Err(error) => {
+                            debug!(target: "nntp_proxy::stat_probe", backend = backend_id.as_index(), pool = %provider.name(), error = %error, "Background STAT response could not be consumed");
+                            return;
+                        }
+                    };
 
-                    if status_code.is_some_and(|status| status.as_u16() == 430)
+                    if status_code.as_u16() == crate::protocol::codes::NO_SUCH_ARTICLE_ID
                         && let Ok(msg_id) = crate::types::MessageId::new(msg_id_text)
                     {
                         cache
@@ -1876,6 +1914,12 @@ mod tests {
     }
 
     async fn spawn_stat_missing_probe_server() -> (u16, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        spawn_stat_probe_server(b"430 Missing\r\n").await
+    }
+
+    async fn spawn_stat_probe_server(
+        stat_response: &'static [u8],
+    ) -> (u16, Arc<AtomicUsize>, Arc<AtomicUsize>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let stat_commands = Arc::new(AtomicUsize::new(0));
@@ -1906,7 +1950,7 @@ mod tests {
                                     let _ = write_half.write_all(b"200 Posting allowed\r\n").await;
                                 } else if cmd.starts_with("STAT ") {
                                     stat_count.fetch_add(1, Ordering::SeqCst);
-                                    let _ = write_half.write_all(b"430 Missing\r\n").await;
+                                    let _ = write_half.write_all(stat_response).await;
                                 } else if cmd.starts_with("BODY") || cmd.starts_with("ARTICLE") {
                                     body_count.fetch_add(1, Ordering::SeqCst);
                                     let _ = write_half.write_all(
@@ -2491,6 +2535,97 @@ mod tests {
         assert_eq!(stat1.load(Ordering::SeqCst), 1);
         assert_eq!(body0.load(Ordering::SeqCst), 0);
         assert_eq!(body1.load(Ordering::SeqCst), 0);
+        for backend in [BackendId::from_index(0), BackendId::from_index(1)] {
+            let counts = router.backend_provider(backend).unwrap().status_counts();
+            assert_eq!(counts.size, 1, "successful STAT must keep its connection");
+            assert_eq!(
+                counts.available, 1,
+                "successful STAT must release its guard"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn stat_probes_reuse_valid_replies_and_retire_discontinued_service() {
+        for (reply, expected_available, expected_missing, expected_unavailable) in [
+            (b"223 0 <found@example.com>\r\n".as_slice(), 1, 0, 0),
+            (b"430 Missing\r\n".as_slice(), 1, 3, 0),
+            (b"400 Service discontinued\r\n".as_slice(), 0, 0, 3),
+        ] {
+            let session = test_session();
+            let (port0, stats0, _) = spawn_stat_probe_server(reply).await;
+            let (port1, stats1, _) = spawn_stat_probe_server(reply).await;
+            let providers = [port0, port1].map(|port| {
+                DeadpoolConnectionProvider::builder("127.0.0.1", port)
+                    .max_connections(2)
+                    .stat_missing(true)
+                    .build()
+                    .unwrap()
+            });
+            let router =
+                router_with_tiered_backends([(providers[0].clone(), 1), (providers[1].clone(), 2)]);
+            let request = request_context(b"BODY <found@example.com>\r\n");
+            let mut availability = ArticleAvailability::new();
+            let mut sent = ClientToBackendBytes::zero();
+            let mut lease = None;
+            let mut suppressed = SuppressedBackends::empty();
+            session
+                .parallel_retry_stat_sweep(
+                    &router,
+                    &request,
+                    &mut ArticleAttemptState {
+                        availability: &mut availability,
+                        client_to_backend_bytes: &mut sent,
+                        backend_connection: &mut lease,
+                        unavailable_backends: &mut suppressed,
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                availability.missing_bits(),
+                expected_missing,
+                "reply: {reply:?}"
+            );
+            assert_eq!(suppressed.bits(), expected_unavailable, "reply: {reply:?}");
+            for provider in &providers {
+                assert_eq!(
+                    provider.status_counts().available,
+                    expected_available,
+                    "sweep reply: {reply:?}"
+                );
+            }
+
+            session.spawn_non_primary_tier_stat_prefetch(
+                &router,
+                &request,
+                &ArticleAvailability::new(),
+                SuppressedBackends::empty(),
+            );
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while stats0.load(Ordering::SeqCst) < 2
+                    || stats1.load(Ordering::SeqCst) < 2
+                    || [0, 1].iter().any(|index| {
+                        router
+                            .backend_load(BackendId::from_index(*index))
+                            .unwrap()
+                            .get()
+                            != 0
+                    })
+                {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("background probes must finish");
+            for provider in &providers {
+                assert_eq!(
+                    provider.status_counts().available,
+                    expected_available,
+                    "prefetch reply: {reply:?}"
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -2703,6 +2838,18 @@ mod tests {
             has_backend_1,
             "tier-1 backend should be marked missing from STAT=430"
         );
+        let counts = router
+            .backend_provider(BackendId::from_index(1))
+            .unwrap()
+            .status_counts();
+        assert_eq!(
+            counts.size, 1,
+            "prefetch must keep its completed connection"
+        );
+        assert_eq!(
+            counts.available, 1,
+            "prefetch must return its guard to the pool"
+        );
     }
 
     #[test]
@@ -2719,6 +2866,65 @@ mod tests {
         assert!(super::ClientSession::should_use_stat_missing_probe(
             &provider, &request, true,
         ));
+    }
+
+    #[tokio::test]
+    async fn article_routing_prefetches_each_non_primary_backend_once() {
+        let session = test_session();
+        let (primary_port, primary_stats, primary_bodies) = spawn_stat_missing_probe_server().await;
+        let (backup_port, backup_stats, backup_bodies) = spawn_stat_missing_probe_server().await;
+        let router = router_with_tiered_backends([
+            (
+                DeadpoolConnectionProvider::builder("127.0.0.1", primary_port)
+                    .max_connections(1)
+                    .build()
+                    .unwrap(),
+                0,
+            ),
+            (
+                DeadpoolConnectionProvider::builder("127.0.0.1", backup_port)
+                    .max_connections(2)
+                    .stat_missing(true)
+                    .build()
+                    .unwrap(),
+                1,
+            ),
+        ]);
+        let (mut client_writer, _client_read, _client_write) = client_writer_pair().await;
+        let mut request = request_context(b"BODY <found@example.com>\r\n");
+        let mut lease = None;
+        let mut sent = ClientToBackendBytes::zero();
+        let mut received = crate::types::BackendToClientBytes::zero();
+        session
+            .route_and_execute_request(
+                router.clone(),
+                &mut request,
+                &mut client_writer,
+                &mut lease,
+                &mut sent,
+                &mut received,
+            )
+            .await
+            .unwrap();
+        finalize_backend_connection(&mut lease);
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while backup_stats.load(Ordering::SeqCst) == 0
+                || router.backend_load(BackendId::from_index(1)).unwrap().get() != 0
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("background probes must finish");
+        assert_eq!(primary_bodies.load(Ordering::SeqCst), 1);
+        assert_eq!(primary_stats.load(Ordering::SeqCst), 0);
+        assert_eq!(backup_bodies.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            backup_stats.load(Ordering::SeqCst),
+            1,
+            "one article request must not launch duplicate backup STAT probes"
+        );
     }
 
     #[tokio::test]
