@@ -6,7 +6,7 @@
 use divan::{Bencher, black_box, counter::BytesCount};
 use nntp_proxy::session::{
     benchmark_incremental_multiline_frame, benchmark_multiline_response,
-    benchmark_stateless_multiline_frame,
+    benchmark_ordered_stat_forwarding, benchmark_stateless_multiline_frame,
 };
 use std::sync::LazyLock;
 
@@ -27,6 +27,29 @@ fn bench_incremental(bencher: Bencher, response: &[u8], chunk_size: usize) {
             chunk_size,
         ))
     });
+}
+
+mod ordered_stat_replies {
+    use super::*;
+
+    fn packed(bencher: Bencher, replies: usize) {
+        let packet = b"223 0 <stat@example.com>\r\n".repeat(replies);
+        bencher.counter(BytesCount::new(packet.len())).bench(|| {
+            let forwarded = benchmark_ordered_stat_forwarding(black_box(&packet), replies);
+            assert_eq!(forwarded, packet.len());
+            black_box(forwarded)
+        });
+    }
+
+    #[divan::bench(sample_count = 100, sample_size = 1000)]
+    fn four_in_one_read(bencher: Bencher) {
+        packed(bencher, 4);
+    }
+
+    #[divan::bench(sample_count = 100, sample_size = 1000)]
+    fn sixteen_in_one_read(bencher: Bencher) {
+        packed(bencher, 16);
+    }
 }
 
 fn bench_stateless(bencher: Bencher, response: &[u8], chunk_size: usize) {

@@ -46,6 +46,7 @@ pub struct ClientSession {
 
     /// Whether to use adaptive availability prechecking for STAT/HEAD
     pub(super) adaptive_precheck: bool,
+    pub(super) reader_message_id_failover: bool,
 }
 
 /// Builder for constructing `ClientSession` instances
@@ -91,6 +92,7 @@ pub struct ClientSessionBuilder {
     connection_stats: Option<crate::metrics::ConnectionStatsAggregator>,
     cache: BuilderCache,
     adaptive_precheck: bool,
+    reader_message_id_failover: bool,
 }
 
 enum BuilderCache {
@@ -161,6 +163,13 @@ impl ClientSessionBuilder {
         self
     }
 
+    /// Keep group-based reader sessions eligible for message-ID miss recovery.
+    #[must_use]
+    pub const fn with_reader_message_id_failover(mut self, enable: bool) -> Self {
+        self.reader_message_id_failover = enable;
+        self
+    }
+
     /// Build the client session
     ///
     /// Creates a new `ClientSession` with a unique client ID and the configured
@@ -190,6 +199,7 @@ impl ClientSessionBuilder {
             connection_stats: self.connection_stats,
             cache,
             adaptive_precheck: self.adaptive_precheck,
+            reader_message_id_failover: self.reader_message_id_failover,
         }
     }
 }
@@ -224,6 +234,7 @@ impl ClientSession {
             connection_stats: None,
             cache: Self::default_cache(),
             adaptive_precheck: false,
+            reader_message_id_failover: false,
         }
     }
 
@@ -254,6 +265,7 @@ impl ClientSession {
             connection_stats: None,
             cache: Self::default_cache(),
             adaptive_precheck: false,
+            reader_message_id_failover: false,
         }
     }
 
@@ -295,6 +307,7 @@ impl ClientSession {
             connection_stats: None,
             cache: BuilderCache::DefaultAvailability,
             adaptive_precheck: false,
+            reader_message_id_failover: false,
         }
     }
 

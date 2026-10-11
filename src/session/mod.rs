@@ -179,7 +179,8 @@ pub(crate) mod multiline_framing;
 #[cfg(feature = "framing-bench")]
 pub use multiline_framing::{
     benchmark_framed_cache_response, benchmark_incremental_multiline_frame,
-    benchmark_multiline_response, benchmark_stateless_multiline_frame,
+    benchmark_multiline_response, benchmark_ordered_stat_forwarding,
+    benchmark_stateless_multiline_frame,
 };
 mod precheck;
 pub(crate) mod response_transfer;

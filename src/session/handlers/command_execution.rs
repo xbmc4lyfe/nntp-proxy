@@ -375,11 +375,11 @@ impl ClientSession {
     ///
     /// If the pooled connection is stale (connection error), automatically retries
     /// with a fresh connection before returning an error.
-    pub(super) async fn try_backend_for_article(
+    pub(super) async fn try_backend_for_article<W: AsyncWrite + Unpin>(
         &self,
         router: &Arc<BackendSelector>,
         request: &mut RequestContext,
-        client_writer: &mut crate::session::ClientWriter,
+        client_writer: &mut W,
         state: &mut ArticleAttemptState<'_>,
         is_retry_attempt: bool,
     ) -> Result<BackendAttemptResult, SessionError> {
@@ -706,17 +706,16 @@ impl ClientSession {
         })
     }
 
-    async fn write_successful_retry_response(
+    async fn write_successful_retry_response<W: AsyncWrite + Unpin>(
         &self,
         attempt: PreparedBackendAttempt<'_>,
-        client_writer: &mut crate::session::ClientWriter,
+        client_writer: &mut W,
         context: ResponseWriteContext<'_>,
         backend_connection: &mut Option<BackendLease>,
     ) -> Result<RequestResponseMetadata, SessionError> {
-        let client_write = client_writer.get_mut();
         self.write_successful_backend_response(
             attempt,
-            client_write,
+            client_writer,
             context,
             Some(backend_connection),
         )

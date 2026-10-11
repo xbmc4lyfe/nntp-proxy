@@ -58,7 +58,7 @@ mod response_contracts {
     #[cfg(response_contract = "article_layout_rebind")]
     fn article_layout_rebind() {
         let layout = crate::protocol::article::ArticleLayout {
-            message_id: 0..1,
+            message_id: panic!("layout construction must stay private"),
             article_number: None,
             content: panic!("layout construction must stay private"),
         };
