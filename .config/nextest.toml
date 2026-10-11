@@ -1,12 +1,19 @@
 # nextest configuration for nntp-proxy
 #
-# Per-test hard timeout: if any test takes longer than 30 seconds, nextest
+# Default per-test hard timeout: if a test takes longer than 30 seconds, nextest
 # kills it and marks it as failed.  This makes test hangs impossible —
 # a test that would have hung indefinitely is now a fast (30 s) failure with
 # a clear "timed out" message in the output.
 
 [profile.default]
 slow-timeout = { period = "30s", terminate-after = 1 }
+
+# This real-socket regression exercises the production 30-second timeout and
+# asserts completion within 32 seconds. Leave time for its cleanup assertions.
+# The default-profile override is also inherited by the CI profile.
+[[profile.default.overrides]]
+filter = 'test(=session::handlers::command_execution::tests::stat_probe_bounds_a_partial_status_reply_and_releases_its_guard)'
+slow-timeout = { period = "45s", terminate-after = 1 }
 
 [profile.ci]
 slow-timeout = { period = "30s", terminate-after = 1 }

@@ -565,9 +565,8 @@ pub(crate) struct BackendResponseOrder {
 
 impl BackendResponseOrder {
     /// Only a fully framed successful QUIT permits an orderly backend close.
-    pub(crate) fn backend_acknowledged_quit(&self) -> bool {
+    pub(crate) const fn backend_acknowledged_quit(&self) -> bool {
         matches!(self.inner.close_state, BackendCloseState::QuitAcknowledged)
-            && !self.has_pending_backend_replies()
     }
 
     /// Register that the next backend bytes should contain a reply for `kind`.
@@ -2683,6 +2682,19 @@ mod tests {
         let mut order = BackendResponseOrder::default();
         let _ = order.client_writes_for_backend_read(b"205 Goodbye\r\n");
         assert!(!order.backend_acknowledged_quit());
+    }
+
+    #[test]
+    fn commands_pipelined_after_quit_do_not_make_the_expected_close_a_backend_failure() {
+        let mut order = BackendResponseOrder::default();
+        order.push_request(crate::protocol::RequestKind::Quit);
+        order.push_request(crate::protocol::RequestKind::Date);
+        let _ = order.client_writes_for_backend_read(b"205 Goodbye\r\n");
+        assert!(order.has_pending_backend_replies());
+        assert!(
+            order.backend_acknowledged_quit(),
+            "commands sent after QUIT are client misuse, not backend damage"
+        );
     }
 
     #[derive(Default)]

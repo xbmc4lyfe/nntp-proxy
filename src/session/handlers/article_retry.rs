@@ -14,7 +14,7 @@ use crate::session::handlers::cache_operations::{
     CacheLookupResult, write_cached_article_response,
 };
 use crate::session::handlers::command_execution::{
-    ArticleAttemptState, AuthoritativeArticleMissing, BackendAttemptResult,
+    ArticleAttemptState, AuthoritativeArticleMissing, BackendAttemptResult, StatPrefetch,
 };
 use crate::types::{BackendToClientBytes, ClientToBackendBytes};
 use anyhow::Result;
@@ -40,6 +40,7 @@ pub(super) enum PreparedRequest {
     /// Continue with backend routing using resolved availability state.
     Continue {
         availability: Option<ArticleAvailability>,
+        stat_prefetch: Option<StatPrefetch>,
     },
 }
 
@@ -72,7 +73,7 @@ impl ClientSession {
         let preloaded_availability = preloaded_cache
             .as_ref()
             .map(|cached| cached.to_availability());
-        let availability = match self
+        let (availability, stat_prefetch) = match self
             .prepare_request_execution(
                 &router,
                 request,
@@ -83,10 +84,13 @@ impl ClientSession {
             .await?
         {
             PreparedRequest::Served => return Ok(()),
-            PreparedRequest::Continue { availability } => availability,
+            PreparedRequest::Continue {
+                availability,
+                stat_prefetch,
+            } => (availability, stat_prefetch),
         };
 
-        self.execute_article_retry_loop(&router, request, availability, &mut io)
+        self.execute_article_retry_loop(&router, request, availability, stat_prefetch, &mut io)
             .await
     }
 
@@ -138,14 +142,14 @@ impl ClientSession {
                 .is_some()
                 .then(ArticleAvailability::new)
         });
-        if let Some(availability) = availability.as_ref() {
+        let stat_prefetch = availability.as_ref().and_then(|availability| {
             self.spawn_non_primary_tier_stat_prefetch(
                 router,
                 request,
                 availability,
                 SuppressedBackends::empty(),
-            );
-        }
+            )
+        });
         if self
             .try_adaptive_precheck(router, request, io, availability.as_ref())
             .await?
@@ -153,7 +157,10 @@ impl ClientSession {
             return Ok(PreparedRequest::Served);
         }
 
-        Ok(PreparedRequest::Continue { availability })
+        Ok(PreparedRequest::Continue {
+            availability,
+            stat_prefetch,
+        })
     }
 
     const fn request_cache_availability(
@@ -264,6 +271,7 @@ impl ClientSession {
         router: &Arc<BackendSelector>,
         request: &mut RequestContext,
         availability: Option<ArticleAvailability>,
+        mut stat_prefetch: Option<StatPrefetch>,
         io: &mut RequestExecutionIo<'_>,
     ) -> Result<(), SessionError> {
         trace!(
@@ -295,6 +303,7 @@ impl ClientSession {
                         backend_connection: io.backend_connection,
                         unavailable_backends: &mut unavailable_backends,
                     },
+                    stat_prefetch.take(),
                 )
                 .await?;
                 retry_stat_sweep_done = true;

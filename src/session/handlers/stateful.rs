@@ -506,6 +506,9 @@ impl ClientSession {
                             &mut state,
                         )
                         .await?;
+                        if state.backend_acknowledged_quit() {
+                            break StatefulSessionExit::QuitCompleted;
+                        }
                         continue;
                     }
                     Ok(None) => break StatefulSessionExit::backend_eof(&state),
@@ -603,13 +606,6 @@ impl ClientSession {
 
                 // Backend → Client
                 result = self.read_stateful_backend_bytes(&mut backend_read) => {
-                    if pending_backend_writes != 0 {
-                        backend_write
-                            .flush()
-                            .await
-                            .map_err(|error| StatefulLoopError::backend(error.into()))?;
-                        pending_backend_writes = 0;
-                    }
                     match result {
                         Ok(Some((buffer, len))) => {
                             // Complete output after select! returns so client readiness cannot
@@ -621,12 +617,24 @@ impl ClientSession {
                                 &mut state,
                             )
                             .await?;
+                            if state.backend_acknowledged_quit() {
+                                break StatefulSessionExit::QuitCompleted;
+                            }
                         }
                         Ok(None) => break StatefulSessionExit::backend_eof(&state),
                         Err(e) => {
                             warn!(client = %self.client_addr, error = %e, "Backend read error");
                             break StatefulSessionExit::BackendReadError;
                         }
+                    }
+                    // The server may have acknowledged QUIT and already closed.
+                    // Frame and forward that reply before flushing post-QUIT writes.
+                    if pending_backend_writes != 0 {
+                        backend_write
+                            .flush()
+                            .await
+                            .map_err(|error| StatefulLoopError::backend(error.into()))?;
+                        pending_backend_writes = 0;
                     }
                 }
             }
@@ -737,6 +745,72 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(&reply, b"205 Goodbye\r\n");
+    }
+
+    #[tokio::test]
+    async fn pipelined_quit_finishes_without_waiting_for_backend_eof() {
+        let session = test_session();
+        let (mut client, proxy_client) = tokio::io::duplex(4096);
+        let (backend, proxy_backend) = tokio::io::duplex(4096);
+        client.write_all(b"QUIT\r\nDATE\r\n").await.unwrap();
+        let server = tokio::spawn(async move {
+            let mut backend = BufReader::new(backend);
+            for expected in ["QUIT\r\n", "DATE\r\n"] {
+                let mut command = String::new();
+                backend.read_line(&mut command).await.unwrap();
+                assert_eq!(command, expected);
+            }
+            backend
+                .get_mut()
+                .write_all(b"205 Goodbye\r\n")
+                .await
+                .unwrap();
+            // A delayed server close must not allow more post-QUIT client I/O.
+            let mut trailing = String::new();
+            assert_eq!(backend.read_line(&mut trailing).await.unwrap(), 0);
+        });
+        let (client_read, client_write) = tokio::io::split(proxy_client);
+        let (backend_read, backend_write) = tokio::io::split(proxy_backend);
+        let backend_write = FlushFailingWriter(backend_write);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            session.run_stateful_proxy_loop(
+                BufReader::new(client_read),
+                client_write,
+                backend_read,
+                backend_write,
+                SessionLoopState::new(false),
+                BackendId::from_index(0),
+            ),
+        )
+        .await
+        .expect("a framed QUIT acknowledgement must finish the session")
+        .unwrap();
+        assert_eq!(
+            result.disposition(),
+            super::StatefulConnectionDisposition::RetireClient
+        );
+        server.await.unwrap();
+    }
+
+    struct FlushFailingWriter<W>(W);
+
+    impl<W: AsyncWrite + Unpin> AsyncWrite for FlushFailingWriter<W> {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Pin::new(&mut self.get_mut().0).poll_write(cx, bytes)
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe)))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.get_mut().0).poll_shutdown(cx)
+        }
     }
 
     #[tokio::test]
