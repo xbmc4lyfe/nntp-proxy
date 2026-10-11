@@ -4,3 +4,7 @@ extend-exclude = ["baseline-bench.txt"]
 [default.extend-words]
 flate = "flate"
 ratatui = "ratatui"
+
+[default.extend-identifiers]
+# Preserve the release-group name; do not allow its parts as ordinary words.
+GeneMige = "GeneMige"
