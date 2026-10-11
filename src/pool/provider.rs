@@ -535,6 +535,12 @@ impl DeadpoolConnectionProvider {
                     max_size: status.max_size,
                 },
             };
+            // A backend in login backoff fails by design on every request until
+            // the window closes; logging each one would flood the log.
+            if matches!(err, ConnectionError::LoginBackoff { .. }) {
+                debug!(pool = %self.name, error = %err, "Connection acquisition skipped");
+                return err;
+            }
             warn!(
                 pool = %self.name,
                 max_size = status.max_size,

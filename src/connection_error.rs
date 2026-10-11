@@ -45,6 +45,12 @@ pub enum ConnectionError {
     #[error("Connection limit exceeded for backend '{backend}': {response}")]
     ConnectionLimitExceeded { backend: String, response: String },
 
+    #[error("Backend '{backend}' refused the previous login; not retrying for {retry_in:?}")]
+    LoginBackoff {
+        backend: String,
+        retry_in: std::time::Duration,
+    },
+
     #[error("Invalid greeting from backend '{backend}': {greeting}")]
     InvalidGreeting { backend: String, greeting: String },
 
@@ -97,6 +103,21 @@ pub enum ConnectionError {
 }
 
 impl ConnectionError {
+    /// The backend answered but would not let this session in.
+    ///
+    /// Unlike a network error, retrying straight away gets the same answer, so
+    /// callers should back off instead of reconnecting for every request.
+    #[must_use]
+    pub const fn is_login_refusal(&self) -> bool {
+        matches!(
+            self,
+            Self::AuthenticationFailed { .. }
+                | Self::ConnectionLimitExceeded { .. }
+                | Self::InvalidGreeting { .. }
+                | Self::UnexpectedAuthResponse { .. }
+        )
+    }
+
     pub fn dns_resolver_init(
         backend: impl Into<String>,
         source: impl StdError + Send + Sync + 'static,
@@ -157,6 +178,34 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("backend1"));
         assert!(msg.contains("20"));
+    }
+
+    #[test]
+    fn login_refusals_are_classified() {
+        let refused = |e: ConnectionError| e.is_login_refusal();
+        assert!(refused(ConnectionError::AuthenticationFailed {
+            backend: "b".into(),
+            response: "502 connection limit (10) reached".into(),
+        }));
+        assert!(refused(ConnectionError::ConnectionLimitExceeded {
+            backend: "b".into(),
+            response: "482".into(),
+        }));
+        assert!(refused(ConnectionError::InvalidGreeting {
+            backend: "b".into(),
+            greeting: "502 too many connections".into(),
+        }));
+        assert!(refused(ConnectionError::UnexpectedAuthResponse {
+            backend: "b".into(),
+            response: "500".into(),
+        }));
+        assert!(!refused(ConnectionError::IoError(std::io::Error::other(
+            "x"
+        ))));
+        assert!(!refused(ConnectionError::LoginBackoff {
+            backend: "b".into(),
+            retry_in: std::time::Duration::from_secs(5),
+        }));
     }
 
     #[test]

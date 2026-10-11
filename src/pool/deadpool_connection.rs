@@ -19,6 +19,7 @@ use tokio::sync::Mutex;
 use tokio::sync::Notify;
 
 use crate::connection_error::ConnectionError;
+use crate::pool::auth_backoff::{Admission, AuthBackoff};
 use crate::protocol::{RequestContext, authinfo_pass, authinfo_user};
 use crate::stream::ConnectionStream;
 use crate::tls::{TlsConfig, TlsManager, TlsPolicy};
@@ -211,6 +212,8 @@ pub struct TcpManager {
     compression_support: Arc<Mutex<CompressionSupportState>>,
     /// Whether to send MODE READER after authentication (RFC 3977 §5.3)
     pub(crate) send_mode_reader: bool,
+    /// Gate that stops repeated logins while the backend keeps refusing them.
+    login_backoff: Arc<AuthBackoff>,
 }
 
 impl TcpManager {
@@ -330,6 +333,7 @@ impl TcpManager {
             compression,
             compression_support: Arc::new(Mutex::new(CompressionSupportState::Unknown)),
             send_mode_reader: options.send_mode_reader,
+            login_backoff: Arc::default(),
         })
     }
 
@@ -790,11 +794,21 @@ impl TcpManager {
 // Manager trait implementation
 // ============================================================================
 
-impl managed::Manager for TcpManager {
-    type Type = ReadyBackendConnection;
-    type Error = ConnectionError;
+/// Holds the single probe slot of the login gate until the login resolves.
+///
+/// Dropping it also covers a cancelled `create()` future, so an abandoned probe
+/// can never leave the gate waiting for an answer that will not come.
+struct ProbeGuard<'a>(&'a AuthBackoff);
 
-    async fn create(&self) -> Result<ReadyBackendConnection, ConnectionError> {
+impl Drop for ProbeGuard<'_> {
+    fn drop(&mut self) {
+        self.0.abandon_probe();
+    }
+}
+
+impl TcpManager {
+    /// Open, greet, authenticate and configure one backend session.
+    async fn create_session(&self) -> Result<ReadyBackendConnection, ConnectionError> {
         let mut stream = self.create_optimized_stream().await?;
         let mut buffer = [0u8; 4096];
 
@@ -811,6 +825,42 @@ impl managed::Manager for TcpManager {
         }
 
         Ok(ReadyBackendConnection::new(stream))
+    }
+}
+
+impl managed::Manager for TcpManager {
+    type Type = ReadyBackendConnection;
+    type Error = ConnectionError;
+
+    async fn create(&self) -> Result<ReadyBackendConnection, ConnectionError> {
+        let probe = match self.login_backoff.admit(std::time::Instant::now()) {
+            Admission::Wait(retry_in) => {
+                return Err(ConnectionError::LoginBackoff {
+                    backend: self.name.clone(),
+                    retry_in,
+                });
+            }
+            Admission::Open => None,
+            Admission::Probe => Some(ProbeGuard(&self.login_backoff)),
+        };
+
+        let result = self.create_session().await;
+        match &result {
+            Ok(_) => self.login_backoff.record_success(),
+            Err(error) if error.is_login_refusal() => {
+                let retry_in = self.login_backoff.record_failure(std::time::Instant::now());
+                tracing::warn!(
+                    backend = %self.name,
+                    retry_in_secs = retry_in.as_secs(),
+                    "Backend refused login; pausing new connections to it"
+                );
+            }
+            // Network-level failure: the probe (if any) learned nothing about
+            // the account, so the guard hands the probe to the next caller.
+            Err(_) => {}
+        }
+        drop(probe);
+        result
     }
 
     async fn recycle(
@@ -1271,5 +1321,147 @@ mod tests {
             1,
             "auto mode should remember unsupported COMPRESS DEFLATE"
         );
+    }
+    /// Mock backend that logs every client in or turns it away at the PASS step.
+    async fn spawn_login_server(pass_reply: &'static str) -> (SocketAddr, Arc<AtomicUsize>) {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let counter = accepted.clone();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                counter.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let (read, mut write) = stream.into_split();
+                    let mut lines = BufReader::new(read).lines();
+                    write.write_all(b"200 ready\r\n").await.unwrap();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        let reply: &[u8] = if line.starts_with("AUTHINFO USER") {
+                            b"381 password required\r\n"
+                        } else if line.starts_with("AUTHINFO PASS") {
+                            pass_reply.as_bytes()
+                        } else {
+                            b"200 ok\r\n"
+                        };
+                        if write.write_all(reply).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+        (addr, accepted)
+    }
+
+    fn login_manager(addr: SocketAddr) -> TcpManager {
+        TcpManager::new(
+            addr.ip().to_string(),
+            addr.port(),
+            "LoginBackoff".to_string(),
+            TcpManagerOptions {
+                username: Some("user".to_string()),
+                password: Some("pass".to_string()),
+                compress: Some(false),
+                ..TcpManagerOptions::default()
+            },
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn refused_login_backs_off_without_reconnecting() {
+        let (addr, accepted) = spawn_login_server("502 connection limit (10) reached\r\n").await;
+        let manager = login_manager(addr);
+
+        let first = managed::Manager::create(&manager).await;
+        assert!(matches!(
+            first,
+            Err(ConnectionError::AuthenticationFailed { .. })
+        ));
+        assert_eq!(accepted.load(Ordering::SeqCst), 1);
+
+        for _ in 0..5 {
+            let again = managed::Manager::create(&manager).await;
+            assert!(matches!(again, Err(ConnectionError::LoginBackoff { .. })));
+        }
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            1,
+            "no new session may be opened while the backend is in login backoff"
+        );
+    }
+
+    #[tokio::test]
+    async fn login_resumes_and_resets_after_backoff_window() {
+        let (addr, accepted) = spawn_login_server("281 welcome\r\n").await;
+        let manager = login_manager(addr);
+
+        // A refusal that happened long enough ago for its window to have closed.
+        let long_ago = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(120))
+            .expect("monotonic clock has run for more than two minutes");
+        manager.login_backoff.record_failure(long_ago);
+        assert_eq!(
+            manager.login_backoff.admit(std::time::Instant::now()),
+            Admission::Probe
+        );
+        manager.login_backoff.abandon_probe();
+
+        managed::Manager::create(&manager)
+            .await
+            .expect("login should be attempted again and succeed");
+        assert_eq!(accepted.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            manager
+                .login_backoff
+                .record_failure(std::time::Instant::now()),
+            crate::pool::auth_backoff::INITIAL_DELAY,
+            "a successful login must restart the schedule"
+        );
+    }
+
+    #[tokio::test]
+    async fn network_errors_do_not_start_login_backoff() {
+        let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = closed.local_addr().unwrap();
+        drop(closed);
+        let manager = login_manager(addr);
+
+        for _ in 0..3 {
+            let result = managed::Manager::create(&manager).await;
+            assert!(matches!(result, Err(ConnectionError::IoError(_))));
+        }
+    }
+
+    #[tokio::test]
+    async fn one_probe_login_when_window_closes_with_many_waiters() {
+        let (addr, accepted) = spawn_login_server("502 connection limit (10) reached\r\n").await;
+        let manager = login_manager(addr);
+        let long_ago = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(120))
+            .expect("monotonic clock has run for more than two minutes");
+        manager.login_backoff.record_failure(long_ago);
+
+        let attempts: Vec<_> = (0..16)
+            .map(|_| {
+                let manager = manager.clone();
+                tokio::spawn(async move { managed::Manager::create(&manager).await })
+            })
+            .collect();
+        let mut refused = 0;
+        let mut waiting = 0;
+        for attempt in attempts {
+            match attempt.await.unwrap() {
+                Err(ConnectionError::AuthenticationFailed { .. }) => refused += 1,
+                Err(ConnectionError::LoginBackoff { .. }) => waiting += 1,
+                other => panic!("unexpected result: {other:?}"),
+            }
+        }
+
+        assert_eq!(refused, 1, "exactly one caller may probe");
+        assert_eq!(waiting, 15);
+        assert_eq!(accepted.load(Ordering::SeqCst), 1);
     }
 }
