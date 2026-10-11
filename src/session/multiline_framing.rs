@@ -564,6 +564,11 @@ pub(crate) struct BackendResponseOrder {
 }
 
 impl BackendResponseOrder {
+    /// Only a fully framed successful QUIT permits an orderly backend close.
+    pub(crate) const fn backend_acknowledged_quit(&self) -> bool {
+        matches!(self.inner.close_state, BackendCloseState::QuitAcknowledged)
+    }
+
     /// Register that the next backend bytes should contain a reply for `kind`.
     pub(crate) fn push_request(&mut self, kind: crate::protocol::RequestKind) {
         self.inner.push_request(kind);
@@ -655,6 +660,14 @@ impl BackendResponseOrder {
 #[derive(Default, Debug)]
 struct BackendReplyTracker {
     pending: VecDeque<PendingRequestFrame>,
+    close_state: BackendCloseState,
+}
+
+#[derive(Debug, Default)]
+enum BackendCloseState {
+    #[default]
+    Open,
+    QuitAcknowledged,
 }
 
 #[derive(Debug)]
@@ -2181,6 +2194,15 @@ impl BackendReplyTracker {
                 break;
             };
 
+            if matches!(front.kind, crate::protocol::RequestKind::Quit)
+                && front.status_line.ends_with(b"\r\n")
+                && crate::protocol::StatusCode::parse(front.status_line.as_slice()).is_some_and(
+                    |status| status.as_u16() == crate::protocol::codes::CONNECTION_CLOSING,
+                )
+            {
+                self.close_state = BackendCloseState::QuitAcknowledged;
+            }
+
             offset = framed.end();
             output.push(BackendReplyBytes::CompletedTrackedReply(
                 framed.backend_bytes(chunk),
@@ -2613,6 +2635,67 @@ mod tests {
     const EXHAUSTIVE_BYTES: [u8; 4] = *b"\r\n.x";
 
     struct FailingWriter;
+
+    #[test]
+    fn quit_acknowledgement_requires_a_complete_successful_quit_reply() {
+        use crate::protocol::RequestKind;
+
+        for reply in [
+            b"205 Goodbye\r".as_slice(),
+            b"500 QUIT rejected\r\n".as_slice(),
+            b"garbage\r\n".as_slice(),
+        ] {
+            let mut order = BackendResponseOrder::default();
+            order.push_request(RequestKind::Quit);
+            let _ = order.client_writes_for_backend_read(reply);
+            assert!(!order.backend_acknowledged_quit(), "reply: {reply:?}");
+        }
+
+        let mut order = BackendResponseOrder::default();
+        order.push_request(RequestKind::Quit);
+        let _ = order.client_writes_for_backend_read(b"20");
+        assert!(!order.backend_acknowledged_quit());
+        let _ = order.client_writes_for_backend_read(b"5 Goodbye\r\n");
+        assert!(order.backend_acknowledged_quit());
+    }
+
+    #[test]
+    fn closing_status_inside_article_does_not_acknowledge_queued_quit() {
+        use crate::protocol::RequestKind;
+
+        let mut order = BackendResponseOrder::default();
+        order.push_request(RequestKind::Article);
+        order.push_request(RequestKind::Quit);
+        let _ = order.client_writes_for_backend_read(b"220 Article follows\r\n205 Goodbye\r\n");
+        assert!(!order.backend_acknowledged_quit());
+        let _ = order.client_writes_for_backend_read(b".\r\n205 Goodbye\r\n");
+        assert!(order.backend_acknowledged_quit());
+    }
+
+    #[test]
+    fn unsolicited_closing_status_does_not_acknowledge_quit() {
+        let mut order = BackendResponseOrder::default();
+        order.push_request(crate::protocol::RequestKind::Date);
+        let _ = order.client_writes_for_backend_read(b"205 Goodbye\r\n");
+        assert!(!order.backend_acknowledged_quit());
+
+        let mut order = BackendResponseOrder::default();
+        let _ = order.client_writes_for_backend_read(b"205 Goodbye\r\n");
+        assert!(!order.backend_acknowledged_quit());
+    }
+
+    #[test]
+    fn commands_pipelined_after_quit_do_not_make_the_expected_close_a_backend_failure() {
+        let mut order = BackendResponseOrder::default();
+        order.push_request(crate::protocol::RequestKind::Quit);
+        order.push_request(crate::protocol::RequestKind::Date);
+        let _ = order.client_writes_for_backend_read(b"205 Goodbye\r\n");
+        assert!(order.has_pending_backend_replies());
+        assert!(
+            order.backend_acknowledged_quit(),
+            "commands sent after QUIT are client misuse, not backend damage"
+        );
+    }
 
     #[derive(Default)]
     struct RecordingWriter {

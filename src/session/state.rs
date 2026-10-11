@@ -191,6 +191,12 @@ impl SessionLoopState {
         self.backend_replies.has_pending_backend_replies()
     }
 
+    /// Preserve backend capacity when the server closes after accepting QUIT.
+    #[must_use]
+    pub(in crate::session) fn backend_acknowledged_quit(&self) -> bool {
+        self.backend_replies.backend_acknowledged_quit()
+    }
+
     /// Return client writes made ready by a backend read.
     ///
     /// This preserves client-visible response ordering even when one read
