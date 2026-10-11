@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Added per-backend `stateful_sessions = "excluded"` (and `NNTP_SERVER_<N>_STATEFUL_SESSIONS`), which keeps a backend out of hybrid and stateful session pinning while it still serves message-ID requests. Indexers that store `GROUP`/`XOVER` article numbers can now share a tier with providers that number articles differently.
+
+### Fixed
+
+- The Docker image builds from a clean checkout again: `.dockerignore` no longer drops `rust-toolchain.toml`, and the toolchain install no longer passes rustup an empty name.
+
 ### Changed
 
 - Added explicit RFC 5322 unfolded-header access through `Headers::unfolded_bytes()` while keeping `Headers::as_bytes()` tied to the original wire bytes.

@@ -126,6 +126,7 @@ password = "reader-password"
 | `max_connections` | `10` | Per-backend pool size |
 | `stat_missing` | `0` | Probe missing articles with `STAT` before `ARTICLE`/`BODY`/`HEAD` on this backend. Enable it on backends that correctly return `430` to speed up retrying missing articles. |
 | `tier` | `0` | Lower tiers are preferred first |
+| `stateful_sessions` | `"allowed"` | `"excluded"` keeps this backend out of stateful sessions (`GROUP`, `XOVER`, article-number commands) while it still serves message-ID requests. See [Article numbering across providers](#article-numbering-across-providers). |
 | `use_tls` | `false` | TLS to the backend |
 | `tls_verify_cert` | `true` | Keep enabled in production |
 | `tls_cert_path` | unset | Additional PEM CA certificate |
@@ -136,6 +137,37 @@ password = "reader-password"
 | `compress` | auto-detect | RFC 8054 backend `COMPRESS DEFLATE` |
 | `compress_level` | unset | Level `0`-`9` when compression is enabled |
 | `backend_idle_timeout` | `600` seconds | Clears idle backend connections after proxy-wide inactivity |
+
+### Article numbering across providers
+
+Each provider numbers the articles in a group independently. In `hybrid` and
+`stateful` modes the proxy pins a client to one backend for `GROUP`, `XOVER` and
+other article-number commands. If two of a client's sessions land on providers
+with different numbering, a client that stores article numbers (an indexer
+tracking its position in each group) gets numbers that don't match.
+
+Set `stateful_sessions = "excluded"` on every backend whose numbering differs
+from the one your client tracks. Excluded backends keep serving message-ID
+requests (`ARTICLE <id>`, `BODY <id>`, `HEAD <id>`, `STAT <id>`) in their tier,
+so they still add download capacity:
+
+```toml
+[[servers]]
+name = "indexer-numbering"
+host = "news.example.com"
+port = 563
+tier = 0
+
+[[servers]]
+name = "download-only"
+host = "news.other-provider.example"
+port = 563
+tier = 0
+stateful_sessions = "excluded"
+```
+
+If every backend in a tier is excluded, stateful sessions use the next tier.
+Startup fails when `hybrid` or `stateful` mode has no allowed backend at all.
 
 ## Environment-based backend configuration
 
@@ -157,6 +189,7 @@ Currently supported backend environment fields:
 - `HEALTH_CHECK_MAX_PER_CYCLE`
 - `HEALTH_CHECK_POOL_TIMEOUT`
 - `TIER`
+- `STATEFUL_SESSIONS` (`allowed` or `excluded`; any other value stops startup)
 
 Example:
 

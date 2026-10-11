@@ -217,6 +217,9 @@ impl NntpProxyBuilder {
                     availability_layout.slot_for_backend(crate::types::BackendId::from_index(idx)),
                 );
                 debug_assert_eq!(backend_id.as_index(), idx);
+                if !servers[idx].stateful_sessions.is_allowed() {
+                    r.exclude_from_stateful_sessions(backend_id);
+                }
             }
             debug_assert_eq!(r.backend_count(), backend_count);
             r

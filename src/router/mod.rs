@@ -488,6 +488,8 @@ pub struct BackendSelector {
     queue_backpressure_limits: QueuePressureLimits,
     /// Delay to apply when all eligible backends in a tier are hard-saturated.
     queue_backpressure_all_busy_sleep_ms: u64,
+    /// Backends configured with `stateful_sessions = "excluded"`.
+    stateful_exclusions: SuppressedBackends,
 }
 
 impl Default for BackendSelector {
@@ -584,6 +586,7 @@ impl BackendSelector {
             queue_backpressure_limits: QueuePressureLimits::default(),
             queue_backpressure_all_busy_sleep_ms:
                 Self::DEFAULT_QUEUE_BACKPRESSURE_ALL_BUSY_SLEEP_MS,
+            stateful_exclusions: SuppressedBackends::empty(),
         }
     }
 
@@ -1156,6 +1159,25 @@ impl BackendSelector {
         }
     }
 
+    /// Never pin a stateful session to this backend.
+    ///
+    /// The backend keeps serving message-ID requests. See
+    /// [`crate::config::StatefulSessions`] for why indexers need this.
+    pub fn exclude_from_stateful_sessions(&mut self, backend_id: BackendId) {
+        self.stateful_exclusions.suppress(backend_id);
+    }
+
+    /// Route a client that is about to hold a backend for stateful commands.
+    ///
+    /// Excluded backends are skipped. Without article availability in the
+    /// request, an all-excluded tier falls through to the next tier.
+    ///
+    /// # Errors
+    /// Returns an error when every backend is excluded or unavailable.
+    pub fn route_stateful_session(&self, client_id: ClientId) -> Result<BackendId> {
+        self.route(RouteRequest::new(client_id).suppressing_backends(self.stateful_exclusions))
+    }
+
     /// Mark a command as complete, decrementing the pending count
     pub fn complete_command(&self, backend_id: BackendId) {
         if let Some(backend) = self.find_backend(backend_id) {
@@ -1435,6 +1457,75 @@ mod tests {
             exhausted_tier0.is_err(),
             "transient backend failures must not escalate to tier 1 before tier 0 has all 430s"
         );
+    }
+
+    fn tiered_selector(backends: &[(&str, u8)]) -> BackendSelector {
+        let mut selector = BackendSelector::with_strategy(BackendSelectionStrategy::LeastLoaded);
+        for &(name, tier) in backends {
+            selector.add_backend(
+                ServerName::try_new(name.to_string()).unwrap(),
+                crate::pool::DeadpoolConnectionProvider::new(
+                    "localhost".to_string(),
+                    119,
+                    name.to_string(),
+                    10,
+                    None,
+                    None,
+                ),
+                tier,
+            );
+        }
+        selector
+    }
+
+    #[test]
+    fn stateful_sessions_never_route_to_excluded_backends() {
+        let mut selector =
+            tiered_selector(&[("numbering-a", 0), ("other-numbering", 0), ("backup", 1)]);
+        selector.exclude_from_stateful_sessions(BackendId::from_index(1));
+
+        for _ in 0..32 {
+            let backend = selector.route_stateful_session(ClientId::new()).unwrap();
+            assert_eq!(backend, BackendId::from_index(0));
+            // Leave it pending so least-loaded would otherwise prefer the excluded peer.
+        }
+    }
+
+    #[test]
+    fn excluded_backends_still_serve_message_id_routing() {
+        let mut selector = tiered_selector(&[("numbering-a", 0), ("other-numbering", 0)]);
+        selector.exclude_from_stateful_sessions(BackendId::from_index(1));
+
+        let availability = ArticleAvailability::new();
+        let routed: std::collections::HashSet<_> = (0..32)
+            .map(|_| {
+                selector
+                    .route(RouteRequest::new(ClientId::new()).with_availability(&availability))
+                    .unwrap()
+                    .backend_id()
+            })
+            .collect();
+        assert!(routed.contains(&BackendId::from_index(1)));
+    }
+
+    #[test]
+    fn stateful_sessions_fall_through_an_all_excluded_tier() {
+        let mut selector = tiered_selector(&[("download-only", 0), ("indexer", 1)]);
+        selector.exclude_from_stateful_sessions(BackendId::from_index(0));
+
+        assert_eq!(
+            selector.route_stateful_session(ClientId::new()).unwrap(),
+            BackendId::from_index(1)
+        );
+    }
+
+    #[test]
+    fn stateful_sessions_error_when_every_backend_is_excluded() {
+        let mut selector = tiered_selector(&[("a", 0), ("b", 1)]);
+        selector.exclude_from_stateful_sessions(BackendId::from_index(0));
+        selector.exclude_from_stateful_sessions(BackendId::from_index(1));
+
+        assert!(selector.route_stateful_session(ClientId::new()).is_err());
     }
 
     #[test]

@@ -56,6 +56,18 @@ impl Config {
             validate_server(server)?;
         }
 
+        if self.routing.routing_mode.supports_stateful_commands()
+            && !self
+                .servers
+                .iter()
+                .any(|server| server.stateful_sessions.is_allowed())
+        {
+            return Err(anyhow::anyhow!(
+                "routing mode \"{}\" needs at least one server with stateful_sessions = \"allowed\"",
+                self.routing.routing_mode.short_name()
+            ));
+        }
+
         Ok(())
     }
 }
@@ -134,6 +146,52 @@ mod tests {
             ..Default::default()
         };
         assert!(config.validate().is_err());
+    }
+
+    fn excluded_server(name: &str) -> Server {
+        Server::builder("localhost", Port::try_new(119).unwrap())
+            .name(name)
+            .stateful_sessions(crate::config::StatefulSessions::Excluded)
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn test_validate_rejects_stateful_capable_mode_without_allowed_server() {
+        for mode in [
+            crate::config::RoutingMode::Hybrid,
+            crate::config::RoutingMode::Stateful,
+        ] {
+            let mut config = Config {
+                servers: vec![excluded_server("a"), excluded_server("b")],
+                ..Default::default()
+            };
+            config.routing.routing_mode = mode;
+            let error = config.validate().unwrap_err().to_string();
+            assert!(error.contains("stateful_sessions"), "{error}");
+        }
+    }
+
+    #[test]
+    fn test_validate_allows_excluded_servers_alongside_an_allowed_one() {
+        let config = Config {
+            servers: vec![
+                create_test_server("allowed", None),
+                excluded_server("excluded"),
+            ],
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_per_command_mode_ignores_stateful_exclusions() {
+        let mut config = Config {
+            servers: vec![excluded_server("excluded")],
+            ..Default::default()
+        };
+        config.routing.routing_mode = crate::config::RoutingMode::PerCommand;
+        assert!(config.validate().is_ok());
     }
 
     #[test]
