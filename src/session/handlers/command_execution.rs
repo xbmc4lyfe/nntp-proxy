@@ -993,7 +993,12 @@ impl ClientSession {
                         pool_waiting = checkout_status.waiting,
                         "Requesting pooled connection after retiring unhealthy cached batch connection"
                     );
-                    provider.checkout_connection_guard().await?.activate()
+                    provider
+                        .checkout_connection_guard_within(
+                            crate::constants::pool::PER_COMMAND_CHECKOUT_TIMEOUT,
+                        )
+                        .await?
+                        .activate()
                 } else if can_expand_or_use_idle {
                     debug!(
                         client = %self.client_addr,
@@ -1010,7 +1015,12 @@ impl ClientSession {
                         "Using idle pool capacity before reusing cached batch connection"
                     );
                     *backend_connection = Some(BackendLease::new(cached_backend_id, guard));
-                    match provider.checkout_connection_guard().await {
+                    match provider
+                        .checkout_connection_guard_within(
+                            crate::constants::pool::PER_COMMAND_CHECKOUT_TIMEOUT,
+                        )
+                        .await
+                    {
                         Ok(conn) => conn.activate(),
                         Err(err) => {
                             debug!(
@@ -1075,7 +1085,12 @@ impl ClientSession {
                     pool_waiting = checkout_status.waiting,
                     "Requesting pooled connection after backend switch"
                 );
-                let conn = provider.checkout_connection_guard().await?.activate();
+                let conn = provider
+                    .checkout_connection_guard_within(
+                        crate::constants::pool::PER_COMMAND_CHECKOUT_TIMEOUT,
+                    )
+                    .await?
+                    .activate();
                 let checkout_status = provider.status_counts();
                 trace!(
                     client = %self.client_addr,
@@ -1107,7 +1122,12 @@ impl ClientSession {
                     pool_waiting = checkout_status.waiting,
                     "Requesting pooled connection"
                 );
-                let conn = provider.checkout_connection_guard().await?.activate();
+                let conn = provider
+                    .checkout_connection_guard_within(
+                        crate::constants::pool::PER_COMMAND_CHECKOUT_TIMEOUT,
+                    )
+                    .await?
+                    .activate();
                 let checkout_status = provider.status_counts();
                 trace!(
                     client = %self.client_addr,
@@ -2385,6 +2405,30 @@ mod tests {
             "message-ID requests may still use the excluded, less-loaded backend"
         );
         assert_eq!(allowed_bodies.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn bounded_checkout_gives_up_when_the_pool_has_no_free_connection() {
+        let (port, _accepts) = spawn_greeting_server().await;
+        let provider = DeadpoolConnectionProvider::builder("127.0.0.1", port)
+            .max_connections(1)
+            .build()
+            .unwrap();
+        let _held = provider.checkout_connection_guard().await.unwrap();
+
+        let started = std::time::Instant::now();
+        let result = provider
+            .checkout_connection_guard_within(std::time::Duration::from_millis(150))
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(crate::connection_error::ConnectionError::PoolExhausted { .. })
+        ));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "a stuck pool must not hold the request"
+        );
     }
 
     #[tokio::test]
