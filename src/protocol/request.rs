@@ -881,7 +881,9 @@ fn classify_request_kind(verb: &[u8], args: &[u8]) -> RequestKind {
             && args
                 .next()
                 .is_some_and(|arg| arg.eq_ignore_ascii_case(b"GZIP"))
-            && args.next().is_none()
+            && args
+                .next()
+                .is_none_or(|arg| arg.eq_ignore_ascii_case(b"TERMINATOR") && args.next().is_none())
         {
             return RequestKind::XfeatureCompressGzip;
         }

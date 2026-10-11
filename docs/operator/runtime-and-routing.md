@@ -67,8 +67,14 @@ Commands that depend on selected group or current article state are not a good f
 those commands require reader state. Hybrid and stateful modes retain their
 reader capability list.
 
-Client `XFEATURE COMPRESS GZIP` requests return `503`: compressed overview
-responses use zlib stream boundaries that the proxy's text framer cannot track.
+In `per-command` mode, client `MODE READER` requests receive `502` and the
+connection closes immediately, as required by RFC 3977 §5.3.2 for a server
+that does not advertise `READER`. Authentication does not change that behavior.
+Hybrid and stateful modes continue to forward `MODE READER` to their backends.
+
+Client `XFEATURE COMPRESS GZIP` requests, including the optional `TERMINATOR`
+form, return `503`: compressed overview responses use zlib stream boundaries
+that the proxy's text framer cannot track.
 Backend RFC 8054 `COMPRESS DEFLATE` negotiation remains available through the
 server `compress` setting.
 

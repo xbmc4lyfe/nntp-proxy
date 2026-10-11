@@ -2681,7 +2681,7 @@ mod tests {
                                     .write_all(b"201 Reader ready\r\n")
                                     .await
                                     .unwrap(),
-                                "XFEATURE COMPRESS GZIP" => {
+                                "XFEATURE COMPRESS GZIP" | "XFEATURE COMPRESS GZIP TERMINATOR" => {
                                     compression_enabled = true;
                                     backend
                                         .get_mut()
@@ -2748,8 +2748,10 @@ mod tests {
             let mut line = String::new();
             client.read_line(&mut line).await?;
             for (command, expected_status) in [
+                ("XFEATURE COMPRESS GZIP TERMINATOR\r\n", 503),
                 ("XFEATURE COMPRESS GZIP\r\n", 503),
                 ("GROUP alt.test\r\n", 211),
+                ("XFEATURE COMPRESS GZIP TERMINATOR\r\n", 503),
                 ("XFEATURE COMPRESS GZIP\r\n", 503),
                 ("XOVER 1-1\r\n", 224),
             ] {

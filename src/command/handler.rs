@@ -182,13 +182,36 @@ pub type CommandAction<'a> = CommandPlan<'a>;
 pub struct RejectResponse {
     status: StatusCode,
     wire: &'static str,
+    connection: RejectConnectionDisposition,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RejectConnectionDisposition {
+    KeepOpen,
+    Close,
 }
 
 impl RejectResponse {
     #[must_use]
     pub const fn new(status: StatusCode, wire: &'static str) -> Self {
         assert!(wire_status(wire) == status.as_u16());
-        Self { status, wire }
+        Self {
+            status,
+            wire,
+            connection: RejectConnectionDisposition::KeepOpen,
+        }
+    }
+
+    const fn closing(status: StatusCode, wire: &'static str) -> Self {
+        Self {
+            connection: RejectConnectionDisposition::Close,
+            ..Self::new(status, wire)
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn closes_connection(self) -> bool {
+        matches!(self.connection, RejectConnectionDisposition::Close)
     }
 
     #[must_use]
@@ -249,6 +272,10 @@ const STATEFUL_REJECT: RejectResponse = RejectResponse::new(
 const TRANSPORT_REJECT: RejectResponse = RejectResponse::new(
     StatusCode::new(codes::FEATURE_NOT_SUPPORTED),
     "503 Transport-changing command not supported\r\n",
+);
+const MODE_READER_REJECT: RejectResponse = RejectResponse::closing(
+    StatusCode::new(codes::ACCESS_DENIED),
+    "502 Reader service unavailable in per-command routing mode\r\n",
 );
 
 const fn wire_status(wire: &str) -> u16 {
@@ -316,6 +343,14 @@ impl CommandHandler {
             RequestKind::AuthInfo => CommandPlan::InterceptAuth(classify_auth(request.args())),
             RequestKind::Capabilities => CommandPlan::InterceptCapabilities,
             RequestKind::Quit => CommandPlan::Forward,
+            RequestKind::Mode
+                if routing_mode == RoutingMode::PerCommand
+                    && trim_ascii(request.args()).eq_ignore_ascii_case(b"READER") =>
+            {
+                // RFC 3977 §5.3.2 requires 502 and an immediate close when
+                // the server does not advertise READER or switch reader modes.
+                CommandPlan::Reject(MODE_READER_REJECT)
+            }
             _ => match request.route_class() {
                 RequestRouteClass::ArticleByMessageId | RequestRouteClass::Stateless => {
                     if auth_access.can_access_backend() {
@@ -604,6 +639,8 @@ mod tests {
             "XFEATURE COMPRESS GZIP\r\n",
             "xfeature compress gzip\r\n",
             "XfEaTuRe\t CoMpReSs\tGzIp  \r\n",
+            "XFEATURE COMPRESS GZIP TERMINATOR\r\n",
+            "XfEaTuRe\t CoMpReSs\tGzIp\tTeRmInAtOr  \r\n",
         ] {
             let request = RequestContext::parse(command.as_bytes()).unwrap();
             assert_eq!(
@@ -637,6 +674,7 @@ mod tests {
             "XFEATURE TEST",
             "XFEATURE COMPRESS OTHER",
             "XFEATURE COMPRESS GZIP EXTRA",
+            "XFEATURE COMPRESS GZIP TERMINATOR EXTRA",
         ] {
             let request = RequestContext::parse(command.as_bytes()).unwrap();
             assert_eq!(request.route_class(), RequestRouteClass::Stateful);
@@ -648,6 +686,25 @@ mod tests {
                 ),
                 CommandPlan::SwitchToStateful(_)
             ));
+        }
+    }
+
+    #[test]
+    fn mode_reader_is_unavailable_in_per_command_mode() {
+        for command in ["MODE READER", "mOdE\t ReAdEr  "] {
+            let request = RequestContext::parse(command.as_bytes()).unwrap();
+            for access in [
+                AuthenticationAccess::Unrestricted,
+                AuthenticationAccess::Required,
+                AuthenticationAccess::Authenticated,
+            ] {
+                let plan =
+                    CommandHandler::classify_request(&request, access, RoutingMode::PerCommand);
+                let CommandPlan::Reject(response) = plan else {
+                    panic!("reader service is unavailable in per-command mode: {plan:?}");
+                };
+                assert_eq!(response.status().as_u16(), 502);
+            }
         }
     }
 
