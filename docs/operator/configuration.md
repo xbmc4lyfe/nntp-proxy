@@ -137,6 +137,7 @@ password = "reader-password"
 | `compress` | auto-detect | RFC 8054 backend `COMPRESS DEFLATE` |
 | `compress_level` | unset | Level `0`-`9` when compression is enabled |
 | `backend_idle_timeout` | `600` seconds | Clears idle backend connections after proxy-wide inactivity |
+| `prewarm_connections` | `max_connections` | Connections opened at startup, capped at `max_connections`. `0` opens none and the pool fills on demand. Lower it on a backend whose account is shared with other clients, so idle pooled connections don't use up the provider's per-account limit. |
 
 ### Article numbering across providers
 
@@ -193,6 +194,7 @@ Currently supported backend environment fields:
 - `CONNECTION_KEEPALIVE`
 - `HEALTH_CHECK_MAX_PER_CYCLE`
 - `HEALTH_CHECK_POOL_TIMEOUT`
+- `PREWARM_CONNECTIONS` (non-negative integer; any other value stops startup)
 - `TIER`
 - `STATEFUL_SESSIONS` (`allowed` or `excluded`; any other value stops startup)
 

@@ -378,6 +378,15 @@ pub fn parse_server_from_env<E: EnvProvider>(index: usize, env: &E) -> Option<Se
         },
     );
 
+    // Fail loudly: a typo silently falling back to "open every connection"
+    // would defeat the point of lowering it.
+    let prewarm_key = format!("NNTP_SERVER_{index}_PREWARM_CONNECTIONS");
+    let prewarm_connections = env.get(&prewarm_key).map(|value| {
+        value.parse::<usize>().unwrap_or_else(|_| {
+            panic!("Invalid {prewarm_key}: '{value}' (must be a non-negative integer)")
+        })
+    });
+
     Some(Server {
         host: crate::types::HostName::try_new(host.clone())
             .unwrap_or_else(|_| panic!("Invalid hostname in {host_key}: '{host}'")),
@@ -401,6 +410,7 @@ pub fn parse_server_from_env<E: EnvProvider>(index: usize, env: &E) -> Option<Se
         compress: None,
         compress_level: None,
         backend_idle_timeout: crate::config::defaults::backend_idle_timeout(),
+        prewarm_connections,
     })
 }
 
@@ -651,6 +661,7 @@ pub fn create_default_config() -> Config {
             compress: None,
             compress_level: None,
             backend_idle_timeout: defaults::backend_idle_timeout(),
+            prewarm_connections: None,
         }],
         ..Default::default()
     }
@@ -896,6 +907,39 @@ mod tests {
 
         let server = parse_server_from_env(0, &env).unwrap();
         assert_eq!(server.stat_missing, 3);
+    }
+
+    #[test]
+    fn test_parse_server_from_env_prewarm_connections() {
+        let mut env = MockEnv::new();
+        env.set("NNTP_SERVER_0_HOST", "news.example.com")
+            .set("NNTP_SERVER_1_HOST", "news2.example.com")
+            .set("NNTP_SERVER_1_PREWARM_CONNECTIONS", "0")
+            .set("NNTP_SERVER_2_HOST", "news3.example.com")
+            .set("NNTP_SERVER_2_PREWARM_CONNECTIONS", "4");
+
+        assert_eq!(
+            parse_server_from_env(0, &env).unwrap().prewarm_connections,
+            None
+        );
+        assert_eq!(
+            parse_server_from_env(1, &env).unwrap().prewarm_connections,
+            Some(0)
+        );
+        assert_eq!(
+            parse_server_from_env(2, &env).unwrap().prewarm_connections,
+            Some(4)
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "NNTP_SERVER_0_PREWARM_CONNECTIONS")]
+    fn test_parse_server_from_env_invalid_prewarm_connections_panics() {
+        let mut env = MockEnv::new();
+        env.set("NNTP_SERVER_0_HOST", "news.example.com")
+            .set("NNTP_SERVER_0_PREWARM_CONNECTIONS", "-1");
+
+        let _ = parse_server_from_env(0, &env);
     }
 
     #[test]

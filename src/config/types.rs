@@ -705,6 +705,16 @@ pub struct Server {
         default = "super::defaults::backend_idle_timeout"
     )]
     pub backend_idle_timeout: Duration,
+
+    /// Connections to open at startup. `None` (default) opens `max_connections`;
+    /// `0` opens none, so the pool fills as requests arrive; larger values are
+    /// capped at `max_connections`.
+    ///
+    /// A prewarmed connection is held against the provider's per-account limit
+    /// for as long as it stays open, so lowering this on a backend whose account
+    /// is shared with other clients leaves those slots free.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prewarm_connections: Option<usize>,
 }
 
 /// Builder for constructing `Server` instances
@@ -753,6 +763,7 @@ pub struct ServerBuilder {
     compress: Option<bool>,
     compress_level: Option<u32>,
     backend_idle_timeout: Option<Duration>,
+    prewarm_connections: Option<usize>,
 }
 
 impl ServerBuilder {
@@ -783,6 +794,7 @@ impl ServerBuilder {
             compress: None,
             compress_level: None,
             backend_idle_timeout: None,
+            prewarm_connections: None,
         }
     }
 
@@ -915,6 +927,15 @@ impl ServerBuilder {
         self
     }
 
+    /// Set how many connections to open at startup (default: `max_connections`)
+    ///
+    /// `0` leaves the pool empty until requests arrive.
+    #[must_use]
+    pub const fn prewarm_connections(mut self, count: usize) -> Self {
+        self.prewarm_connections = Some(count);
+        self
+    }
+
     /// Build the Server
     ///
     /// # Errors
@@ -975,6 +996,7 @@ impl ServerBuilder {
             backend_idle_timeout: self
                 .backend_idle_timeout
                 .unwrap_or_else(super::defaults::backend_idle_timeout),
+            prewarm_connections: self.prewarm_connections,
         })
     }
 }

@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Added per-backend `prewarm_connections` (and `NNTP_SERVER_<N>_PREWARM_CONNECTIONS`): how many connections to open at startup, capped at `max_connections`. The default still opens the whole pool; `0` fills the pool on demand. Lowering it keeps idle pooled connections from using up the per-account limit of a provider shared with other clients.
 - Added per-backend `stateful_sessions = "excluded"` (and `NNTP_SERVER_<N>_STATEFUL_SESSIONS`), which keeps a backend out of hybrid and stateful session pinning while it still serves message-ID requests. Indexers that store `GROUP`/`XOVER` article numbers can now share a tier with providers that number articles differently.
 
 ### Fixed
