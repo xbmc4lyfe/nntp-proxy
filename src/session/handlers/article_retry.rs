@@ -346,6 +346,21 @@ impl ClientSession {
                     is_retry_attempt = true;
                 }
                 Ok(BackendAttemptResult::NoRetryableBackend) => {
+                    // Some backend answered 430 and the rest were only
+                    // transiently unavailable (busy or refusing logins): the
+                    // article is most likely gone, and clients handle 430
+                    // (try another source) far better than 503 (retry here).
+                    if availability.missing_bits() != 0 {
+                        trace!(
+                            "Client {} remaining backends unavailable after 430s for {:?}, sending 430",
+                            self.client_addr,
+                            request.message_id_value()
+                        );
+                        let client_write = io.client_writer.get_mut();
+                        self.send_430_to_client(client_write, io.backend_to_client_bytes)
+                            .await?;
+                        return Ok(());
+                    }
                     let bytes_written = {
                         let client_write = io.client_writer.get_mut();
                         Self::write_backend_error_response(client_write).await?
