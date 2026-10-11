@@ -19,6 +19,7 @@ use tokio::sync::Mutex;
 use tokio::sync::Notify;
 
 use crate::connection_error::ConnectionError;
+use crate::pool::auth_backoff::{Admission, AuthBackoff};
 use crate::protocol::{RequestContext, authinfo_pass, authinfo_user};
 use crate::stream::ConnectionStream;
 use crate::tls::{TlsConfig, TlsManager, TlsPolicy};
@@ -212,7 +213,7 @@ pub struct TcpManager {
     /// Whether to send MODE READER after authentication (RFC 3977 §5.3)
     pub(crate) send_mode_reader: bool,
     /// Gate that stops repeated logins while the backend keeps refusing them.
-    login_backoff: Arc<super::auth_backoff::AuthBackoff>,
+    login_backoff: Arc<AuthBackoff>,
 }
 
 impl TcpManager {
@@ -793,6 +794,18 @@ impl TcpManager {
 // Manager trait implementation
 // ============================================================================
 
+/// Holds the single probe slot of the login gate until the login resolves.
+///
+/// Dropping it also covers a cancelled `create()` future, so an abandoned probe
+/// can never leave the gate waiting for an answer that will not come.
+struct ProbeGuard<'a>(&'a AuthBackoff);
+
+impl Drop for ProbeGuard<'_> {
+    fn drop(&mut self) {
+        self.0.abandon_probe();
+    }
+}
+
 impl TcpManager {
     /// Open, greet, authenticate and configure one backend session.
     async fn create_session(&self) -> Result<ReadyBackendConnection, ConnectionError> {
@@ -820,30 +833,34 @@ impl managed::Manager for TcpManager {
     type Error = ConnectionError;
 
     async fn create(&self) -> Result<ReadyBackendConnection, ConnectionError> {
-        if let Some(retry_in) = self.login_backoff.remaining(std::time::Instant::now()) {
-            return Err(ConnectionError::LoginBackoff {
-                backend: self.name.clone(),
-                retry_in,
-            });
-        }
+        let probe = match self.login_backoff.admit(std::time::Instant::now()) {
+            Admission::Wait(retry_in) => {
+                return Err(ConnectionError::LoginBackoff {
+                    backend: self.name.clone(),
+                    retry_in,
+                });
+            }
+            Admission::Open => None,
+            Admission::Probe => Some(ProbeGuard(&self.login_backoff)),
+        };
 
-        match self.create_session().await {
-            Ok(conn) => {
-                self.login_backoff.record_success();
-                Ok(conn)
+        let result = self.create_session().await;
+        match &result {
+            Ok(_) => self.login_backoff.record_success(),
+            Err(error) if error.is_login_refusal() => {
+                let retry_in = self.login_backoff.record_failure(std::time::Instant::now());
+                tracing::warn!(
+                    backend = %self.name,
+                    retry_in_secs = retry_in.as_secs(),
+                    "Backend refused login; pausing new connections to it"
+                );
             }
-            Err(error) => {
-                if error.is_login_refusal() {
-                    let retry_in = self.login_backoff.record_failure(std::time::Instant::now());
-                    tracing::warn!(
-                        backend = %self.name,
-                        retry_in_secs = retry_in.as_secs(),
-                        "Backend refused login; pausing new connections to it"
-                    );
-                }
-                Err(error)
-            }
+            // Network-level failure: the probe (if any) learned nothing about
+            // the account, so the guard hands the probe to the next caller.
+            Err(_) => {}
         }
+        drop(probe);
+        result
     }
 
     async fn recycle(
@@ -1386,12 +1403,11 @@ mod tests {
             .checked_sub(std::time::Duration::from_secs(120))
             .expect("monotonic clock has run for more than two minutes");
         manager.login_backoff.record_failure(long_ago);
-        assert!(
-            manager
-                .login_backoff
-                .remaining(std::time::Instant::now())
-                .is_none()
+        assert_eq!(
+            manager.login_backoff.admit(std::time::Instant::now()),
+            Admission::Probe
         );
+        manager.login_backoff.abandon_probe();
 
         managed::Manager::create(&manager)
             .await
@@ -1417,5 +1433,35 @@ mod tests {
             let result = managed::Manager::create(&manager).await;
             assert!(matches!(result, Err(ConnectionError::IoError(_))));
         }
+    }
+
+    #[tokio::test]
+    async fn one_probe_login_when_window_closes_with_many_waiters() {
+        let (addr, accepted) = spawn_login_server("502 connection limit (10) reached\r\n").await;
+        let manager = login_manager(addr);
+        let long_ago = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(120))
+            .expect("monotonic clock has run for more than two minutes");
+        manager.login_backoff.record_failure(long_ago);
+
+        let attempts: Vec<_> = (0..16)
+            .map(|_| {
+                let manager = manager.clone();
+                tokio::spawn(async move { managed::Manager::create(&manager).await })
+            })
+            .collect();
+        let mut refused = 0;
+        let mut waiting = 0;
+        for attempt in attempts {
+            match attempt.await.unwrap() {
+                Err(ConnectionError::AuthenticationFailed { .. }) => refused += 1,
+                Err(ConnectionError::LoginBackoff { .. }) => waiting += 1,
+                other => panic!("unexpected result: {other:?}"),
+            }
+        }
+
+        assert_eq!(refused, 1, "exactly one caller may probe");
+        assert_eq!(waiting, 15);
+        assert_eq!(accepted.load(Ordering::SeqCst), 1);
     }
 }

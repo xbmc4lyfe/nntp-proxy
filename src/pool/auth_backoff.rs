@@ -18,12 +18,28 @@ pub(crate) const INITIAL_DELAY: Duration = Duration::from_secs(5);
 /// Longest wait between login attempts while the backend keeps refusing.
 pub(crate) const MAX_DELAY: Duration = Duration::from_secs(60);
 
+/// How long callers that lose the race for the probe are told to wait.
+pub(crate) const PROBE_RETRY: Duration = Duration::from_secs(1);
+
+/// What a caller may do right now.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Admission {
+    /// No refusal is on record: log in normally.
+    Open,
+    /// The backoff window has closed: this caller alone probes with a real login.
+    Probe,
+    /// Do not touch the network; try again after this long.
+    Wait(Duration),
+}
+
 #[derive(Debug, Default)]
 struct State {
     /// Consecutive refused attempts, counted once per backoff window.
     failures: u32,
     /// No login may be attempted before this instant.
     retry_not_before: Option<Instant>,
+    /// A probe login is in flight, so everyone else keeps waiting.
+    probing: bool,
 }
 
 /// Shared by every pool slot of one backend.
@@ -33,16 +49,35 @@ pub(crate) struct AuthBackoff {
 }
 
 impl AuthBackoff {
-    /// Remaining wait if a login must not be attempted at `now`.
-    pub(crate) fn remaining(&self, now: Instant) -> Option<Duration> {
-        let state = self
-            .state
+    fn lock(&self) -> std::sync::MutexGuard<'_, State> {
+        self.state
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Decide whether a login may be attempted at `now`.
+    ///
+    /// While refusals are on record, at most one caller at a time is admitted
+    /// as the probe once the window closes. Without that, every pool slot waiting
+    /// on the backend would log in together at each window boundary and bring
+    /// the failed-login storm straight back.
+    pub(crate) fn admit(&self, now: Instant) -> Admission {
+        let mut state = self.lock();
+        if let Some(left) = state
             .retry_not_before
             .and_then(|deadline| deadline.checked_duration_since(now))
             .filter(|left| !left.is_zero())
+        {
+            return Admission::Wait(left);
+        }
+        if state.failures == 0 {
+            return Admission::Open;
+        }
+        if state.probing {
+            return Admission::Wait(PROBE_RETRY);
+        }
+        state.probing = true;
+        Admission::Probe
     }
 
     /// Record a refused login and return the wait that now applies.
@@ -51,10 +86,8 @@ impl AuthBackoff {
     /// together; only the first of them extends the delay, so a pool of N
     /// concurrent creators does not jump N steps up the schedule.
     pub(crate) fn record_failure(&self, now: Instant) -> Duration {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = self.lock();
+        state.probing = false;
         if let Some(deadline) = state.retry_not_before
             && now < deadline
         {
@@ -68,11 +101,13 @@ impl AuthBackoff {
 
     /// A login succeeded: forget the refusals so the next one starts fresh.
     pub(crate) fn record_success(&self) {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *state = State::default();
+        *self.lock() = State::default();
+    }
+
+    /// The probe ended without an answer (network error or cancelled), so let
+    /// the next caller probe instead of leaving the gate shut.
+    pub(crate) fn abandon_probe(&self) {
+        self.lock().probing = false;
     }
 }
 
@@ -86,10 +121,21 @@ fn delay_for(failures: u32) -> Duration {
 mod tests {
     use super::*;
 
+    fn remaining(gate: &AuthBackoff, now: Instant) -> Option<Duration> {
+        match gate.admit(now) {
+            Admission::Wait(left) => Some(left),
+            Admission::Open => None,
+            Admission::Probe => {
+                gate.abandon_probe();
+                None
+            }
+        }
+    }
+
     #[test]
     fn open_until_first_failure() {
         let gate = AuthBackoff::default();
-        assert_eq!(gate.remaining(Instant::now()), None);
+        assert_eq!(gate.admit(Instant::now()), Admission::Open);
     }
 
     #[test]
@@ -97,12 +143,12 @@ mod tests {
         let gate = AuthBackoff::default();
         let t0 = Instant::now();
         assert_eq!(gate.record_failure(t0), INITIAL_DELAY);
-        assert_eq!(gate.remaining(t0), Some(INITIAL_DELAY));
+        assert_eq!(remaining(&gate, t0), Some(INITIAL_DELAY));
         assert_eq!(
-            gate.remaining(t0 + Duration::from_secs(2)),
+            remaining(&gate, t0 + Duration::from_secs(2)),
             Some(Duration::from_secs(3))
         );
-        assert_eq!(gate.remaining(t0 + INITIAL_DELAY), None);
+        assert_eq!(remaining(&gate, t0 + INITIAL_DELAY), None);
     }
 
     #[test]
@@ -142,7 +188,7 @@ mod tests {
             now += gate.record_failure(now);
         }
         gate.record_success();
-        assert_eq!(gate.remaining(now), None);
+        assert_eq!(remaining(&gate, now), None);
         assert_eq!(gate.record_failure(now), INITIAL_DELAY);
     }
 
@@ -150,5 +196,60 @@ mod tests {
     fn huge_failure_counts_do_not_overflow() {
         assert_eq!(delay_for(u32::MAX), MAX_DELAY);
         assert_eq!(delay_for(40), MAX_DELAY);
+    }
+
+    #[test]
+    fn many_callers_are_admitted_before_any_refusal() {
+        let gate = AuthBackoff::default();
+        let now = Instant::now();
+        for _ in 0..50 {
+            assert_eq!(gate.admit(now), Admission::Open);
+        }
+    }
+
+    #[test]
+    fn only_one_probe_after_window_closes() {
+        let gate = AuthBackoff::default();
+        let t0 = Instant::now();
+        gate.record_failure(t0);
+        let later = t0 + INITIAL_DELAY;
+        assert_eq!(gate.admit(later), Admission::Probe);
+        for _ in 0..10 {
+            assert_eq!(gate.admit(later), Admission::Wait(PROBE_RETRY));
+        }
+    }
+
+    #[test]
+    fn failed_probe_reopens_window_with_longer_delay() {
+        let gate = AuthBackoff::default();
+        let t0 = Instant::now();
+        gate.record_failure(t0);
+        let later = t0 + INITIAL_DELAY;
+        assert_eq!(gate.admit(later), Admission::Probe);
+        assert_eq!(gate.record_failure(later), Duration::from_secs(10));
+        assert_eq!(gate.admit(later), Admission::Wait(Duration::from_secs(10)));
+    }
+
+    #[test]
+    fn successful_probe_reopens_gate_for_everyone() {
+        let gate = AuthBackoff::default();
+        let t0 = Instant::now();
+        gate.record_failure(t0);
+        let later = t0 + INITIAL_DELAY;
+        assert_eq!(gate.admit(later), Admission::Probe);
+        gate.record_success();
+        assert_eq!(gate.admit(later), Admission::Open);
+        assert_eq!(gate.admit(later), Admission::Open);
+    }
+
+    #[test]
+    fn abandoned_probe_lets_the_next_caller_probe() {
+        let gate = AuthBackoff::default();
+        let t0 = Instant::now();
+        gate.record_failure(t0);
+        let later = t0 + INITIAL_DELAY;
+        assert_eq!(gate.admit(later), Admission::Probe);
+        gate.abandon_probe();
+        assert_eq!(gate.admit(later), Admission::Probe);
     }
 }

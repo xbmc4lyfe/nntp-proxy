@@ -375,7 +375,16 @@ impl ClientSession {
                 conn_guard.activate()
             }
             Err(e) => {
-                error!(server = server_name, client = %self.client_addr, error = %e, "Failed to get pooled connection");
+                // A backend in login backoff fails every checkout by design until
+                // its window closes; one error per client would flood the log.
+                if matches!(
+                    e,
+                    crate::connection_error::ConnectionError::LoginBackoff { .. }
+                ) {
+                    debug!(server = server_name, client = %self.client_addr, error = %e, "Backend in login backoff");
+                } else {
+                    error!(server = server_name, client = %self.client_addr, error = %e, "Failed to get pooled connection");
+                }
                 client_stream
                     .write_all(BACKEND_UNAVAILABLE)
                     .await
