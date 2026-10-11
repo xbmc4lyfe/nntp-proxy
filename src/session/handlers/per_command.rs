@@ -142,7 +142,9 @@ impl BatchBackendConnection {
 impl Drop for BatchBackendConnection {
     fn drop(&mut self) {
         if let Some(lease) = self.conn.take() {
-            lease.fail_backend();
+            // Cancelled/aborted batch (usually a client disconnect): retire the cached
+            // socket but do not shrink the backend pool for a client-side event.
+            lease.fail_client();
         }
     }
 }

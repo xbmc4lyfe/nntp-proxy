@@ -26,6 +26,9 @@ use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tracing::{debug, trace, warn};
 
 const BACKEND_TIMING_SAMPLE_MASK: u64 = 0x0f;
+
+/// Speculative STAT probes must not queue behind a saturated or login-refusing pool.
+const STAT_PROBE_CHECKOUT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 static BACKEND_TIMING_SAMPLE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[inline]
@@ -453,9 +456,14 @@ impl ClientSession {
             let stat_request = stat_request.clone_for_background_probe();
             probes.push(async move {
                 let _guard = BackendSelector::guard_for_manual_backend(router, backend_id);
-                let conn = match provider.checkout_connection_guard().await {
-                    Ok(conn) => conn.activate(),
-                    Err(_) => return RetryStatProbeOutcome::Unavailable(backend_id),
+                let conn = match tokio::time::timeout(
+                    STAT_PROBE_CHECKOUT_TIMEOUT,
+                    provider.checkout_connection_guard(),
+                )
+                .await
+                {
+                    Ok(Ok(conn)) => conn.activate(),
+                    Ok(Err(_)) | Err(_) => return RetryStatProbeOutcome::Unavailable(backend_id),
                 };
                 let buffer = self.buffer_pool.acquire();
                 let exchange = match backend::execute_request_exchange(
@@ -574,9 +582,14 @@ impl ClientSession {
                         .availability_slot(backend_id)
                         .expect("probe backend is registered");
                     let _guard = BackendSelector::guard_for_manual_backend(router, backend_id);
-                    let conn = match provider.checkout_connection_guard().await {
-                        Ok(conn) => conn.activate(),
-                        Err(_) => return,
+                    let conn = match tokio::time::timeout(
+                        STAT_PROBE_CHECKOUT_TIMEOUT,
+                        provider.checkout_connection_guard(),
+                    )
+                    .await
+                    {
+                        Ok(Ok(conn)) => conn.activate(),
+                        Ok(Err(_)) | Err(_) => return,
                     };
                     let buffer = buffer_pool.acquire();
                     let exchange = match backend::execute_request_exchange(

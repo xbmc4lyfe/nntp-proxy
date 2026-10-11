@@ -1348,14 +1348,19 @@ impl BufferPool {
                     );
                 }
 
-                hot_path_allocation_metrics()
+                let fallbacks = hot_path_allocation_metrics()
                     .regular_pool_fallback_allocations
                     .fetch_add(1, Ordering::Relaxed);
-                warn!(
-                    max_pool_size = self.max_pool_size,
-                    buffer_size = self.buffer_size.get(),
-                    "Regular buffer pool exhausted; allocating fallback buffer"
-                );
+                // Log the first and then every 4096th fallback (was one WARN per acquire,
+                // ~1300 lines/s under load, rotating docker's 30 MB log in ~75 s).
+                if fallbacks.is_multiple_of(4096) {
+                    warn!(
+                        max_pool_size = self.max_pool_size,
+                        buffer_size = self.buffer_size.get(),
+                        fallbacks_so_far = fallbacks,
+                        "Regular buffer pool exhausted; allocating fallback buffer"
+                    );
+                }
                 self.wrap_regular_buffer(
                     Self::create_aligned_buffer(self.buffer_size.get()),
                     true,
