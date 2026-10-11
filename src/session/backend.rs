@@ -149,6 +149,28 @@ where
     ClassifiedResponse::read_for_test(conn, request, buffer).await
 }
 
+/// Read the first chunk of a backend reply, bounded by `timeout::BACKEND_READ`.
+///
+/// A backend that accepts a command and never answers (seen with `STAT` for
+/// unknown message-IDs) would otherwise hold the client forever. On timeout the
+/// error propagates, the caller drops the connection guard, and the stuck
+/// connection is removed from the pool with a cooldown.
+async fn read_first_chunk(
+    buffer: &mut PooledBuffer,
+    conn: &mut crate::pool::ConnectionGuard,
+) -> Result<()> {
+    let n = tokio::time::timeout(
+        crate::constants::timeout::BACKEND_READ,
+        buffer.read_from(conn.stream_mut()),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("Backend did not respond within the read timeout"))??;
+    if n == 0 {
+        anyhow::bail!("Backend connection closed unexpectedly");
+    }
+    Ok(())
+}
+
 /// Execute a direct request and return the response bound to the connection
 /// that supplied it.  The exchange owns both values until a consuming
 /// forwarding, capture, or observation operation is selected.
@@ -161,10 +183,7 @@ pub(crate) async fn execute_request_exchange<'pool>(
 ) -> Result<BackendResponseExchange<'pool>> {
     request.write_wire_to(conn.stream_mut()).await?;
 
-    let n = buffer.read_from(conn.stream_mut()).await?;
-    if n == 0 {
-        anyhow::bail!("Backend connection closed unexpectedly");
-    }
+    read_first_chunk(&mut buffer, &mut conn).await?;
 
     BackendResponseExchange::read(conn, request, buffer, pool, backend_id).await
 }
@@ -184,10 +203,7 @@ pub(crate) async fn execute_request_exchange_timed<'pool>(
     request.write_wire_to(conn.stream_mut()).await?;
     let after_send = Instant::now();
 
-    let n = buffer.read_from(conn.stream_mut()).await?;
-    if n == 0 {
-        anyhow::bail!("Backend connection closed unexpectedly");
-    }
+    read_first_chunk(&mut buffer, &mut conn).await?;
 
     let exchange = BackendResponseExchange::read(conn, request, buffer, pool, backend_id).await?;
     let after_recv = Instant::now();

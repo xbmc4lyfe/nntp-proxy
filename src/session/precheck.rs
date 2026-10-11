@@ -198,7 +198,7 @@ async fn query_backend(
 
     // Retry once on backend error (fresh connection on second attempt)
     let query_result = crate::session::retry::retry_once!(
-        execute_backend_query(deps, provider, &backend, request).await,
+        bounded_backend_query(deps, provider, &backend, request).await,
         backend = backend_id.as_index()
     )
     .unwrap_or(QueryAttemptResult::Error);
@@ -211,6 +211,25 @@ async fn query_backend(
         QueryAttemptResult::Missing => QueryResult::Missing(backend),
         QueryAttemptResult::Error => QueryResult::Error,
     }
+}
+
+/// Run one precheck attempt, giving up after `timeout::PRECHECK_QUERY`.
+///
+/// A backend that never answers must not stall the whole racing query, which
+/// waits for every backend in a tier before it can report an article missing.
+/// A timeout is a transport error (inconclusive), never a missing fact.
+async fn bounded_backend_query(
+    deps: &OwnedDeps,
+    provider: &crate::pool::DeadpoolConnectionProvider,
+    backend: &ArticleBackend,
+    request: &RequestContext,
+) -> Result<QueryAttemptResult, ()> {
+    tokio::time::timeout(
+        crate::constants::timeout::PRECHECK_QUERY,
+        execute_backend_query(deps, provider, backend, request),
+    )
+    .await
+    .unwrap_or(Ok(QueryAttemptResult::Error))
 }
 
 /// Execute a single backend query attempt
@@ -1027,6 +1046,50 @@ mod tests {
             0,
         );
         (selector, backend_id)
+    }
+
+    async fn spawn_silent_precheck_server() -> std::net::SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let _ = stream.write_all(b"200 mock\r\n").await;
+                    let mut buf = [0u8; 1024];
+                    // Read commands but never answer them.
+                    while matches!(stream.read(&mut buf).await, Ok(n) if n > 0) {}
+                });
+            }
+        });
+
+        addr
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn query_backend_times_out_when_backend_never_answers() {
+        let addr = spawn_silent_precheck_server().await;
+        let (selector, backend_id) = selector_with_backend(addr, 2);
+
+        let deps = OwnedDeps {
+            router: Arc::new(selector),
+            cache: Arc::new(UnifiedCache::memory(100, Duration::from_secs(60))),
+            buffer_pool: BufferPool::new(BufferSize::try_new(4096).unwrap(), 2),
+            metrics: MetricsCollector::new(1),
+        };
+
+        let request =
+            RequestContext::parse(b"STAT <test@example.com>\r\n").expect("valid request line");
+        let result = tokio::time::timeout(
+            Duration::from_secs(60),
+            query_backend(&deps, eligible(backend_id), &request),
+        )
+        .await
+        .expect("a silent backend must not stall the precheck");
+        assert!(matches!(result, QueryResult::Error));
     }
 
     #[tokio::test]
