@@ -2,6 +2,7 @@
 //!
 //! This module provides connection management and buffer pooling for the NNTP proxy.
 
+pub(crate) mod auth_backoff;
 pub mod buffer;
 pub mod connection_guard;
 pub mod connection_trait;
