@@ -33,6 +33,43 @@ impl Default for RoutingMode {
     }
 }
 
+/// Whether a backend may be pinned to a client for stateful commands.
+///
+/// Providers number articles independently. A client that stores article
+/// numbers from `GROUP`/`XOVER` (an indexer tracking group positions) breaks
+/// when two of its sessions are pinned to providers with different numbering.
+/// Excluding a backend keeps it in message-ID routing (`ARTICLE <id>`,
+/// `BODY <id>`, `HEAD <id>`, `STAT <id>`) while never handing it a stateful
+/// session.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum StatefulSessions {
+    /// The backend may be selected for stateful sessions (default).
+    #[default]
+    Allowed,
+    /// The backend serves message-ID requests only.
+    Excluded,
+}
+
+impl StatefulSessions {
+    #[must_use]
+    pub const fn is_allowed(self) -> bool {
+        matches!(self, Self::Allowed)
+    }
+}
+
+impl std::str::FromStr for StatefulSessions {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "allowed" => Ok(Self::Allowed),
+            "excluded" => Ok(Self::Excluded),
+            other => anyhow::bail!("expected \"allowed\" or \"excluded\", got \"{other}\""),
+        }
+    }
+}
+
 impl RoutingMode {
     /// Check if this mode supports per-command routing
     #[must_use]
@@ -648,6 +685,10 @@ pub struct Server {
     /// Servers with lower tier numbers are tried first; higher tiers only when lower exhausted
     #[serde(default)]
     pub tier: u8,
+    /// Whether stateful sessions (`GROUP`, `XOVER`, article-number commands)
+    /// may be pinned to this backend. See [`StatefulSessions`].
+    #[serde(default)]
+    pub stateful_sessions: StatefulSessions,
     /// Wire compression for backend connections (RFC 8054 COMPRESS DEFLATE)
     /// None (default) = auto-detect, Some(true) = require, Some(false) = disable
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -708,6 +749,7 @@ pub struct ServerBuilder {
     health_check_max_per_cycle: Option<usize>,
     health_check_pool_timeout: Option<Duration>,
     tier: u8,
+    stateful_sessions: StatefulSessions,
     compress: Option<bool>,
     compress_level: Option<u32>,
     backend_idle_timeout: Option<Duration>,
@@ -737,6 +779,7 @@ impl ServerBuilder {
             health_check_max_per_cycle: None,
             health_check_pool_timeout: None,
             tier: 0,
+            stateful_sessions: StatefulSessions::Allowed,
             compress: None,
             compress_level: None,
             backend_idle_timeout: None,
@@ -836,6 +879,13 @@ impl ServerBuilder {
         self
     }
 
+    /// Set whether stateful sessions may be pinned to this backend
+    #[must_use]
+    pub const fn stateful_sessions(mut self, stateful_sessions: StatefulSessions) -> Self {
+        self.stateful_sessions = stateful_sessions;
+        self
+    }
+
     /// Set wire compression mode (RFC 8054 COMPRESS DEFLATE)
     #[must_use]
     pub const fn compress(mut self, compress: Option<bool>) -> Self {
@@ -919,6 +969,7 @@ impl ServerBuilder {
             health_check_max_per_cycle,
             health_check_pool_timeout,
             tier: self.tier,
+            stateful_sessions: self.stateful_sessions,
             compress: self.compress,
             compress_level: self.compress_level,
             backend_idle_timeout: self
@@ -1327,6 +1378,25 @@ mod tests {
     fn test_disk_cache_default_compression_is_lz4() {
         let disk_cache = DiskCache::default();
         assert_eq!(disk_cache.compression, CompressionCodec::Lz4);
+    }
+
+    #[test]
+    fn test_server_stateful_sessions_deserializes_and_defaults_to_allowed() {
+        let base = r#"
+            host = "news.example.com"
+            port = 563
+            name = "example"
+        "#;
+        let server: Server = toml::from_str(base).unwrap();
+        assert_eq!(server.stateful_sessions, StatefulSessions::Allowed);
+
+        let server: Server =
+            toml::from_str(&format!("{base}\nstateful_sessions = \"excluded\"")).unwrap();
+        assert_eq!(server.stateful_sessions, StatefulSessions::Excluded);
+
+        assert!(
+            toml::from_str::<Server>(&format!("{base}\nstateful_sessions = \"never\"")).is_err()
+        );
     }
 
     #[test]

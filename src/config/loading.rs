@@ -366,6 +366,18 @@ pub fn parse_server_from_env<E: EnvProvider>(index: usize, env: &E) -> Option<Se
         .and_then(|value| value.parse::<u8>().ok())
         .unwrap_or_else(defaults::stat_missing);
 
+    // Fail loudly: silently ignoring an exclusion would let stateful sessions
+    // reach a backend with different article numbering.
+    let stateful_sessions_key = format!("NNTP_SERVER_{index}_STATEFUL_SESSIONS");
+    let stateful_sessions = env.get(&stateful_sessions_key).map_or_else(
+        crate::config::StatefulSessions::default,
+        |value| {
+            value
+                .parse()
+                .unwrap_or_else(|error| panic!("Invalid {stateful_sessions_key}: {error}"))
+        },
+    );
+
     Some(Server {
         host: crate::types::HostName::try_new(host.clone())
             .unwrap_or_else(|_| panic!("Invalid hostname in {host_key}: '{host}'")),
@@ -385,6 +397,7 @@ pub fn parse_server_from_env<E: EnvProvider>(index: usize, env: &E) -> Option<Se
         health_check_max_per_cycle,
         health_check_pool_timeout,
         tier,
+        stateful_sessions,
         compress: None,
         compress_level: None,
         backend_idle_timeout: crate::config::defaults::backend_idle_timeout(),
@@ -634,6 +647,7 @@ pub fn create_default_config() -> Config {
             health_check_max_per_cycle: defaults::health_check_max_per_cycle(),
             health_check_pool_timeout: defaults::health_check_pool_timeout(),
             tier: 0,
+            stateful_sessions: crate::config::StatefulSessions::default(),
             compress: None,
             compress_level: None,
             backend_idle_timeout: defaults::backend_idle_timeout(),
@@ -882,6 +896,33 @@ mod tests {
 
         let server = parse_server_from_env(0, &env).unwrap();
         assert_eq!(server.stat_missing, 3);
+    }
+
+    #[test]
+    fn test_parse_server_from_env_stateful_sessions() {
+        let mut env = MockEnv::new();
+        env.set("NNTP_SERVER_0_HOST", "news.example.com")
+            .set("NNTP_SERVER_1_HOST", "news2.example.com")
+            .set("NNTP_SERVER_1_STATEFUL_SESSIONS", "Excluded");
+
+        assert_eq!(
+            parse_server_from_env(0, &env).unwrap().stateful_sessions,
+            crate::config::StatefulSessions::Allowed
+        );
+        assert_eq!(
+            parse_server_from_env(1, &env).unwrap().stateful_sessions,
+            crate::config::StatefulSessions::Excluded
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "NNTP_SERVER_0_STATEFUL_SESSIONS")]
+    fn test_parse_server_from_env_invalid_stateful_sessions_panics() {
+        let mut env = MockEnv::new();
+        env.set("NNTP_SERVER_0_HOST", "news.example.com")
+            .set("NNTP_SERVER_0_STATEFUL_SESSIONS", "never");
+
+        let _ = parse_server_from_env(0, &env);
     }
 
     #[test]
