@@ -124,6 +124,22 @@ When a backend read includes bytes for the next response, those bytes are kept a
 opaque pending input on the backend connection. Connections with pending bytes
 are not returned to the general pool after a completed per-command response.
 
+Managed backend creation has one 10-second setup deadline covering asynchronous
+DNS, TCP, TLS, greeting, authentication, `MODE READER`, and compression negotiation.
+A setup timeout retires the socket and releases its creation reservation; it is
+not a login refusal and does not start authentication backoff. This deadline does
+not cover waiting for a full pool, synchronous manager initialization, or
+standalone TLS handshake APIs.
+
+Direct and pipelined backend exchanges have one 30-second deadline to receive and
+classify the complete initial status, including a status split across reads.
+Queued input is preserved. Timeout makes that provider unavailable for the
+attempt; only an actual `430` records a missing article. Checkout and request
+writes are outside this receive deadline. Body streaming and idle pinned reader
+loops are not globally limited to 30 seconds, and the existing retry-once policy
+can give an operation more than one receive deadline. These limits introduce no
+new configuration settings.
+
 ## CLI overrides
 
 Most day-to-day runtime overrides map directly to config:

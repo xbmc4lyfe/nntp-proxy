@@ -16,7 +16,6 @@ use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
-use tokio::sync::Notify;
 
 use crate::connection_error::ConnectionError;
 use crate::pool::auth_backoff::{Admission, AuthBackoff};
@@ -117,7 +116,6 @@ enum CompressionSupport {
 enum CompressionSupportState {
     #[default]
     Unknown,
-    Probing(Arc<Notify>),
     Supported,
     Unsupported,
 }
@@ -589,66 +587,26 @@ impl TcpManager {
                 .map(|support| matches!(support, CompressionSupport::Supported));
         }
 
-        loop {
-            let probe_waiter = {
-                let mut cached_support = self.compression_support.lock().await;
-                match &*cached_support {
-                    CompressionSupportState::Unsupported => {
-                        tracing::debug!(
-                            backend = %self.name,
-                            "Skipping COMPRESS DEFLATE; backend previously reported it unsupported"
-                        );
-                        return Ok(false);
-                    }
-                    CompressionSupportState::Supported => {
-                        drop(cached_support);
-                        return self
-                            .probe_compression_with_timeout(stream, buffer)
-                            .await
-                            .map(|support| matches!(support, CompressionSupport::Supported));
-                    }
-                    CompressionSupportState::Probing(notify) => {
-                        Some(notify.clone().notified_owned())
-                    }
-                    CompressionSupportState::Unknown => {
-                        let notify = Arc::new(Notify::new());
-                        *cached_support = CompressionSupportState::Probing(notify);
-                        None
-                    }
-                }
-            };
-
-            if let Some(waiter) = probe_waiter {
-                waiter.await;
-                continue;
+        let mut cached_support = self.compression_support.lock().await;
+        match *cached_support {
+            CompressionSupportState::Unsupported => Ok(false),
+            CompressionSupportState::Supported => {
+                // Every supported session negotiates independently.
+                drop(cached_support);
+                self.probe_compression_with_timeout(stream, buffer)
+                    .await
+                    .map(|support| matches!(support, CompressionSupport::Supported))
             }
-
-            let support = self.probe_compression_with_timeout(stream, buffer).await;
-            let mut cached_support = self.compression_support.lock().await;
-            let notify = match std::mem::take(&mut *cached_support) {
-                CompressionSupportState::Probing(notify) => notify,
-                state => {
-                    *cached_support = state;
-                    return support.map(|support| matches!(support, CompressionSupport::Supported));
-                }
-            };
-
-            match support {
-                Ok(CompressionSupport::Supported) => {
-                    *cached_support = CompressionSupportState::Supported;
-                    notify.notify_waiters();
-                    return Ok(true);
-                }
-                Ok(CompressionSupport::Unsupported) => {
-                    *cached_support = CompressionSupportState::Unsupported;
-                    notify.notify_waiters();
-                    return Ok(false);
-                }
-                Err(err) => {
-                    *cached_support = CompressionSupportState::Unknown;
-                    notify.notify_waiters();
-                    return Err(err);
-                }
+            CompressionSupportState::Unknown => {
+                // Holding the guard serializes discovery without publishing
+                // incomplete state. Cancellation or error leaves Unknown and
+                // releases the next creator to discover the capability.
+                let support = self.probe_compression_with_timeout(stream, buffer).await?;
+                *cached_support = match support {
+                    CompressionSupport::Supported => CompressionSupportState::Supported,
+                    CompressionSupport::Unsupported => CompressionSupportState::Unsupported,
+                };
+                Ok(matches!(support, CompressionSupport::Supported))
             }
         }
     }
@@ -844,7 +802,15 @@ impl managed::Manager for TcpManager {
             Admission::Probe => Some(ProbeGuard(&self.login_backoff)),
         };
 
-        let result = self.create_session().await;
+        let result =
+            tokio::time::timeout(crate::constants::timeout::CONNECTION, self.create_session())
+                .await
+                .unwrap_or_else(|_| {
+                    Err(ConnectionError::SetupTimeout {
+                        backend: self.name.clone(),
+                        timeout: crate::constants::timeout::CONNECTION,
+                    })
+                });
         match &result {
             Ok(_) => self.login_backoff.record_success(),
             Err(error) if error.is_login_refusal() => {
@@ -1252,6 +1218,441 @@ mod tests {
             .expect("split unsupported compression reply should be accepted");
 
         assert!(!enabled);
+    }
+
+    #[tokio::test]
+    async fn cached_supported_compression_probes_sessions_in_parallel() {
+        use crate::protocol::StatusCode;
+        use crate::session::ResponseFixture;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let received = Arc::new(tokio::sync::Semaphore::new(0));
+        let replies = Arc::new(tokio::sync::Semaphore::new(0));
+        let server_received = received.clone();
+        let server_replies = replies.clone();
+        let server = tokio::spawn(async move {
+            let mut sessions = tokio::task::JoinSet::new();
+            for index in 0..3 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let received = server_received.clone();
+                let replies = server_replies.clone();
+                sessions.spawn(async move {
+                    stream
+                        .write_all(&ResponseFixture::status(StatusCode::new(200), "Ready").wire())
+                        .await
+                        .unwrap();
+                    let mut command = [0; 18];
+                    stream.read_exact(&mut command).await.unwrap();
+                    assert_eq!(&command, crate::protocol::COMPRESS_DEFLATE);
+                    if index != 0 {
+                        received.add_permits(1);
+                        replies.acquire().await.unwrap().forget();
+                    }
+                    stream
+                        .write_all(
+                            &ResponseFixture::status(StatusCode::new(206), "Compression active")
+                                .wire(),
+                        )
+                        .await
+                        .unwrap();
+                    std::future::pending::<()>().await;
+                });
+            }
+            std::future::pending::<()>().await;
+        });
+        let manager = TcpManager::new(
+            addr.ip().to_string(),
+            addr.port(),
+            "SupportedParallel".into(),
+            TcpManagerOptions {
+                send_mode_reader: false,
+                ..TcpManagerOptions::default()
+            },
+        )
+        .unwrap();
+        let pool = Pool::builder(manager.clone()).max_size(3).build().unwrap();
+        let first = pool.get().await.unwrap();
+        assert!(first.is_compressed());
+        assert!(matches!(
+            *manager.compression_support.lock().await,
+            CompressionSupportState::Supported
+        ));
+        let second_pool = pool.clone();
+        let second = tokio::spawn(async move { second_pool.get().await });
+        let third_pool = pool.clone();
+        let third = tokio::spawn(async move { third_pool.get().await });
+        tokio::time::timeout(Duration::from_secs(1), received.acquire_many(2))
+            .await
+            .expect("cached support must release the cache lock before each independent probe")
+            .unwrap()
+            .forget();
+        replies.add_permits(2);
+        let second = second.await.unwrap().unwrap();
+        let third = third.await.unwrap().unwrap();
+        assert!(second.is_compressed());
+        assert!(third.is_compressed());
+        drop((first, second, third));
+        assert_eq!(pool.status().available, 3);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn failed_compression_probe_leaves_discovery_unknown_for_next_creator() {
+        use crate::protocol::StatusCode;
+        use crate::session::ResponseFixture;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for index in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                stream
+                    .write_all(&ResponseFixture::status(StatusCode::new(200), "Ready").wire())
+                    .await
+                    .unwrap();
+                let mut command = [0; 18];
+                stream.read_exact(&mut command).await.unwrap();
+                assert_eq!(&command, crate::protocol::COMPRESS_DEFLATE);
+                if index == 1 {
+                    stream
+                        .write_all(
+                            &ResponseFixture::status(StatusCode::new(500), "Unsupported").wire(),
+                        )
+                        .await
+                        .unwrap();
+                    std::future::pending::<()>().await;
+                }
+            }
+        });
+        let manager = TcpManager::new(
+            addr.ip().to_string(),
+            addr.port(),
+            "FailedDiscovery".into(),
+            TcpManagerOptions {
+                send_mode_reader: false,
+                ..TcpManagerOptions::default()
+            },
+        )
+        .unwrap();
+        let pool = Pool::builder(manager.clone()).max_size(1).build().unwrap();
+        assert!(matches!(
+            pool.get().await,
+            Err(managed::PoolError::Backend(ConnectionError::IoError(_)))
+        ));
+        assert!(matches!(
+            *manager.compression_support.lock().await,
+            CompressionSupportState::Unknown
+        ));
+        assert_eq!(pool.status().size, 0);
+        let connection = pool.get().await.unwrap();
+        assert!(!connection.is_compressed());
+        assert!(matches!(
+            *manager.compression_support.lock().await,
+            CompressionSupportState::Unsupported
+        ));
+        drop(connection);
+        assert_eq!(pool.status().available, 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn cancelled_compression_creator_hands_probe_to_waiting_creator() {
+        use crate::protocol::StatusCode;
+        use crate::session::ResponseFixture;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (probing, probe_seen) = tokio::sync::oneshot::channel();
+        let (second_ready, second_seen) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await.unwrap();
+            first
+                .write_all(&ResponseFixture::status(StatusCode::new(200), "Ready").wire())
+                .await
+                .unwrap();
+            let mut command = [0; 18];
+            first.read_exact(&mut command).await.unwrap();
+            assert_eq!(&command, crate::protocol::COMPRESS_DEFLATE);
+            probing.send(()).unwrap();
+            let (mut second, _) = listener.accept().await.unwrap();
+            second
+                .write_all(&ResponseFixture::status(StatusCode::new(200), "Ready").wire())
+                .await
+                .unwrap();
+            second_ready.send(()).unwrap();
+            second.read_exact(&mut command).await.unwrap();
+            assert_eq!(&command, crate::protocol::COMPRESS_DEFLATE);
+            second
+                .write_all(&ResponseFixture::status(StatusCode::new(500), "Unsupported").wire())
+                .await
+                .unwrap();
+            // Keep both sockets alive: cancellation, rather than peer EOF,
+            // must release the first pool reservation and capability probe.
+            std::future::pending::<()>().await;
+        });
+        let manager = TcpManager::new(
+            addr.ip().to_string(),
+            addr.port(),
+            "CancelledProbe".into(),
+            TcpManagerOptions {
+                send_mode_reader: false,
+                ..TcpManagerOptions::default()
+            },
+        )
+        .unwrap();
+        let pool = Pool::builder(manager.clone()).max_size(2).build().unwrap();
+        let first_pool = pool.clone();
+        let first = tokio::spawn(async move { first_pool.get().await });
+        probe_seen.await.unwrap();
+        let mut second = Box::pin(pool.get());
+        tokio::select! {
+            result = &mut second => panic!("second creator completed before the held probe: {result:?}"),
+            result = second_seen => result.unwrap(),
+        }
+        tokio::task::yield_now().await;
+        assert!(futures::poll!(&mut second).is_pending());
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+        let connection = tokio::time::timeout(Duration::from_secs(1), second)
+            .await
+            .expect("cancelling the first probe must release its waiting creator")
+            .unwrap();
+        assert!(matches!(
+            *manager.compression_support.lock().await,
+            CompressionSupportState::Unsupported
+        ));
+        assert_eq!(
+            connection.underlying_tcp_stream().peer_addr().unwrap(),
+            addr
+        );
+        assert_eq!(pool.status().size, 1);
+        drop(connection);
+        assert_eq!(pool.status().available, 1);
+        let reused = pool.get().await.unwrap();
+        assert_eq!(reused.underlying_tcp_stream().peer_addr().unwrap(), addr);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn managed_setup_deadline_hands_compression_probe_to_younger_creator() {
+        use crate::protocol::StatusCode;
+        use crate::session::ResponseFixture;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (probing, probe_seen) = tokio::sync::oneshot::channel();
+        let (second_ready, second_seen) = tokio::sync::oneshot::channel();
+        let (accepted, seen) = tokio::sync::oneshot::channel();
+        let (greeting, greeting_ready) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await.unwrap();
+            accepted.send(()).unwrap();
+            greeting_ready.await.unwrap();
+            first
+                .write_all(&ResponseFixture::status(StatusCode::new(200), "Ready").wire())
+                .await
+                .unwrap();
+            let mut command = [0; 18];
+            first.read_exact(&mut command).await.unwrap();
+            assert_eq!(&command, crate::protocol::COMPRESS_DEFLATE);
+            probing.send(()).unwrap();
+            let (mut second, _) = listener.accept().await.unwrap();
+            second
+                .write_all(&ResponseFixture::status(StatusCode::new(200), "Ready").wire())
+                .await
+                .unwrap();
+            second_ready.send(()).unwrap();
+            second.read_exact(&mut command).await.unwrap();
+            assert_eq!(&command, crate::protocol::COMPRESS_DEFLATE);
+            second
+                .write_all(&ResponseFixture::status(StatusCode::new(500), "Unsupported").wire())
+                .await
+                .unwrap();
+            assert_eq!(first.read(&mut [0]).await.unwrap(), 0);
+            std::future::pending::<()>().await;
+        });
+        let manager = TcpManager::new(
+            addr.ip().to_string(),
+            addr.port(),
+            "SetupProbeHandoff".into(),
+            TcpManagerOptions {
+                send_mode_reader: false,
+                ..TcpManagerOptions::default()
+            },
+        )
+        .unwrap();
+        let pool = Pool::builder(manager.clone()).max_size(2).build().unwrap();
+        let first_pool = pool.clone();
+        let first = tokio::spawn(async move { first_pool.get().await });
+        seen.await.unwrap();
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::time::resume();
+        greeting.send(()).unwrap();
+        probe_seen.await.unwrap();
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(8)).await;
+        tokio::time::resume();
+        let mut second = Box::pin(pool.get());
+        tokio::select! {
+            result = &mut second => panic!("second creator completed before the held probe: {result:?}"),
+            result = second_seen => result.unwrap(),
+        }
+        tokio::task::yield_now().await;
+        assert!(futures::poll!(&mut second).is_pending());
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let first_error = tokio::time::timeout(Duration::from_millis(100), first)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            matches!(first_error, managed::PoolError::Backend(ConnectionError::SetupTimeout { ref backend, timeout })
+            if backend == "SetupProbeHandoff" && timeout == crate::constants::timeout::CONNECTION)
+        );
+        tokio::time::resume();
+        let connection = tokio::time::timeout(Duration::from_secs(1), second)
+            .await
+            .expect("setup cancellation must release compression discovery")
+            .unwrap();
+        assert!(matches!(
+            *manager.compression_support.lock().await,
+            CompressionSupportState::Unsupported
+        ));
+        assert_eq!(
+            manager.login_backoff.admit(std::time::Instant::now()),
+            Admission::Open
+        );
+        assert_eq!(pool.status().size, 1);
+        drop(connection);
+        assert_eq!(pool.status().available, 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn managed_setup_deadline_releases_silent_greeting_reservation() {
+        use crate::protocol::StatusCode;
+        use crate::session::ResponseFixture;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (accepted, seen) = tokio::sync::oneshot::channel();
+        let (closed, closure) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut silent, _) = listener.accept().await.unwrap();
+            accepted.send(()).unwrap();
+            assert_eq!(silent.read(&mut [0]).await.unwrap(), 0);
+            closed.send(()).unwrap();
+            let (mut healthy, _) = listener.accept().await.unwrap();
+            healthy
+                .write_all(&ResponseFixture::status(StatusCode::new(200), "Ready").wire())
+                .await
+                .unwrap();
+            std::future::pending::<()>().await;
+        });
+        let manager = TcpManager::new(
+            addr.ip().to_string(),
+            addr.port(),
+            "SilentGreeting".into(),
+            TcpManagerOptions {
+                compress: Some(false),
+                send_mode_reader: false,
+                ..TcpManagerOptions::default()
+            },
+        )
+        .unwrap();
+        let pool = Pool::builder(manager.clone()).max_size(1).build().unwrap();
+        let pending_pool = pool.clone();
+        let setup = tokio::spawn(async move { pending_pool.get().await });
+        seen.await.unwrap();
+        tokio::time::pause();
+        tokio::time::advance(crate::constants::timeout::CONNECTION).await;
+        let error = tokio::time::timeout(Duration::from_secs(1), setup)
+            .await
+            .expect("the managed setup must expire for a silent greeting")
+            .unwrap()
+            .unwrap_err();
+        let managed::PoolError::Backend(error) = error else {
+            panic!("setup error must retain backend attribution")
+        };
+        assert!(
+            matches!(&error, ConnectionError::SetupTimeout { backend, timeout }
+            if backend == "SilentGreeting" && *timeout == crate::constants::timeout::CONNECTION)
+        );
+        assert!(!error.is_login_refusal());
+        assert_eq!(
+            manager.login_backoff.admit(std::time::Instant::now()),
+            Admission::Open
+        );
+        assert_eq!(pool.status().size, 0);
+        assert_eq!(pool.status().available, 0);
+        tokio::time::resume();
+        closure.await.unwrap();
+        let connection = tokio::time::timeout(Duration::from_secs(1), pool.get())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            connection.underlying_tcp_stream().peer_addr().unwrap(),
+            addr
+        );
+        drop(connection);
+        assert_eq!(pool.status().available, 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn managed_setup_deadline_releases_silent_tls_reservation() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (client_hello, seen) = tokio::sync::oneshot::channel();
+        let (closed, closure) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut input = [0; 4096];
+            assert!(stream.read(&mut input).await.unwrap() > 0);
+            client_hello.send(()).unwrap();
+            while stream.read(&mut input).await.unwrap() > 0 {}
+            closed.send(()).unwrap();
+        });
+        let manager = TcpManager::new(
+            addr.ip().to_string(),
+            addr.port(),
+            "SilentTls".into(),
+            TcpManagerOptions {
+                tls_config: Some(TlsConfig {
+                    use_tls: true,
+                    tls_verify_cert: true,
+                    tls_cert_path: None,
+                }),
+                ..TcpManagerOptions::default()
+            },
+        )
+        .unwrap();
+        let pool = Pool::builder(manager.clone()).max_size(1).build().unwrap();
+        let pending_pool = pool.clone();
+        let setup = tokio::spawn(async move { pending_pool.get().await });
+        seen.await.unwrap();
+        tokio::time::pause();
+        tokio::time::advance(crate::constants::timeout::CONNECTION).await;
+        let error = tokio::time::timeout(Duration::from_secs(1), setup)
+            .await
+            .expect("the managed setup must expire during a silent TLS handshake")
+            .unwrap()
+            .unwrap_err();
+        let managed::PoolError::Backend(error) = error else {
+            panic!("setup error must retain backend attribution")
+        };
+        assert!(
+            matches!(&error, ConnectionError::SetupTimeout { backend, timeout }
+            if backend == "SilentTls" && *timeout == crate::constants::timeout::CONNECTION)
+        );
+        assert!(!error.is_login_refusal());
+        assert_eq!(
+            manager.login_backoff.admit(std::time::Instant::now()),
+            Admission::Open
+        );
+        assert_eq!(pool.status().size, 0);
+        tokio::time::resume();
+        closure.await.unwrap();
+        server.await.unwrap();
     }
 
     #[tokio::test]

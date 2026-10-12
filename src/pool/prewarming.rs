@@ -175,6 +175,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prewarming_deadline_releases_silent_greeting_and_tls_peers() {
+        use crate::tls::TlsConfig;
+        use tokio::io::AsyncReadExt;
+        for tls in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let (connected, seen) = tokio::sync::oneshot::channel();
+            let (closed, closure) = tokio::sync::oneshot::channel();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut input = [0; 4096];
+                if tls {
+                    assert!(stream.read(&mut input).await.unwrap() > 0);
+                }
+                connected.send(()).unwrap();
+                while stream.read(&mut input).await.unwrap() > 0 {}
+                closed.send(()).unwrap();
+            });
+            let builder = DeadpoolConnectionProvider::builder("127.0.0.1", port)
+                .name("SilentPrewarm")
+                .max_connections(1);
+            let provider = if tls {
+                builder
+                    .tls_config(TlsConfig {
+                        use_tls: true,
+                        tls_verify_cert: true,
+                        tls_cert_path: None,
+                    })
+                    .build()
+                    .unwrap()
+            } else {
+                builder.build().unwrap()
+            };
+            let pending_provider = provider.clone();
+            let prewarm = tokio::spawn(async move {
+                prewarm_single_pool(pending_provider, "SilentPrewarm".into(), 1).await
+            });
+            seen.await.unwrap();
+            tokio::time::pause();
+            tokio::time::advance(crate::constants::timeout::CONNECTION).await;
+            assert_eq!(
+                tokio::time::timeout(std::time::Duration::from_secs(1), prewarm)
+                    .await
+                    .expect("prewarming must finish when managed setup expires")
+                    .unwrap()
+                    .unwrap(),
+                0
+            );
+            assert_eq!(provider.status_counts().size, 0);
+            assert_eq!(provider.status_counts().available, 0);
+            tokio::time::resume();
+            closure.await.unwrap();
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn test_prewarm_pools_basic() {
         let (port, _server) = spawn_mock_server_on_random_port().await;
 

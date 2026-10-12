@@ -142,6 +142,15 @@ impl ResponseFixture {
         self.wire().len()
     }
 
+    /// Send an intentionally incomplete status prefix for stalled-peer tests.
+    /// The fixture owns the split so consumers never inspect status bytes.
+    pub async fn write_partial_status<W: tokio::io::AsyncWrite + Unpin>(
+        &self,
+        writer: &mut W,
+    ) -> std::io::Result<()> {
+        writer.write_all(&self.wire()[..2]).await
+    }
+
     pub async fn assert_status_received<R: tokio::io::AsyncRead + Unpin>(
         &self,
         reader: &mut R,
@@ -431,18 +440,8 @@ pub(crate) async fn read_exchange_for_already_sent_request<'pool>(
     pool: &'pool crate::pool::BufferPool,
     backend_id: crate::types::BackendId,
 ) -> anyhow::Result<BackendResponseExchange<'pool>> {
-    let mut buffer = take_queued_input_or_acquire_empty(conn.stream_mut(), pool);
-    if buffer.initialized() == 0 {
-        let n = buffer.read_from(conn.stream_mut()).await?;
-        if n == 0 {
-            anyhow::bail!("Backend connection closed unexpectedly");
-        }
-    }
-
-    let response = ClassifiedResponse::read_unbound(conn.stream_mut(), request, buffer).await?;
-    Ok(BackendResponseExchange::new(
-        conn, response, pool, backend_id,
-    ))
+    let buffer = take_queued_input_or_acquire_empty(conn.stream_mut(), pool);
+    BackendResponseExchange::read(conn, request, buffer, pool, backend_id).await
 }
 
 async fn write_response_chunk_preserving_suffix_on_error<W>(
@@ -1074,8 +1073,8 @@ impl InvalidBackendResponse {
 }
 
 impl<'pool> BackendResponseExchange<'pool> {
-    /// Read one response and bind it to the connection, pool, and backend
-    /// identity that supplied its bytes.
+    /// Bound the complete initial status, including an empty or partial input,
+    /// then bind it to its connection. Body streaming has its own lifetime.
     pub(crate) async fn read(
         mut conn: crate::pool::ConnectionGuard,
         request: &crate::protocol::RequestContext,
@@ -1083,7 +1082,12 @@ impl<'pool> BackendResponseExchange<'pool> {
         pool: &'pool crate::pool::BufferPool,
         backend_id: crate::types::BackendId,
     ) -> anyhow::Result<Self> {
-        let response = ClassifiedResponse::read_unbound(conn.stream_mut(), request, buffer).await?;
+        let response = tokio::time::timeout(
+            crate::constants::timeout::BACKEND_READ,
+            ClassifiedResponse::read_unbound(conn.stream_mut(), request, buffer),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("Backend did not respond within the read timeout"))??;
         Ok(Self::new(conn, response, pool, backend_id))
     }
 
@@ -2955,6 +2959,379 @@ mod tests {
             fixture.wire(),
             b"222 0 <fixture@reader>\r\n..first\r\n..second\r\n.\r\n"
         );
+    }
+
+    #[tokio::test]
+    async fn exchange_deadline_preserves_complete_queued_and_packed_status_on_silent_peer() {
+        let (provider, reply, server) = deadline_test_backend().await;
+        let guard = provider
+            .checkout_connection_guard()
+            .await
+            .unwrap()
+            .activate();
+        let buffers = make_pool();
+        let request = crate::protocol::RequestContext::parse(b"STAT <deadline@test>\r\n").unwrap();
+        let backend = crate::types::BackendId::from_index(0);
+        let mut queued = buffers.acquire();
+        queued.copy_from_slice(b"223 0 <first@test>\r\n430 Missing next\r\n");
+        let first = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            BackendResponseExchange::read(guard, &request, queued, &buffers, backend),
+        )
+        .await
+        .expect("complete queued status must not read a silent socket")
+        .unwrap();
+        assert_eq!(
+            first.single_line_bytes(),
+            Some(b"223 0 <first@test>\r\n".as_slice())
+        );
+        let guard = first.observe_and_reuse().await.unwrap();
+        let second = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            read_exchange_for_already_sent_request(guard, &request, &buffers, backend),
+        )
+        .await
+        .expect("packed status must be read from the queue")
+        .unwrap();
+        assert_eq!(
+            second.single_line_bytes(),
+            Some(b"430 Missing next\r\n".as_slice())
+        );
+        let guard = second.observe_and_reuse().await.unwrap();
+        drop(guard.complete_success());
+        assert_eq!(provider.status_counts().available, 1);
+        drop(reply);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn exchange_deadline_appends_queued_status_just_before_expiry() {
+        let (provider, reply, server) = deadline_test_backend().await;
+        let mut guard = provider
+            .checkout_connection_guard()
+            .await
+            .unwrap()
+            .activate();
+        let buffers = make_pool();
+        let request = crate::protocol::RequestContext::parse(b"STAT <deadline@test>\r\n").unwrap();
+        request.write_wire_to(guard.stream_mut()).await.unwrap();
+        let mut queued = buffers.acquire();
+        queued.copy_from_slice(b"22");
+        guard
+            .stream_mut()
+            .queue_pooled_pending_bytes_first(queued, 0..2)
+            .unwrap();
+        let mut receive = Box::pin(read_exchange_for_already_sent_request(
+            guard,
+            &request,
+            &buffers,
+            crate::types::BackendId::from_index(0),
+        ));
+        assert!(futures::poll!(&mut receive).is_pending());
+        tokio::time::pause();
+        tokio::time::advance(std::time::Duration::from_secs(29)).await;
+        assert!(futures::poll!(&mut receive).is_pending());
+        tokio::time::resume();
+        reply.send(b"3 0 <deadline@test>\r\n".to_vec()).unwrap();
+        let exchange = tokio::time::timeout(std::time::Duration::from_millis(500), receive)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            exchange.single_line_bytes(),
+            Some(b"223 0 <deadline@test>\r\n".as_slice())
+        );
+        drop(
+            exchange
+                .observe_and_reuse()
+                .await
+                .unwrap()
+                .complete_success(),
+        );
+        assert_eq!(provider.status_counts().available, 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn exchange_deadline_classifies_malformed_queued_status_without_reading() {
+        let (provider, reply, server) = deadline_test_backend().await;
+        let guard = provider
+            .checkout_connection_guard()
+            .await
+            .unwrap()
+            .activate();
+        let buffers = make_pool();
+        let request = crate::protocol::RequestContext::parse(b"STAT <deadline@test>\r\n").unwrap();
+        let mut queued = buffers.acquire();
+        queued.copy_from_slice(b"malformed status\r\n");
+        let mut exchange = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            BackendResponseExchange::read(
+                guard,
+                &request,
+                queued,
+                &buffers,
+                crate::types::BackendId::from_index(0),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(exchange.status_code(), None);
+        assert!(exchange.receiving().unwrap().observe().await.is_err());
+        exchange.fail_backend();
+        assert_eq!(provider.status_counts().size, 0);
+        drop(reply);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn exchange_status_deadline_does_not_bound_multiline_body_streaming() {
+        let (provider, reply, server) = deadline_test_backend().await;
+        let mut guard = provider
+            .checkout_connection_guard()
+            .await
+            .unwrap()
+            .activate();
+        let buffers = make_pool();
+        let request = crate::protocol::RequestContext::parse(b"BODY <deadline@test>\r\n").unwrap();
+        request.write_wire_to(guard.stream_mut()).await.unwrap();
+        let mut status = buffers.acquire();
+        status.copy_from_slice(b"222 0 <deadline@test>\r\n");
+        let mut exchange = BackendResponseExchange::read(
+            guard,
+            &request,
+            status,
+            &buffers,
+            crate::types::BackendId::from_index(0),
+        )
+        .await
+        .unwrap();
+        assert_eq!(exchange.status_code().unwrap().as_u16(), 222);
+        let mut output = Vec::new();
+        {
+            let mut forwarding = Box::pin(exchange.receiving().unwrap().write(&mut output));
+            assert!(futures::poll!(&mut forwarding).is_pending());
+            tokio::time::pause();
+            tokio::time::advance(
+                crate::constants::timeout::BACKEND_READ + std::time::Duration::from_secs(1),
+            )
+            .await;
+            assert!(
+                futures::poll!(&mut forwarding).is_pending(),
+                "body forwarding must outlive the initial status deadline"
+            );
+            tokio::time::resume();
+            reply.send(b"slow body\r\n.\r\n".to_vec()).unwrap();
+            tokio::time::timeout(std::time::Duration::from_millis(500), forwarding)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        assert_eq!(output, b"222 0 <deadline@test>\r\nslow body\r\n.\r\n");
+        drop(exchange.into_connection().complete_success());
+        assert_eq!(provider.status_counts().available, 1);
+        server.abort();
+    }
+
+    async fn deadline_test_backend() -> (
+        crate::pool::DeadpoolConnectionProvider,
+        tokio::sync::oneshot::Sender<Vec<u8>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (reply, reply_ready) = tokio::sync::oneshot::channel::<Vec<u8>>();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            reader.get_mut().write_all(b"200 Ready\r\n").await.unwrap();
+            let mut line = String::new();
+            loop {
+                line.clear();
+                if reader.read_line(&mut line).await.unwrap() == 0 {
+                    return;
+                }
+                let request = crate::protocol::RequestContext::parse(line.as_bytes()).unwrap();
+                if request.is_stat() || request.kind() == crate::protocol::RequestKind::Body {
+                    if let Ok(bytes) = reply_ready.await {
+                        reader.get_mut().write_all(&bytes).await.unwrap();
+                    }
+                    std::future::pending::<()>().await;
+                    break;
+                }
+                reader.get_mut().write_all(b"200 Ready\r\n").await.unwrap();
+            }
+        });
+        let provider = crate::pool::DeadpoolConnectionProvider::builder("127.0.0.1", port)
+            .max_connections(1)
+            .build()
+            .unwrap();
+        (provider, reply, server)
+    }
+
+    #[tokio::test]
+    async fn ordinary_exchange_deadline_bounds_partial_status() {
+        assert_exchange_status_deadline(DeadlineEntry::Ordinary).await;
+    }
+
+    #[tokio::test]
+    async fn timed_exchange_deadline_bounds_partial_status() {
+        assert_exchange_status_deadline(DeadlineEntry::Timed).await;
+    }
+
+    #[tokio::test]
+    async fn stat_exchange_deadline_bounds_partial_status() {
+        assert_exchange_status_deadline(DeadlineEntry::Stat).await;
+    }
+
+    #[tokio::test]
+    async fn pipeline_exchange_deadline_bounds_empty_status() {
+        assert_exchange_status_deadline(DeadlineEntry::Pipeline).await;
+    }
+
+    #[tokio::test]
+    async fn pipeline_exchange_deadline_bounds_partial_queued_status() {
+        assert_exchange_status_deadline(DeadlineEntry::QueuedPartial).await;
+    }
+
+    #[derive(Clone, Copy)]
+    enum DeadlineEntry {
+        Ordinary,
+        Timed,
+        Stat,
+        Pipeline,
+        QueuedPartial,
+    }
+
+    async fn assert_exchange_status_deadline(entry: DeadlineEntry) {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (status_sent, status_seen) = tokio::sync::oneshot::channel();
+        let (closed, closure) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            reader.get_mut().write_all(b"200 Ready\r\n").await.unwrap();
+            let mut line = String::new();
+            loop {
+                line.clear();
+                reader.read_line(&mut line).await.unwrap();
+                if crate::protocol::RequestContext::parse(line.as_bytes())
+                    .unwrap()
+                    .is_stat()
+                {
+                    if matches!(
+                        entry,
+                        DeadlineEntry::Ordinary | DeadlineEntry::Timed | DeadlineEntry::Stat
+                    ) {
+                        reader.get_mut().write_all(b"22").await.unwrap();
+                    }
+                    status_sent.send(()).unwrap();
+                    assert_eq!(reader.read(&mut [0]).await.unwrap(), 0);
+                    closed.send(()).unwrap();
+                    break;
+                }
+                reader.get_mut().write_all(b"200 Ready\r\n").await.unwrap();
+            }
+        });
+        let provider = crate::pool::DeadpoolConnectionProvider::builder("127.0.0.1", port)
+            .max_connections(1)
+            .build()
+            .unwrap();
+        let mut guard = provider
+            .checkout_connection_guard()
+            .await
+            .unwrap()
+            .activate();
+        let request = crate::protocol::RequestContext::parse(b"STAT <deadline@test>\r\n").unwrap();
+        let metrics = std::sync::Arc::new(crate::metrics::MetricsCollector::new(1));
+        let probe_metrics = metrics.clone();
+        let backend = crate::types::BackendId::from_index(0);
+        let buffers = make_pool();
+        if matches!(
+            entry,
+            DeadlineEntry::Pipeline | DeadlineEntry::QueuedPartial
+        ) {
+            request.write_wire_to(guard.stream_mut()).await.unwrap();
+            if matches!(entry, DeadlineEntry::QueuedPartial) {
+                let mut queued = buffers.acquire();
+                queued.copy_from_slice(b"22");
+                guard
+                    .stream_mut()
+                    .queue_pooled_pending_bytes_first(queued, 0..2)
+                    .unwrap();
+            }
+        }
+        let receive = tokio::spawn(async move {
+            use crate::session::backend;
+            let result = match entry {
+                DeadlineEntry::Ordinary => {
+                    backend::execute_request_exchange(
+                        guard,
+                        &request,
+                        buffers.acquire(),
+                        &buffers,
+                        backend,
+                    )
+                    .await
+                }
+                DeadlineEntry::Timed => backend::execute_request_exchange_timed(
+                    guard,
+                    &request,
+                    buffers.acquire(),
+                    &buffers,
+                    backend,
+                )
+                .await
+                .map(|(exchange, _, _, _)| exchange),
+                DeadlineEntry::Stat => backend::execute_stat_probe_exchange(
+                    guard,
+                    &request,
+                    buffers.acquire(),
+                    &buffers,
+                    backend::ProbeMetrics::new(&probe_metrics, backend),
+                    backend::ProbeTiming::Sampled,
+                )
+                .await
+                .map(|(exchange, _)| exchange),
+                DeadlineEntry::Pipeline | DeadlineEntry::QueuedPartial => {
+                    read_exchange_for_already_sent_request(guard, &request, &buffers, backend).await
+                }
+            };
+            match result {
+                Ok(exchange) => {
+                    exchange.fail_backend();
+                    panic!("incomplete status was accepted")
+                }
+                Err(error) => error,
+            }
+        });
+        status_seen.await.unwrap();
+        tokio::time::pause();
+        tokio::time::advance(crate::constants::timeout::BACKEND_READ).await;
+        let error = tokio::time::timeout(std::time::Duration::from_secs(1), receive)
+            .await
+            .expect("the status deadline must include all classification reads")
+            .unwrap();
+        assert!(error.to_string().contains("read timeout"));
+        assert_eq!(provider.status_counts().size, 0);
+        assert_eq!(provider.status_counts().available, 0);
+        if matches!(entry, DeadlineEntry::Stat) {
+            let snapshot = metrics.snapshot(None);
+            assert_eq!(snapshot.backend_stats[0].total_commands.get(), 1);
+            assert_eq!(
+                snapshot.backend_stats[0].bytes_sent.as_u64(),
+                b"STAT <deadline@test>\r\n".len() as u64
+            );
+            assert_eq!(snapshot.backend_stats[0].bytes_received.as_u64(), 0);
+            assert!(snapshot.user_stats.is_empty());
+        }
+        tokio::time::resume();
+        closure.await.unwrap();
+        server.await.unwrap();
     }
 
     #[tokio::test]

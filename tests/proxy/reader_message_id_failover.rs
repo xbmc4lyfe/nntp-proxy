@@ -54,6 +54,7 @@ struct ReaderBackend {
     lookup: Arc<Mutex<ResponseFixture>>,
     probe: Arc<Mutex<Option<ResponseFixture>>>,
     probe_gate: Arc<Mutex<Option<Arc<tokio::sync::Semaphore>>>>,
+    partial_probe: Arc<Mutex<Option<Arc<tokio::sync::Semaphore>>>>,
     task: tokio::task::AbortHandle,
 }
 impl Drop for ReaderBackend {
@@ -72,6 +73,8 @@ async fn reader_backend(host: &str, tier: u8, lookup: ResponseFixture) -> Result
     let probe_responses = probe.clone();
     let probe_gate = Arc::new(Mutex::new(None::<Arc<tokio::sync::Semaphore>>));
     let gates = probe_gate.clone();
+    let partial_probe = Arc::new(Mutex::new(None::<Arc<tokio::sync::Semaphore>>));
+    let partial_probes = partial_probe.clone();
     let task = tokio::spawn(async move {
         let mut clients = tokio::task::JoinSet::new();
         while let Ok((stream, _)) = listener.accept().await {
@@ -79,6 +82,7 @@ async fn reader_backend(host: &str, tier: u8, lookup: ResponseFixture) -> Result
             let responses = responses.clone();
             let probe_responses = probe_responses.clone();
             let gates = gates.clone();
+            let partial_probes = partial_probes.clone();
             clients.spawn(async move {
                 let mut stream = BufReader::new(stream);
                 stream
@@ -95,6 +99,16 @@ async fn reader_backend(host: &str, tier: u8, lookup: ResponseFixture) -> Result
                     let command = line.trim_end();
                     observed.lock().unwrap().push(command.into());
                     if command == "STAT <PAR2@Example.COM>" {
+                        let partial = partial_probes.lock().unwrap().clone();
+                        if let Some(sent) = partial {
+                            metadata(RequestKind::Stat)
+                                .write_partial_status(stream.get_mut())
+                                .await
+                                .unwrap();
+                            sent.add_permits(1);
+                            assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
+                            break;
+                        }
                         let gate = gates.lock().unwrap().clone();
                         if let Some(gate) = gate {
                             gate.acquire().await.unwrap().forget();
@@ -146,6 +160,7 @@ async fn reader_backend(host: &str, tier: u8, lookup: ResponseFixture) -> Result
         lookup,
         probe,
         probe_gate,
+        partial_probe,
         task,
     })
 }
@@ -203,6 +218,121 @@ async fn reader_proxy_with_cache_ttl(
     let proxy = NntpProxy::new(config, RoutingMode::Hybrid).await?;
     let port = spawn_test_proxy_on_random_port(proxy.clone(), true).await?;
     Ok((proxy, connect_and_read_greeting(port).await?))
+}
+
+#[tokio::test]
+async fn reader_selected_partial_stat_times_out_to_same_tier_without_missing_fact() -> Result<()> {
+    let primary = reader_backend("127.0.0.1", 0, status(430, "Missing primary")).await?;
+    let mut stalled = reader_backend("127.0.0.2", 0, metadata(RequestKind::Body)).await?;
+    stalled.config.stateful_sessions = nntp_proxy::config::StatefulSessions::Excluded;
+    stalled.config.stat_missing = 1;
+    let partial_sent = Arc::new(tokio::sync::Semaphore::new(0));
+    *stalled.partial_probe.lock().unwrap() = Some(partial_sent.clone());
+    let mut healthy = reader_backend("127.0.0.3", 0, metadata(RequestKind::Body)).await?;
+    healthy.config.stateful_sessions = nntp_proxy::config::StatefulSessions::Excluded;
+    let mut lower = reader_backend("127.0.0.4", 1, metadata(RequestKind::Body)).await?;
+    lower.config.stateful_sessions = nntp_proxy::config::StatefulSessions::Excluded;
+    // GROUP consumes the first round-robin selection; its retry selects the
+    // second of the two eligible same-tier alternates.
+    let (proxy, mut client) = reader_proxy(&[&primary, &healthy, &stalled, &lower], true).await?;
+    let before = proxy.metrics().snapshot(None);
+    exchange(&mut client, "GROUP alt.test", &group()).await?;
+    send(&mut client, &format!("BODY {ID}")).await?;
+    // Preserve the existing retry-once policy: each actual probe gets one
+    // status deadline and one command/traffic charge before same-tier fallback.
+    for _ in 0..2 {
+        tokio::time::timeout(std::time::Duration::from_secs(3), partial_sent.acquire())
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "partial STAT never sent: {error}; primary={:?}; stalled={:?}; healthy={:?}",
+                    primary.commands.lock().unwrap(),
+                    stalled.commands.lock().unwrap(),
+                    healthy.commands.lock().unwrap()
+                )
+            })?
+            .forget();
+        tokio::time::pause();
+        tokio::time::advance(nntp_proxy::constants::timeout::BACKEND_READ).await;
+        tokio::time::resume();
+    }
+    tokio::time::timeout(std::time::Duration::from_secs(3), metadata(RequestKind::Body).assert_received(&mut client))
+        .await.unwrap_or_else(|error| panic!("selected partial STAT failed recovery: {error}; stalled={:?}; healthy={:?}; pools={:?}", stalled.commands.lock().unwrap(), healthy.commands.lock().unwrap(), proxy.router().backend_provider(nntp_proxy::types::BackendId::from_index(2)).unwrap().status_counts()))?;
+    assert_eq!(
+        proxy
+            .cache()
+            .get_request_message_id(ID)
+            .await
+            .unwrap()
+            .availability()
+            .missing_bits(),
+        0b0001
+    );
+    let stalled_commands: Vec<_> = stalled
+        .commands
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|command| command.ends_with(ID))
+        .cloned()
+        .collect();
+    assert_eq!(
+        stalled_commands,
+        [format!("STAT {ID}"), format!("STAT {ID}")]
+    );
+    assert!(
+        healthy
+            .commands
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|command| command == &format!("BODY {ID}"))
+    );
+    assert!(
+        !lower
+            .commands
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|command| command.ends_with(ID))
+    );
+    let backend = nntp_proxy::types::BackendId::from_index(2);
+    assert_eq!(
+        proxy
+            .router()
+            .backend_provider(backend)
+            .unwrap()
+            .status_counts()
+            .size,
+        0
+    );
+    exchange(&mut client, "QUIT", &status(205, "Goodbye")).await?;
+    assert_eq!(client.read(&mut [0]).await?, 0);
+    let after = proxy.metrics().snapshot(None);
+    assert_eq!(
+        after.backend_stats[2].total_commands.get() - before.backend_stats[2].total_commands.get(),
+        2
+    );
+    assert_eq!(
+        after.backend_stats[2].bytes_sent.as_u64() - before.backend_stats[2].bytes_sent.as_u64(),
+        2 * format!("STAT {ID}\r\n").len() as u64
+    );
+    assert_eq!(
+        after.backend_stats[2].bytes_received.as_u64()
+            - before.backend_stats[2].bytes_received.as_u64(),
+        0
+    );
+    assert_eq!(
+        after.user_stats[0].bytes_sent.as_u64() - before.user_stats[0].bytes_sent.as_u64(),
+        format!("GROUP alt.test\r\nBODY {ID}\r\nQUIT\r\n").len() as u64
+    );
+    assert_eq!(
+        after.user_stats[0].bytes_received.as_u64() - before.user_stats[0].bytes_received.as_u64(),
+        (group().wire_len()
+            + metadata(RequestKind::Body).wire_len()
+            + status(205, "Goodbye").wire_len()) as u64
+    );
+    Ok(())
 }
 
 #[tokio::test]
