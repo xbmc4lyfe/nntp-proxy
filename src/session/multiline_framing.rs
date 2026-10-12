@@ -197,6 +197,284 @@ impl ResponseFixture {
     }
 }
 
+/// Application pacing for benchmark fixtures; this does not shape the network.
+#[cfg(feature = "framing-bench")]
+#[doc(hidden)]
+#[derive(Clone, Copy)]
+pub enum BenchmarkFixturePacing {
+    Unpaced,
+    Application(std::time::Duration),
+}
+
+/// Encoded fixture bytes are opaque so callers cannot split response packets.
+#[cfg(feature = "framing-bench")]
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct PreparedResponseFixture {
+    wire: std::sync::Arc<[u8]>,
+    body_len: usize,
+}
+
+/// A fixture receiver owns its capture storage before measurement starts.
+#[cfg(feature = "framing-bench")]
+#[doc(hidden)]
+pub struct PreparedFixtureReceiver {
+    expected: std::sync::Arc<[u8]>,
+    actual: Vec<u8>,
+    pacing: BenchmarkFixturePacing,
+}
+
+/// Socket timestamps precede content validation and exclude caller setup.
+#[cfg(feature = "framing-bench")]
+#[doc(hidden)]
+#[derive(Clone, Copy)]
+pub struct FixtureReadTimings {
+    pub first_byte: std::time::Instant,
+    pub completed: std::time::Instant,
+}
+
+/// Complete fixture data can be validated after its measured completion.
+#[cfg(feature = "framing-bench")]
+#[doc(hidden)]
+pub struct ReceivedFixtureResponse {
+    expected: std::sync::Arc<[u8]>,
+    actual: Vec<u8>,
+    timings: FixtureReadTimings,
+}
+
+#[cfg(feature = "framing-bench")]
+impl ResponseFixture {
+    /// Render once, outside the benchmark clock.
+    #[must_use]
+    pub fn prepare_benchmark(&self) -> PreparedResponseFixture {
+        PreparedResponseFixture {
+            wire: self.wire().into(),
+            body_len: self.body.len(),
+        }
+    }
+
+    /// Fill semantic body bytes while respecting the framer's capture budget.
+    pub fn benchmark_body_with_wire_budget(mut self, budget: usize) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            budget <= MAX_CAPTURED_MULTILINE_RESPONSE_BYTES,
+            "fixture exceeds capture budget"
+        );
+        self.body = vec![b'x'];
+        let overhead = self.wire_len() - 1;
+        anyhow::ensure!(budget > overhead, "fixture budget cannot hold a body");
+        self.body = vec![b'x'; budget - overhead];
+        anyhow::ensure!(self.wire_len() == budget, "fixture wire budget differs");
+        Ok(self)
+    }
+}
+
+#[cfg(feature = "framing-bench")]
+impl PreparedResponseFixture {
+    #[must_use]
+    pub fn wire_len(&self) -> usize {
+        self.wire.len()
+    }
+
+    #[must_use]
+    pub const fn body_len(&self) -> usize {
+        self.body_len
+    }
+
+    /// Preserve the original first-byte-plus-16-KiB drain cadence.
+    #[must_use]
+    pub fn prepare_receive(&self, pacing: BenchmarkFixturePacing) -> PreparedFixtureReceiver {
+        PreparedFixtureReceiver {
+            expected: self.wire.clone(),
+            actual: vec![0; self.wire.len()],
+            pacing,
+        }
+    }
+
+    /// Only this framer-owned operation chooses outgoing response fragments.
+    pub async fn write_to<W: tokio::io::AsyncWrite + Unpin>(
+        &self,
+        writer: &mut W,
+        pacing: BenchmarkFixturePacing,
+    ) -> anyhow::Result<()> {
+        match pacing {
+            BenchmarkFixturePacing::Unpaced => writer.write_all(&self.wire).await?,
+            BenchmarkFixturePacing::Application(pause) => {
+                for (index, chunk) in self.wire.chunks(16 * 1024).enumerate() {
+                    if index != 0 {
+                        tokio::time::sleep(pause).await;
+                    }
+                    writer.write_all(chunk).await?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "framing-bench")]
+impl PreparedFixtureReceiver {
+    /// Record socket completion before any response-content comparison.
+    pub async fn receive<R: tokio::io::AsyncRead + Unpin>(
+        mut self,
+        reader: &mut R,
+    ) -> anyhow::Result<ReceivedFixtureResponse> {
+        use tokio::io::AsyncReadExt;
+        reader.read_exact(&mut self.actual[..1]).await?;
+        let first_byte = std::time::Instant::now();
+        let mut consumed = 1;
+        while consumed < self.actual.len() {
+            let end = match self.pacing {
+                BenchmarkFixturePacing::Unpaced => self.actual.len(),
+                BenchmarkFixturePacing::Application(_) => {
+                    (consumed + 16 * 1024).min(self.actual.len())
+                }
+            };
+            reader.read_exact(&mut self.actual[consumed..end]).await?;
+            consumed = end;
+            if let BenchmarkFixturePacing::Application(pause) = self.pacing
+                && consumed < self.actual.len()
+            {
+                tokio::time::sleep(pause).await;
+            }
+        }
+        let completed = std::time::Instant::now();
+        Ok(ReceivedFixtureResponse {
+            expected: self.expected,
+            actual: self.actual,
+            timings: FixtureReadTimings {
+                first_byte,
+                completed,
+            },
+        })
+    }
+}
+
+#[cfg(feature = "framing-bench")]
+impl ReceivedFixtureResponse {
+    #[must_use]
+    pub const fn timings(&self) -> FixtureReadTimings {
+        self.timings
+    }
+
+    /// Compare complete encoded content after the caller records the timings.
+    pub fn validate(self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.actual.as_slice() == self.expected.as_ref(),
+            "fixture response content differs"
+        );
+        Ok(())
+    }
+}
+
+#[cfg(all(test, feature = "framing-bench"))]
+mod benchmark_fixture_tests {
+    use super::{BenchmarkFixturePacing, ResponseFixture};
+    use crate::protocol::{RequestKind, StatusCode};
+    use std::time::{Duration, Instant};
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::{TcpListener, TcpStream};
+
+    #[tokio::test]
+    async fn prepared_fixture_validates_exact_content_after_recorded_completion()
+    -> anyhow::Result<()> {
+        let fixture = ResponseFixture::status(StatusCode::new(200), "fixture").prepare_benchmark();
+        assert_eq!(fixture.wire_len(), 13);
+        let receiver = fixture.prepare_receive(BenchmarkFixturePacing::Unpaced);
+        let (mut writer, mut reader) = tokio::io::duplex(64);
+        fixture
+            .write_to(&mut writer, BenchmarkFixturePacing::Unpaced)
+            .await?;
+        let received = receiver.receive(&mut reader).await?;
+        let timings = received.timings();
+        assert!(timings.first_byte <= timings.completed);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        received.validate()?;
+        assert!(timings.completed.elapsed() >= Duration::from_millis(20));
+        let receiver = fixture.prepare_receive(BenchmarkFixturePacing::Unpaced);
+        writer
+            .write_all(&ResponseFixture::status(StatusCode::new(500), "fixture").wire())
+            .await?;
+        assert!(receiver.receive(&mut reader).await?.validate().is_err());
+        Ok(())
+    }
+
+    async fn socket_exchange(
+        write_pacing: BenchmarkFixturePacing,
+        read_pacing: BenchmarkFixturePacing,
+    ) -> anyhow::Result<Duration> {
+        let prepared = ResponseFixture::reader(RequestKind::Article, 0, "<paced@fixture>")
+            .body(vec![b'x'; 64 * 1024])
+            .prepare_benchmark();
+        let receiver = prepared.prepare_receive(read_pacing);
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let (mut client, (mut server, _)) = tokio::try_join!(
+            TcpStream::connect(listener.local_addr()?),
+            listener.accept()
+        )?;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (start_tx, start_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let _ = ready_tx.send(());
+            start_rx.await?;
+            prepared.write_to(&mut server, write_pacing).await
+        });
+        ready_rx.await?;
+        let started = Instant::now();
+        let _ = start_tx.send(());
+        let received = receiver.receive(&mut client).await?;
+        let elapsed = received.timings().completed.duration_since(started);
+        received.validate()?;
+        server.await??;
+        Ok(elapsed)
+    }
+
+    #[tokio::test]
+    async fn outgoing_fixture_pacing_excludes_slow_connection_setup() -> anyhow::Result<()> {
+        let elapsed = socket_exchange(
+            BenchmarkFixturePacing::Application(Duration::from_millis(5)),
+            BenchmarkFixturePacing::Unpaced,
+        )
+        .await?;
+        assert!(
+            elapsed >= Duration::from_millis(20),
+            "upstream fixture pacing was omitted after the start gate"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn incoming_fixture_pacing_excludes_slow_connection_setup() -> anyhow::Result<()> {
+        let elapsed = socket_exchange(
+            BenchmarkFixturePacing::Unpaced,
+            BenchmarkFixturePacing::Application(Duration::from_millis(5)),
+        )
+        .await?;
+        assert!(
+            elapsed >= Duration::from_millis(20),
+            "downstream fixture pacing was omitted after the start gate"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn wire_budget_includes_encoding_and_rejects_oversized_capture() -> anyhow::Result<()> {
+        let fixture = ResponseFixture::reader(RequestKind::Article, 0, "<budget@fixture>");
+        let fitted = fixture
+            .clone()
+            .benchmark_body_with_wire_budget(4 * 1024 * 1024)?
+            .prepare_benchmark();
+        assert_eq!(fitted.wire_len(), 4 * 1024 * 1024);
+        assert!(fitted.body_len() < fitted.wire_len());
+        assert!(
+            fixture
+                .benchmark_body_with_wire_budget(4 * 1024 * 1024 + 1)
+                .is_err()
+        );
+        Ok(())
+    }
+}
+
 static TERMINATOR_FINDER: LazyLock<memchr::memmem::Finder<'static>> =
     LazyLock::new(|| memchr::memmem::Finder::new(TERMINATOR));
 

@@ -215,6 +215,7 @@ harness = false
 [[bench]]
 name = "controlled_reader_cache"
 harness = false
+required-features = ["framing-bench"]
 
 [[bench]]
 name = "client_stat"

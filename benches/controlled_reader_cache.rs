@@ -6,22 +6,23 @@
 //! this work. First byte includes the status line. Backend completion means
 //! socket-writer acceptance, not client delivery. Content validation and cache
 //! inspection happen after the measured client-completion timestamp.
+//!
+//! Run with `cargo bench --features framing-bench --bench controlled_reader_cache`.
 
 use anyhow::{Context, Result, ensure};
 use clap::Parser;
 use nntp_proxy::config::{Cache, Config, Server};
 use nntp_proxy::protocol::{RequestContext, RequestKind, StatusCode};
-use nntp_proxy::session::ResponseFixture;
+use nntp_proxy::session::{BenchmarkFixturePacing, PreparedResponseFixture, ResponseFixture};
 use nntp_proxy::types::{CacheCapacity, MaxConnections, Port};
 use nntp_proxy::{NntpProxy, RoutingMode};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::{JoinHandle, JoinSet};
 
-const CHUNK_BYTES: usize = 16 * 1024;
 const CACHE_BYTES: u64 = 16 * 1024 * 1024;
 const WIRE_BUDGET_4M: usize = 4 * 1024 * 1024;
 
@@ -77,26 +78,39 @@ async fn wait_reply_delay(delay: Duration) {
     }
 }
 
-async fn check_reply_delay() -> Result<()> {
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
-    let address = listener.local_addr()?;
-    let fixture = ResponseFixture::status(StatusCode::new(200), "Delayed fixture");
-    let wire = fixture.wire();
+async fn reply_delay_elapsed(delay: Duration) -> Result<Duration> {
+    let fixture = status(200, "Delayed fixture").prepare_benchmark();
+    let receiver = fixture.prepare_receive(BenchmarkFixturePacing::Unpaced);
+    let (mut client, mut stream) = connected_sockets().await?;
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let (start_tx, start_rx) = tokio::sync::oneshot::channel();
     let server = tokio::spawn(async move {
-        let (mut stream, _) = listener.accept().await?;
-        wait_reply_delay(Duration::from_millis(5)).await;
-        stream.write_all(&wire).await
+        let _ = ready_tx.send(());
+        start_rx.await?;
+        wait_reply_delay(delay).await;
+        fixture
+            .write_to(&mut stream, BenchmarkFixturePacing::Unpaced)
+            .await
     });
+    ready_rx.await?;
     let start = Instant::now();
-    let mut client = TcpStream::connect(address).await?;
-    fixture.assert_received(&mut client).await?;
-    ensure!(
-        start.elapsed() >= Duration::from_millis(5),
-        "modeled reply delay was omitted from the actual socket exchange"
-    );
+    let _ = start_tx.send(());
+    let received = receiver.receive(&mut client).await?;
+    let timings = received.timings();
+    received.validate()?;
     server.await??;
-    println!("PASS actual socket reply observes modeled service delay");
-    Ok(())
+    Ok(timings.first_byte.duration_since(start))
+}
+
+async fn connected_sockets() -> Result<(TcpStream, TcpStream)> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let (client, (server, _)) = tokio::try_join!(
+        TcpStream::connect(listener.local_addr()?),
+        listener.accept()
+    )?;
+    // Deliberately slow setup must never satisfy a modeled-delay self-check.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    Ok((client, server))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -133,6 +147,21 @@ enum PayloadCache {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
+enum StatMode {
+    Disabled,
+    Enabled,
+}
+
+impl StatMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Disabled => "0",
+            Self::Enabled => "1",
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Pacing {
     None,
     Upstream,
@@ -162,7 +191,7 @@ enum Scenario {
     Reader {
         delay_ms: u64,
         outcome: Outcome,
-        stat: u8,
+        stat: StatMode,
     },
     Payload {
         size: usize,
@@ -185,9 +214,13 @@ fn cases() -> Vec<Case> {
             Outcome::Unsupported503,
             Outcome::Unknown500,
         ] {
-            for stat in [0, 1] {
+            for stat in [StatMode::Disabled, StatMode::Enabled] {
                 cases.push(Case {
-                    name: format!("reader-{delay_ms}ms-{}-stat{stat}", outcome.label()),
+                    name: format!(
+                        "reader-{delay_ms}ms-{}-stat{}",
+                        outcome.label(),
+                        stat.label()
+                    ),
                     scenario: Scenario::Reader {
                         delay_ms,
                         outcome,
@@ -236,30 +269,6 @@ fn request_id(index: usize) -> String {
     format!("<controlled-{index:06}@bench.local>")
 }
 
-fn payload_body_len(id: &str, size: usize) -> usize {
-    if size == WIRE_BUDGET_4M {
-        // Reserve renderer overhead numerically; never locate wire boundaries.
-        let overhead = article(id, 1).wire_len() - 1;
-        size - overhead
-    } else {
-        size
-    }
-}
-
-async fn wait_pacing(delay: Duration) {
-    tokio::time::sleep(delay).await;
-}
-
-async fn write_paced(stream: &mut TcpStream, wire: &[u8], pause: Duration) -> Result<()> {
-    for (index, chunk) in wire.chunks(CHUNK_BYTES).enumerate() {
-        if index != 0 {
-            wait_pacing(pause).await;
-        }
-        stream.write_all(chunk).await?;
-    }
-    Ok(())
-}
-
 #[derive(Default)]
 struct Counts {
     articles: AtomicUsize,
@@ -268,7 +277,7 @@ struct Counts {
 
 struct PreparedReply {
     id: String,
-    wire: Arc<[u8]>,
+    fixture: PreparedResponseFixture,
 }
 type CurrentReply = Arc<Mutex<Option<PreparedReply>>>;
 type WriteTime = Arc<Mutex<Option<Instant>>>;
@@ -294,7 +303,7 @@ impl Drop for Backend {
 struct BackendOptions {
     host: &'static str,
     tier: u8,
-    stat: u8,
+    stat: StatMode,
     lookup: Lookup,
     probe: StatusCode,
     delay: Duration,
@@ -307,7 +316,10 @@ async fn start_backend(options: BackendOptions, current: CurrentReply) -> Result
         .name(format!("controlled-tier{}", options.tier))
         .tier(options.tier)
         .max_connections(MaxConnections::try_new(1)?)
-        .stat_missing(options.stat)
+        .stat_missing(match options.stat {
+            StatMode::Disabled => 0,
+            StatMode::Enabled => 1,
+        })
         .build()?;
     let counts = Arc::new(Counts::default());
     let final_write: WriteTime = Arc::default();
@@ -327,9 +339,9 @@ async fn start_backend(options: BackendOptions, current: CurrentReply) -> Result
             let pacing = options.pacing;
             clients.spawn(async move {
                 let mut reader = BufReader::new(stream);
-                reader
-                    .get_mut()
-                    .write_all(&status(200, "Reader fixture").wire())
+                status(200, "Reader fixture")
+                    .prepare_benchmark()
+                    .write_to(reader.get_mut(), BenchmarkFixturePacing::Unpaced)
                     .await?;
                 let mut line = String::new();
                 loop {
@@ -339,7 +351,7 @@ async fn start_backend(options: BackendOptions, current: CurrentReply) -> Result
                     }
                     let request = RequestContext::parse(line.as_bytes())
                         .context("invalid fixture request")?;
-                    let wire: Arc<[u8]> = match request.kind() {
+                    let fixture = match request.kind() {
                         RequestKind::Article | RequestKind::Stat => {
                             let id = request
                                 .message_id()
@@ -351,34 +363,36 @@ async fn start_backend(options: BackendOptions, current: CurrentReply) -> Result
                                 counts.stats.fetch_add(1, Ordering::Relaxed);
                                 if probe.as_u16() == 223 {
                                     ResponseFixture::reader(RequestKind::Stat, 0, id)
-                                        .wire()
-                                        .into()
+                                        .prepare_benchmark()
                                 } else {
                                     ResponseFixture::status(probe, "No such article")
-                                        .wire()
-                                        .into()
+                                        .prepare_benchmark()
                                 }
                             } else {
                                 counts.articles.fetch_add(1, Ordering::Relaxed);
                                 match lookup {
-                                    Lookup::Present => reply.wire.clone(),
-                                    Lookup::Missing => status(430, "No such article").wire().into(),
+                                    Lookup::Present => reply.fixture.clone(),
+                                    Lookup::Missing => {
+                                        status(430, "No such article").prepare_benchmark()
+                                    }
                                 }
                             }
                         }
-                        RequestKind::Group => status(211, "1 42 42 alt.test").wire().into(),
-                        RequestKind::Mode => status(200, "Reader mode").wire().into(),
-                        RequestKind::Quit => status(205, "Goodbye").wire().into(),
-                        _ => status(500, "Unsupported fixture command").wire().into(),
+                        RequestKind::Group => status(211, "1 42 42 alt.test").prepare_benchmark(),
+                        RequestKind::Mode => status(200, "Reader mode").prepare_benchmark(),
+                        RequestKind::Quit => status(205, "Goodbye").prepare_benchmark(),
+                        _ => status(500, "Unsupported fixture command").prepare_benchmark(),
                     };
                     if matches!(request.kind(), RequestKind::Article | RequestKind::Stat) {
                         wait_reply_delay(delay).await;
                     }
-                    if request.kind() == RequestKind::Article && pacing.upstream() {
-                        write_paced(reader.get_mut(), &wire, Duration::from_millis(1)).await?;
-                    } else {
-                        reader.get_mut().write_all(&wire).await?;
-                    }
+                    let write_pacing =
+                        if request.kind() == RequestKind::Article && pacing.upstream() {
+                            BenchmarkFixturePacing::Application(Duration::from_millis(1))
+                        } else {
+                            BenchmarkFixturePacing::Unpaced
+                        };
+                    fixture.write_to(reader.get_mut(), write_pacing).await?;
                     *final_write.lock().unwrap() = Some(Instant::now());
                 }
             });
@@ -416,7 +430,13 @@ impl Lab {
                 stat,
             } => {
                 for (host, tier, lookup, probe, enabled) in [
-                    ("127.0.0.1", 0, Lookup::Missing, StatusCode::new(430), 0),
+                    (
+                        "127.0.0.1",
+                        0,
+                        Lookup::Missing,
+                        StatusCode::new(430),
+                        StatMode::Disabled,
+                    ),
                     (
                         "127.0.0.2",
                         1,
@@ -453,7 +473,7 @@ impl Lab {
                         BackendOptions {
                             host: "127.0.0.1",
                             tier: 0,
-                            stat: 0,
+                            stat: StatMode::Disabled,
                             lookup: Lookup::Present,
                             probe: StatusCode::new(223),
                             delay: Duration::ZERO,
@@ -484,6 +504,10 @@ impl Lab {
         config.routing.reader_message_id_failover = true;
         config.memory.buffer_pool_count = 8;
         let proxy = NntpProxy::new(config, mode).await?;
+        ensure!(
+            proxy.cache().stores_payload_responses() == (payload_cache == PayloadCache::Enabled),
+            "fixture cache policy differs from selected scenario"
+        );
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let address = listener.local_addr()?;
         let serving = proxy.clone();
@@ -533,59 +557,50 @@ impl Lab {
                 .is_none(),
             "cold request reused a warm/cache-known ID"
         );
-        let body_len = match scenario {
-            Scenario::Reader { .. } => 64 * 1024,
-            Scenario::Payload { size, .. } => payload_body_len(&id, size),
+        let payload = match scenario {
+            Scenario::Reader { .. } => article(&id, 64 * 1024),
+            Scenario::Payload {
+                size: WIRE_BUDGET_4M,
+                ..
+            } => article(&id, 0).benchmark_body_with_wire_budget(WIRE_BUDGET_4M)?,
+            Scenario::Payload { size, .. } => article(&id, size),
         };
-        let payload = article(&id, body_len);
+        let payload = payload.prepare_benchmark();
+        let body_len = payload.body_len();
         let expected = match scenario {
             Scenario::Reader {
                 outcome: Outcome::Missing,
                 ..
-            } => status(430, "No such article"),
+            } => status(430, "No such article").prepare_benchmark(),
             _ => payload.clone(),
         };
         let wire_len = expected.wire_len();
         *self.current.lock().unwrap() = Some(PreparedReply {
             id: id.clone(),
-            wire: payload.wire().into(),
+            fixture: payload,
         });
         for backend in &self.backends {
             *backend.final_write.lock().unwrap() = None;
         }
         let command = format!("ARTICLE {id}");
         let request = RequestContext::parse(command.as_bytes()).unwrap();
-        let mut actual = vec![0; wire_len];
+        let read_pacing = if matches!(scenario, Scenario::Payload { pacing, .. } if pacing.downstream())
+        {
+            BenchmarkFixturePacing::Application(Duration::from_millis(1))
+        } else {
+            BenchmarkFixturePacing::Unpaced
+        };
+        let receiver = expected.prepare_receive(read_pacing);
         let started = Instant::now();
         request.write_wire_to(&mut self.client).await?;
-        self.client.read_exact(&mut actual[..1]).await?;
-        let first = Instant::now();
-        let downstream =
-            matches!(scenario, Scenario::Payload { pacing, .. } if pacing.downstream());
-        let mut consumed = 1;
-        while consumed < actual.len() {
-            let end = if downstream {
-                (consumed + CHUNK_BYTES).min(actual.len())
-            } else {
-                actual.len()
-            };
-            self.client.read_exact(&mut actual[consumed..end]).await?;
-            consumed = end;
-            if downstream && consumed < actual.len() {
-                wait_pacing(Duration::from_millis(1)).await;
-            }
-        }
-        let completed = Instant::now();
-        expected.assert_received(&mut actual.as_slice()).await?;
-        for _ in 0..128 {
-            tokio::task::yield_now().await;
-        }
-        let admitted = self
-            .proxy
-            .cache()
-            .get_request_message_id(&id)
-            .await
-            .is_some_and(|entry| entry.is_complete_article());
+        let received = receiver.receive(&mut self.client).await?;
+        let timings = received.timings();
+        received.validate()?;
+        let cache_mode = match scenario {
+            Scenario::Payload { cache, .. } => cache,
+            Scenario::Reader { .. } => PayloadCache::Disabled,
+        };
+        let admitted = payload_admitted(self.proxy.cache(), &id, cache_mode).await?;
         let final_write = self
             .backends
             .last()
@@ -595,10 +610,10 @@ impl Lab {
             .unwrap()
             .context("backend did not finish writing its fixture")?;
         Ok(Observation {
-            first_byte: first.duration_since(started),
-            complete: completed.duration_since(started),
+            first_byte: timings.first_byte.duration_since(started),
+            complete: timings.completed.duration_since(started),
             backend_complete: final_write.duration_since(started),
-            first_before_backend_complete: first < final_write,
+            first_before_backend_complete: timings.first_byte < final_write,
             admitted,
             body_len,
             wire_len,
@@ -623,6 +638,84 @@ struct Run {
     secondary_stats: usize,
 }
 
+async fn payload_admitted(
+    cache: &nntp_proxy::cache::UnifiedCache,
+    id: &str,
+    mode: PayloadCache,
+) -> Result<bool> {
+    if mode == PayloadCache::Disabled {
+        return Ok(false);
+    }
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if cache
+                .get_request_message_id(id)
+                .await
+                .is_some_and(|entry| entry.is_complete_article())
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .context("payload admission deadline exceeded")?;
+    Ok(true)
+}
+
+async fn check_delayed_admission() -> Result<()> {
+    let id = "<delayed-admission@bench.local>";
+    let cache = Arc::new(nntp_proxy::cache::UnifiedCache::memory(
+        CACHE_BYTES,
+        Duration::from_secs(300),
+    ));
+    let prepared = article(id, 128).prepare_benchmark();
+    let mut wire = Vec::new();
+    prepared
+        .write_to(&mut wire, BenchmarkFixturePacing::Unpaced)
+        .await?;
+    let inserting = cache.clone();
+    let task = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        inserting
+            .upsert_test_response(
+                nntp_proxy::types::MessageId::from_borrowed(id)?,
+                wire,
+                nntp_proxy::types::BackendId::from_index(0),
+                nntp_proxy::cache::ttl::CacheTier::new(0),
+            )
+            .await;
+        Ok::<(), anyhow::Error>(())
+    });
+    ensure!(
+        payload_admitted(&cache, id, PayloadCache::Enabled).await?,
+        "delayed payload admission was not observed"
+    );
+    task.await??;
+    ensure!(
+        !tokio::time::timeout(
+            Duration::from_millis(10),
+            payload_admitted(&cache, id, PayloadCache::Disabled)
+        )
+        .await??,
+        "disabled cache mode waited for or admitted payloads"
+    );
+    ensure!(
+        payload_admitted(
+            &cache,
+            "<never-admitted@bench.local>",
+            PayloadCache::Enabled
+        )
+        .await
+        .is_err(),
+        "missing admission did not fail closed at its deadline"
+    );
+    println!(
+        "PASS delayed real-cache admission, immediate disabled mode, and missing-entry deadline"
+    );
+    Ok(())
+}
+
 async fn run_case(case: &Case, requests: usize) -> Result<Run> {
     let mut lab = Lab::start(case.scenario).await?;
     let mut observations = Vec::new();
@@ -644,7 +737,7 @@ async fn run_case(case: &Case, requests: usize) -> Result<Run> {
     );
     match case.scenario {
         Scenario::Reader { outcome, stat, .. } => {
-            let expected_articles = if outcome == Outcome::Missing && stat == 1 {
+            let expected_articles = if outcome == Outcome::Missing && stat == StatMode::Enabled {
                 0
             } else {
                 requests
@@ -654,7 +747,11 @@ async fn run_case(case: &Case, requests: usize) -> Result<Run> {
                 "unexpected fallback ARTICLE count"
             );
             ensure!(
-                secondary_stats == usize::from(stat) * requests,
+                secondary_stats
+                    == match stat {
+                        StatMode::Disabled => 0,
+                        StatMode::Enabled => requests,
+                    },
                 "unexpected fallback STAT count"
             );
             ensure!(
@@ -751,29 +848,44 @@ impl Run {
     }
 }
 
-async fn check_application_pacing() -> Result<()> {
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
-    let address = listener.local_addr()?;
-    let fixture = article("<pacing@bench.local>", 64 * 1024);
-    let wire = fixture.wire();
+async fn application_pacing_elapsed(pacing: BenchmarkFixturePacing) -> Result<Duration> {
+    let fixture = article("<pacing@bench.local>", 64 * 1024).prepare_benchmark();
+    let receiver = fixture.prepare_receive(BenchmarkFixturePacing::Unpaced);
+    let (mut client, mut stream) = connected_sockets().await?;
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let (start_tx, start_rx) = tokio::sync::oneshot::channel();
     let server = tokio::spawn(async move {
-        let (mut stream, _) = listener.accept().await?;
-        write_paced(&mut stream, &wire, Duration::from_millis(5)).await
+        let _ = ready_tx.send(());
+        start_rx.await?;
+        fixture.write_to(&mut stream, pacing).await
     });
+    ready_rx.await?;
     let started = Instant::now();
-    let mut client = TcpStream::connect(address).await?;
-    fixture.assert_received(&mut client).await?;
-    ensure!(
-        started.elapsed() >= Duration::from_millis(20),
-        "application pacing was omitted from the actual socket exchange"
-    );
+    let _ = start_tx.send(());
+    let received = receiver.receive(&mut client).await?;
+    let completed = received.timings().completed;
+    received.validate()?;
     server.await??;
-    println!("PASS actual socket transfer observes application pacing");
-    Ok(())
+    Ok(completed.duration_since(started))
 }
 
 async fn self_check() -> Result<()> {
-    check_reply_delay().await?;
+    check_delayed_admission().await?;
+    ensure!(
+        reply_delay_elapsed(Duration::ZERO).await? < Duration::from_millis(5),
+        "connection setup masked an omitted reply delay"
+    );
+    ensure!(
+        application_pacing_elapsed(BenchmarkFixturePacing::Unpaced).await?
+            < Duration::from_millis(20),
+        "connection setup masked omitted application pacing"
+    );
+    println!("PASS slow accepted-socket setup cannot satisfy omitted-delay/pacing controls");
+    ensure!(
+        reply_delay_elapsed(Duration::from_millis(5)).await? >= Duration::from_millis(5),
+        "modeled reply delay was omitted from the actual socket exchange"
+    );
+    println!("PASS actual socket reply observes modeled service delay");
     let case = Case {
         name: "self-check-cold-payload".to_owned(),
         scenario: Scenario::Payload {
@@ -784,14 +896,22 @@ async fn self_check() -> Result<()> {
     };
     run_case(&case, 2).await?;
     println!("PASS two fresh IDs fetch and admit two real payloads");
-    check_application_pacing().await?;
+    ensure!(
+        application_pacing_elapsed(BenchmarkFixturePacing::Application(Duration::from_millis(
+            5
+        )))
+        .await?
+            >= Duration::from_millis(20),
+        "application pacing was omitted from the actual socket exchange"
+    );
+    println!("PASS actual socket transfer observes application pacing");
     for outcome in [
         Outcome::Present,
         Outcome::Missing,
         Outcome::Unsupported503,
         Outcome::Unknown500,
     ] {
-        for stat in [0, 1] {
+        for stat in [StatMode::Disabled, StatMode::Enabled] {
             let case = Case {
                 name: "self-check-reader".to_owned(),
                 scenario: Scenario::Reader {

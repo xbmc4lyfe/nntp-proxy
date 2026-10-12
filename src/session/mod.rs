@@ -180,6 +180,7 @@ pub(crate) mod multiline_framing;
 pub use multiline_framing::ResponseFixture;
 #[cfg(feature = "framing-bench")]
 pub use multiline_framing::{
+    BenchmarkFixturePacing, FixtureReadTimings, PreparedResponseFixture,
     benchmark_framed_cache_response, benchmark_incremental_multiline_frame,
     benchmark_multiline_response, benchmark_ordered_stat_forwarding,
     benchmark_stateless_multiline_frame,
