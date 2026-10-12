@@ -1037,6 +1037,11 @@ pub(crate) struct ClassifiedResponse {
     kind: crate::protocol::RequestKind,
 }
 
+enum ResponseClassification {
+    Ready(ClassifiedResponse),
+    Pending(crate::pool::PooledBuffer),
+}
+
 /// Owns a classified response and the backend connection that supplied it.
 ///
 /// The response buffer and connection are deliberately moved together.  A
@@ -1082,6 +1087,14 @@ impl<'pool> BackendResponseExchange<'pool> {
         pool: &'pool crate::pool::BufferPool,
         backend_id: crate::types::BackendId,
     ) -> anyhow::Result<Self> {
+        // Queued complete statuses require no I/O, so they can keep the owning
+        // exchange without registering a timer for a receive already finished.
+        let buffer = match ClassifiedResponse::classify_ready(request, buffer) {
+            ResponseClassification::Ready(response) => {
+                return Ok(Self::new(conn, response, pool, backend_id));
+            }
+            ResponseClassification::Pending(buffer) => buffer,
+        };
         let response = tokio::time::timeout(
             crate::constants::timeout::BACKEND_READ,
             ClassifiedResponse::read_unbound(conn.stream_mut(), request, buffer),
@@ -1236,36 +1249,45 @@ impl<'pool> BackendResponseExchange<'pool> {
 }
 
 impl ClassifiedResponse {
+    fn classify_ready(
+        request: &crate::protocol::RequestContext,
+        buffer: crate::pool::PooledBuffer,
+    ) -> ResponseClassification {
+        if buffer.initialized() == 0 {
+            return ResponseClassification::Pending(buffer);
+        }
+        match ResponseFrame::parse(request, &buffer) {
+            Err(ResponseReadError::Incomplete) => ResponseClassification::Pending(buffer),
+            frame => ResponseClassification::Ready(Self {
+                buffer,
+                frame,
+                kind: request.kind(),
+            }),
+        }
+    }
+
     async fn read_unbound<C: tokio::io::AsyncRead + Unpin>(
         conn: &mut C,
         request: &crate::protocol::RequestContext,
         mut buffer: crate::pool::PooledBuffer,
     ) -> anyhow::Result<Self> {
         loop {
-            let frame = ResponseFrame::parse(request, &buffer);
-            match frame {
-                Err(ResponseReadError::Incomplete) => {
-                    let more = buffer.read_more(conn).await?;
-                    if more == 0 {
-                        if buffer.available_read_capacity() == 0 {
-                            anyhow::bail!(
-                                "Backend response exceeded the read buffer capacity ({} bytes)",
-                                buffer.initialized()
-                            );
-                        }
-                        anyhow::bail!(
-                            "Backend EOF before complete backend response ({} bytes)",
-                            buffer.initialized()
-                        );
-                    }
+            buffer = match Self::classify_ready(request, buffer) {
+                ResponseClassification::Ready(response) => return Ok(response),
+                ResponseClassification::Pending(buffer) => buffer,
+            };
+            let more = buffer.read_more(conn).await?;
+            if more == 0 {
+                if buffer.available_read_capacity() == 0 {
+                    anyhow::bail!(
+                        "Backend response exceeded the read buffer capacity ({} bytes)",
+                        buffer.initialized()
+                    );
                 }
-                frame => {
-                    return Ok(Self {
-                        buffer,
-                        frame,
-                        kind: request.kind(),
-                    });
-                }
+                anyhow::bail!(
+                    "Backend EOF before complete backend response ({} bytes)",
+                    buffer.initialized()
+                );
             }
         }
     }
