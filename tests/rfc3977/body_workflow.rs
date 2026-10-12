@@ -20,7 +20,7 @@ use crate::test_helpers::{
     MockNntpServer, RfcTestClient, connect_and_read_greeting,
     create_test_server_config_with_max_connections, spawn_proxy_with_config,
 };
-use nntp_proxy::{Config, RoutingMode, config::Cache};
+use nntp_proxy::{Config, RoutingMode};
 
 const PIPELINE_COMMON_RESPONSES: &[(&str, &str)] = &[
     ("MODE READER", "200 Posting prohibited\r\n"),
@@ -198,20 +198,6 @@ fn pipeline_backend_config_with_max_connections(
         servers: vec![server],
         ..Default::default()
     }
-}
-
-fn pipeline_backend_config_with_cache(
-    backend_port: u16,
-    name: &str,
-    max_connections: usize,
-) -> Config {
-    let mut config =
-        pipeline_backend_config_with_max_connections(backend_port, name, max_connections);
-    config.cache = Some(Cache {
-        store_article_bodies: true,
-        ..Default::default()
-    });
-    config
 }
 
 fn find_pipeline_response<'a>(command: &str, responses: &'a [(&str, &str)]) -> Option<&'a str> {
@@ -480,53 +466,6 @@ struct BufferedResponseExpectation<'a> {
     body_context: &'a str,
     expected_status: &'a str,
     expected_body_line: &'a str,
-}
-
-async fn expect_buffered_until_backend_finishes(
-    proxy_port: u16,
-    expectation: BufferedResponseExpectation<'_>,
-    initial_written: Arc<Notify>,
-    release_tx: oneshot::Sender<()>,
-) -> Result<()> {
-    let BufferedResponseExpectation {
-        command,
-        status_context,
-        body_context,
-        expected_status,
-        expected_body_line,
-    } = expectation;
-    let client = connect_and_read_greeting(proxy_port).await?;
-    let (read_half, mut write_half) = client.into_split();
-    let mut reader = BufReader::new(read_half);
-
-    write_commands(&mut write_half, &[command]).await?;
-    initial_written.notified().await;
-
-    let status_result =
-        read_line_with_timeout(&mut reader, status_context, Duration::from_millis(200)).await;
-    let body_line_result =
-        read_line_with_timeout(&mut reader, body_context, Duration::from_millis(200)).await;
-
-    assert!(
-        status_result.is_err(),
-        "{command:?} should stay buffered until the backend sends the terminator"
-    );
-    assert!(
-        body_line_result.is_err(),
-        "{command:?} body bytes should stay buffered until the backend finishes"
-    );
-
-    let _ = release_tx.send(());
-    let status_line = read_line(&mut reader, status_context).await?;
-    let body_line = read_line(&mut reader, body_context).await?;
-    assert_eq!(status_line, expected_status);
-    assert_eq!(body_line, expected_body_line);
-    assert_eq!(
-        read_line(&mut reader, "multiline terminator").await?,
-        ".\r\n"
-    );
-
-    Ok(())
 }
 
 async fn expect_pass_through_borrows_initial_backend_bytes(
@@ -1687,130 +1626,6 @@ async fn test_article_second_burst_drains_before_trailing_group_switch() -> Resu
     );
 
     Ok(())
-}
-
-#[tokio::test]
-async fn test_cached_body_pipeline_buffers_until_backend_finishes() -> Result<()> {
-    let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
-    let backend_port = backend_listener.local_addr()?.port();
-    let (initial_written, release_tx) = spawn_gated_multiline_backend(
-        backend_listener,
-        "BODY <cached-body@example>",
-        "222 0 <cached-body@example>\r\nbody-prefix\r\n",
-        ".\r\n",
-    );
-
-    let proxy_port = spawn_proxy_with_config(
-        pipeline_backend_config_with_cache(backend_port, "CachedBodyPipeline", 2),
-        RoutingMode::PerCommand,
-    )
-    .await?;
-    expect_buffered_until_backend_finishes(
-        proxy_port,
-        BufferedResponseExpectation {
-            command: "BODY <cached-body@example>\r\n",
-            status_context: "cached BODY status",
-            body_context: "cached BODY first line",
-            expected_status: "222 0 <cached-body@example>\r\n",
-            expected_body_line: "body-prefix\r\n",
-        },
-        initial_written,
-        release_tx,
-    )
-    .await
-}
-
-#[tokio::test]
-async fn test_cached_article_pipeline_buffers_until_backend_finishes() -> Result<()> {
-    let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
-    let backend_port = backend_listener.local_addr()?.port();
-    let (initial_written, release_tx) = spawn_gated_multiline_backend(
-        backend_listener,
-        "ARTICLE <cached-article@example>",
-        "220 0 <cached-article@example>\r\narticle-prefix\r\n",
-        ".\r\n",
-    );
-
-    let proxy_port = spawn_proxy_with_config(
-        pipeline_backend_config_with_cache(backend_port, "CachedArticlePipeline", 2),
-        RoutingMode::PerCommand,
-    )
-    .await?;
-    expect_buffered_until_backend_finishes(
-        proxy_port,
-        BufferedResponseExpectation {
-            command: "ARTICLE <cached-article@example>\r\n",
-            status_context: "cached ARTICLE status",
-            body_context: "cached ARTICLE first line",
-            expected_status: "220 0 <cached-article@example>\r\n",
-            expected_body_line: "article-prefix\r\n",
-        },
-        initial_written,
-        release_tx,
-    )
-    .await
-}
-
-#[tokio::test]
-async fn test_cached_body_pipeline_buffers_when_first_read_only_has_status_line() -> Result<()> {
-    let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
-    let backend_port = backend_listener.local_addr()?.port();
-    let (initial_written, release_tx) = spawn_gated_multiline_backend(
-        backend_listener,
-        "BODY <cached-status-only-body@example>",
-        "222 0 <cached-status-only-body@example>\r\n",
-        "cached-status-only-body-prefix\r\n.\r\n",
-    );
-
-    let proxy_port = spawn_proxy_with_config(
-        pipeline_backend_config_with_cache(backend_port, "CachedStatusOnlyBodyPipeline", 2),
-        RoutingMode::PerCommand,
-    )
-    .await?;
-    expect_buffered_until_backend_finishes(
-        proxy_port,
-        BufferedResponseExpectation {
-            command: "BODY <cached-status-only-body@example>\r\n",
-            status_context: "cached status-only BODY status",
-            body_context: "cached status-only BODY first line",
-            expected_status: "222 0 <cached-status-only-body@example>\r\n",
-            expected_body_line: "cached-status-only-body-prefix\r\n",
-        },
-        initial_written,
-        release_tx,
-    )
-    .await
-}
-
-#[tokio::test]
-async fn test_cached_article_pipeline_buffers_when_first_read_only_has_status_line() -> Result<()> {
-    let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
-    let backend_port = backend_listener.local_addr()?.port();
-    let (initial_written, release_tx) = spawn_gated_multiline_backend(
-        backend_listener,
-        "ARTICLE <cached-status-only-article@example>",
-        "220 0 <cached-status-only-article@example>\r\n",
-        "cached-status-only-article-prefix\r\n.\r\n",
-    );
-
-    let proxy_port = spawn_proxy_with_config(
-        pipeline_backend_config_with_cache(backend_port, "CachedStatusOnlyArticlePipeline", 2),
-        RoutingMode::PerCommand,
-    )
-    .await?;
-    expect_buffered_until_backend_finishes(
-        proxy_port,
-        BufferedResponseExpectation {
-            command: "ARTICLE <cached-status-only-article@example>\r\n",
-            status_context: "cached status-only ARTICLE status",
-            body_context: "cached status-only ARTICLE first line",
-            expected_status: "220 0 <cached-status-only-article@example>\r\n",
-            expected_body_line: "cached-status-only-article-prefix\r\n",
-        },
-        initial_written,
-        release_tx,
-    )
-    .await
 }
 
 #[tokio::test]
