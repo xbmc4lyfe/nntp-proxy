@@ -213,6 +213,10 @@ name = "end_to_end_proxy"
 harness = false
 
 [[bench]]
+name = "controlled_reader_cache"
+harness = false
+
+[[bench]]
 name = "client_stat"
 harness = false
 
