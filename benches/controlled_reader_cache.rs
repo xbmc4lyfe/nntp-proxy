@@ -44,7 +44,7 @@ struct Args {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    if args.list {
+    if args.list || (args.exact.is_none() && !args.self_check) {
         for case in cases() {
             println!("{}", case.name);
         }
