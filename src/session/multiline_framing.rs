@@ -1037,11 +1037,6 @@ pub(crate) struct ClassifiedResponse {
     kind: crate::protocol::RequestKind,
 }
 
-enum ResponseClassification {
-    Ready(ClassifiedResponse),
-    Pending(crate::pool::PooledBuffer),
-}
-
 /// Owns a classified response and the backend connection that supplied it.
 ///
 /// The response buffer and connection are deliberately moved together.  A
@@ -1087,20 +1082,23 @@ impl<'pool> BackendResponseExchange<'pool> {
         pool: &'pool crate::pool::BufferPool,
         backend_id: crate::types::BackendId,
     ) -> anyhow::Result<Self> {
-        // Queued complete statuses require no I/O, so they can keep the owning
-        // exchange without registering a timer for a receive already finished.
-        let buffer = match ClassifiedResponse::classify_ready(request, buffer) {
-            ResponseClassification::Ready(response) => {
-                return Ok(Self::new(conn, response, pool, backend_id));
+        let response = {
+            use std::task::Poll;
+
+            // Ready queued or socket input needs no timer. If receiving must
+            // suspend, retain its first-read state and original absolute budget.
+            let deadline = tokio::time::Instant::now() + crate::constants::timeout::BACKEND_READ;
+            let receiving = ClassifiedResponse::read_unbound(conn.stream_mut(), request, buffer);
+            tokio::pin!(receiving);
+            match std::future::poll_fn(|cx| Poll::Ready(receiving.as_mut().poll(cx))).await {
+                Poll::Ready(response) => response?,
+                Poll::Pending => tokio::time::timeout_at(deadline, receiving)
+                    .await
+                    .map_err(|_| {
+                        anyhow::anyhow!("Backend did not respond within the read timeout")
+                    })??,
             }
-            ResponseClassification::Pending(buffer) => buffer,
         };
-        let response = tokio::time::timeout(
-            crate::constants::timeout::BACKEND_READ,
-            ClassifiedResponse::read_unbound(conn.stream_mut(), request, buffer),
-        )
-        .await
-        .map_err(|_| anyhow::anyhow!("Backend did not respond within the read timeout"))??;
         Ok(Self::new(conn, response, pool, backend_id))
     }
 
@@ -1249,45 +1247,40 @@ impl<'pool> BackendResponseExchange<'pool> {
 }
 
 impl ClassifiedResponse {
-    fn classify_ready(
-        request: &crate::protocol::RequestContext,
-        buffer: crate::pool::PooledBuffer,
-    ) -> ResponseClassification {
-        if buffer.initialized() == 0 {
-            return ResponseClassification::Pending(buffer);
-        }
-        match ResponseFrame::parse(request, &buffer) {
-            Err(ResponseReadError::Incomplete) => ResponseClassification::Pending(buffer),
-            frame => ResponseClassification::Ready(Self {
-                buffer,
-                frame,
-                kind: request.kind(),
-            }),
-        }
-    }
-
     async fn read_unbound<C: tokio::io::AsyncRead + Unpin>(
         conn: &mut C,
         request: &crate::protocol::RequestContext,
         mut buffer: crate::pool::PooledBuffer,
     ) -> anyhow::Result<Self> {
         loop {
-            buffer = match Self::classify_ready(request, buffer) {
-                ResponseClassification::Ready(response) => return Ok(response),
-                ResponseClassification::Pending(buffer) => buffer,
+            let frame = if buffer.initialized() == 0 {
+                Err(ResponseReadError::Incomplete)
+            } else {
+                ResponseFrame::parse(request, &buffer)
             };
-            let more = buffer.read_more(conn).await?;
-            if more == 0 {
-                if buffer.available_read_capacity() == 0 {
-                    anyhow::bail!(
-                        "Backend response exceeded the read buffer capacity ({} bytes)",
-                        buffer.initialized()
-                    );
+            match frame {
+                Err(ResponseReadError::Incomplete) => {
+                    let more = buffer.read_more(conn).await?;
+                    if more == 0 {
+                        if buffer.available_read_capacity() == 0 {
+                            anyhow::bail!(
+                                "Backend response exceeded the read buffer capacity ({} bytes)",
+                                buffer.initialized()
+                            );
+                        }
+                        anyhow::bail!(
+                            "Backend EOF before complete backend response ({} bytes)",
+                            buffer.initialized()
+                        );
+                    }
                 }
-                anyhow::bail!(
-                    "Backend EOF before complete backend response ({} bytes)",
-                    buffer.initialized()
-                );
+                frame => {
+                    return Ok(Self {
+                        buffer,
+                        frame,
+                        kind: request.kind(),
+                    });
+                }
             }
         }
     }
@@ -2981,6 +2974,239 @@ mod tests {
             fixture.wire(),
             b"222 0 <fixture@reader>\r\n..first\r\n..second\r\n.\r\n"
         );
+    }
+
+    #[tokio::test]
+    async fn exchange_receives_immediately_available_socket_status_from_empty_buffer() {
+        let (provider, fragments, mut written, server) = fragmented_status_test_backend().await;
+        let mut guard = provider
+            .checkout_connection_guard()
+            .await
+            .unwrap()
+            .activate();
+        let request = crate::protocol::RequestContext::parse(b"STAT <wake@test>\r\n").unwrap();
+        request.write_wire_to(guard.stream_mut()).await.unwrap();
+        fragments
+            .send(b"223 0 <wake@test>\r\n".as_slice())
+            .await
+            .unwrap();
+        written.recv().await.unwrap();
+        guard
+            .stream_mut()
+            .underlying_tcp_stream()
+            .readable()
+            .await
+            .unwrap();
+        let buffers = make_pool();
+        let buffer = buffers.acquire();
+        assert_eq!(buffer.initialized(), 0);
+        let receive = BackendResponseExchange::read(
+            guard,
+            &request,
+            buffer,
+            &buffers,
+            crate::types::BackendId::from_index(0),
+        );
+        tokio::pin!(receive);
+        let std::task::Poll::Ready(result) = futures::poll!(&mut receive) else {
+            panic!("an already readable complete status must finish on its first poll");
+        };
+        let exchange = result.unwrap();
+        assert_eq!(
+            exchange.single_line_bytes(),
+            Some(b"223 0 <wake@test>\r\n".as_slice())
+        );
+        drop(
+            exchange
+                .observe_and_reuse()
+                .await
+                .unwrap()
+                .complete_success(),
+        );
+        assert_eq!(provider.status_counts().available, 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn exchange_preserves_initial_partial_socket_read_until_real_wake() {
+        let (provider, fragments, mut written, server) = fragmented_status_test_backend().await;
+        let mut guard = provider
+            .checkout_connection_guard()
+            .await
+            .unwrap()
+            .activate();
+        let request = crate::protocol::RequestContext::parse(b"STAT <wake@test>\r\n").unwrap();
+        request.write_wire_to(guard.stream_mut()).await.unwrap();
+        fragments.send(b"22".as_slice()).await.unwrap();
+        written.recv().await.unwrap();
+        guard
+            .stream_mut()
+            .underlying_tcp_stream()
+            .readable()
+            .await
+            .unwrap();
+        let observer = socket2::SockRef::from(guard.stream_mut().underlying_tcp_stream())
+            .try_clone()
+            .unwrap();
+        let (pending, pending_seen) = tokio::sync::oneshot::channel();
+        let receive = tokio::spawn(async move {
+            let buffers = make_pool();
+            let receive = BackendResponseExchange::read(
+                guard,
+                &request,
+                buffers.acquire(),
+                &buffers,
+                crate::types::BackendId::from_index(0),
+            );
+            tokio::pin!(receive);
+            assert!(futures::poll!(&mut receive).is_pending());
+            assert_socket_input_consumed(&observer);
+            pending.send(()).unwrap();
+            let exchange = receive.await.unwrap();
+            assert_eq!(
+                exchange.single_line_bytes(),
+                Some(b"223 0 <wake@test>\r\n".as_slice())
+            );
+            drop(
+                exchange
+                    .observe_and_reuse()
+                    .await
+                    .unwrap()
+                    .complete_success(),
+            );
+        });
+        pending_seen.await.unwrap();
+        fragments
+            .send(b"3 0 <wake@test>\r\n".as_slice())
+            .await
+            .unwrap();
+        written.recv().await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), receive)
+            .await
+            .expect("the pending receive must wake on actual socket input")
+            .unwrap();
+        assert_eq!(provider.status_counts().available, 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn exchange_fragment_at_twenty_nine_seconds_keeps_original_status_deadline() {
+        let (provider, fragments, mut written, server) = fragmented_status_test_backend().await;
+        let mut guard = provider
+            .checkout_connection_guard()
+            .await
+            .unwrap()
+            .activate();
+        let request = crate::protocol::RequestContext::parse(b"STAT <wake@test>\r\n").unwrap();
+        request.write_wire_to(guard.stream_mut()).await.unwrap();
+        fragments.send(b"22".as_slice()).await.unwrap();
+        written.recv().await.unwrap();
+        guard
+            .stream_mut()
+            .underlying_tcp_stream()
+            .readable()
+            .await
+            .unwrap();
+        let observer = socket2::SockRef::from(guard.stream_mut().underlying_tcp_stream())
+            .try_clone()
+            .unwrap();
+        let buffers = make_pool();
+        let receive = BackendResponseExchange::read(
+            guard,
+            &request,
+            buffers.acquire(),
+            &buffers,
+            crate::types::BackendId::from_index(0),
+        );
+        tokio::pin!(receive);
+        assert!(futures::poll!(&mut receive).is_pending());
+        assert_socket_input_consumed(&observer);
+        tokio::time::pause();
+        tokio::time::advance(std::time::Duration::from_secs(29)).await;
+        tokio::time::resume();
+        fragments.send(b"3 0 <wake@test>".as_slice()).await.unwrap();
+        written.recv().await.unwrap();
+        // Confirm real consumption, not just the peer write, before advancing
+        // the final second. A per-fragment timer reset must fail this control.
+        tokio::time::timeout(std::time::Duration::from_millis(500), async {
+            loop {
+                assert!(futures::poll!(&mut receive).is_pending());
+                if socket_input_is_consumed(&observer) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        tokio::time::pause();
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        let error = tokio::time::timeout(std::time::Duration::from_millis(100), receive)
+            .await
+            .expect("late fragments must not restart the original status deadline")
+            .err()
+            .expect("an incomplete status must expire");
+        assert!(error.to_string().contains("read timeout"));
+        assert_eq!(provider.status_counts().size, 0);
+        tokio::time::resume();
+        server.abort();
+    }
+
+    fn socket_input_is_consumed(socket: &socket2::Socket) -> bool {
+        match socket.peek(&mut [std::mem::MaybeUninit::uninit(); 1]) {
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => true,
+            Ok(bytes) if bytes > 0 => false,
+            other => panic!("unexpected socket observation: {other:?}"),
+        }
+    }
+
+    fn assert_socket_input_consumed(socket: &socket2::Socket) {
+        assert!(
+            socket_input_is_consumed(socket),
+            "the receive must consume actual socket input before it suspends"
+        );
+    }
+
+    async fn fragmented_status_test_backend() -> (
+        crate::pool::DeadpoolConnectionProvider,
+        tokio::sync::mpsc::Sender<&'static [u8]>,
+        tokio::sync::mpsc::Receiver<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (fragments, mut next_fragment) = tokio::sync::mpsc::channel::<&'static [u8]>(1);
+        let (written, fragment_written) = tokio::sync::mpsc::channel(1);
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            stream.set_nodelay(true).unwrap();
+            let mut reader = BufReader::new(stream);
+            reader.get_mut().write_all(b"200 Ready\r\n").await.unwrap();
+            let mut line = String::new();
+            loop {
+                line.clear();
+                if reader.read_line(&mut line).await.unwrap() == 0 {
+                    return;
+                }
+                if crate::protocol::RequestContext::parse(line.as_bytes())
+                    .unwrap()
+                    .is_stat()
+                {
+                    while let Some(bytes) = next_fragment.recv().await {
+                        reader.get_mut().write_all(bytes).await.unwrap();
+                        written.send(()).await.unwrap();
+                    }
+                    break;
+                }
+                reader.get_mut().write_all(b"200 Ready\r\n").await.unwrap();
+            }
+        });
+        let provider = crate::pool::DeadpoolConnectionProvider::builder("127.0.0.1", port)
+            .max_connections(1)
+            .build()
+            .unwrap();
+        (provider, fragments, fragment_written, server)
     }
 
     #[tokio::test]
