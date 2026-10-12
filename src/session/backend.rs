@@ -162,41 +162,17 @@ where
     ClassifiedResponse::read_for_test(conn, request, buffer).await
 }
 
-/// Read the first chunk of a backend reply, bounded by `timeout::BACKEND_READ`.
-///
-/// A backend that accepts a command and never answers (seen with `STAT` for
-/// unknown message-IDs) would otherwise hold the client forever. On timeout the
-/// error propagates, the caller drops the connection guard, and the stuck
-/// connection is removed from the pool with a cooldown.
-async fn read_first_chunk(
-    buffer: &mut PooledBuffer,
-    conn: &mut crate::pool::ConnectionGuard,
-) -> Result<()> {
-    let n = tokio::time::timeout(
-        crate::constants::timeout::BACKEND_READ,
-        buffer.read_from(conn.stream_mut()),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("Backend did not respond within the read timeout"))??;
-    if n == 0 {
-        anyhow::bail!("Backend connection closed unexpectedly");
-    }
-    Ok(())
-}
-
 /// Execute a direct request and return the response bound to the connection
 /// that supplied it.  The exchange owns both values until a consuming
 /// forwarding, capture, or observation operation is selected.
 pub(crate) async fn execute_request_exchange<'pool>(
     mut conn: crate::pool::ConnectionGuard,
     request: &RequestContext,
-    mut buffer: PooledBuffer,
+    buffer: PooledBuffer,
     pool: &'pool crate::pool::BufferPool,
     backend_id: crate::types::BackendId,
 ) -> Result<BackendResponseExchange<'pool>> {
     request.write_wire_to(conn.stream_mut()).await?;
-
-    read_first_chunk(&mut buffer, &mut conn).await?;
 
     BackendResponseExchange::read(conn, request, buffer, pool, backend_id).await
 }
@@ -206,7 +182,7 @@ pub(crate) async fn execute_request_exchange<'pool>(
 pub(crate) async fn execute_request_exchange_timed<'pool>(
     mut conn: crate::pool::ConnectionGuard,
     request: &RequestContext,
-    mut buffer: PooledBuffer,
+    buffer: PooledBuffer,
     pool: &'pool crate::pool::BufferPool,
     backend_id: crate::types::BackendId,
 ) -> Result<(BackendResponseExchange<'pool>, u64, u64, u64)> {
@@ -215,8 +191,6 @@ pub(crate) async fn execute_request_exchange_timed<'pool>(
     let start = Instant::now();
     request.write_wire_to(conn.stream_mut()).await?;
     let after_send = Instant::now();
-
-    read_first_chunk(&mut buffer, &mut conn).await?;
 
     let exchange = BackendResponseExchange::read(conn, request, buffer, pool, backend_id).await?;
     let after_recv = Instant::now();
@@ -263,7 +237,7 @@ pub(crate) type ProbeTimings = (u64, u64, u64);
 pub(crate) async fn execute_stat_probe_exchange<'pool>(
     mut conn: crate::pool::ConnectionGuard,
     request: &RequestContext,
-    mut buffer: PooledBuffer,
+    buffer: PooledBuffer,
     pool: &'pool crate::pool::BufferPool,
     context: ProbeMetrics<'_>,
     timing: ProbeTiming,
@@ -277,7 +251,6 @@ pub(crate) async fn execute_stat_probe_exchange<'pool>(
         request.request_wire_len().as_u64(),
     );
     let after_send = start.map(|_| std::time::Instant::now());
-    read_first_chunk(&mut buffer, &mut conn).await?;
     let exchange =
         BackendResponseExchange::read(conn, request, buffer, pool, context.backend_id).await?;
     if let Some(bytes) = exchange.single_line_bytes() {

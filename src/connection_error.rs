@@ -51,6 +51,12 @@ pub enum ConnectionError {
         retry_in: std::time::Duration,
     },
 
+    #[error("Connection setup for backend '{backend}' timed out after {timeout:?}")]
+    SetupTimeout {
+        backend: String,
+        timeout: std::time::Duration,
+    },
+
     #[error("Invalid greeting from backend '{backend}': {greeting}")]
     InvalidGreeting { backend: String, greeting: String },
 

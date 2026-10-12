@@ -83,6 +83,7 @@ fn spawn_backend(listener: TcpListener, response: Arc<[u8]>) {
             let Ok((stream, _)) = listener.accept().await else {
                 break;
             };
+            stream.set_nodelay(true).unwrap();
             let response = Arc::clone(&response);
             let group_response = Arc::clone(&group_response);
             let stat_response = Arc::clone(&stat_response);
@@ -145,6 +146,7 @@ fn spawn_proxy(listener: TcpListener, proxy: NntpProxy, mode: RoutingMode) {
             let Ok((stream, addr)) = listener.accept().await else {
                 break;
             };
+            stream.set_nodelay(true).unwrap();
             let proxy = proxy.clone();
             tokio::spawn(async move {
                 let _ = match mode {
@@ -489,6 +491,31 @@ mod cache_miss_roundtrip {
 
 mod stateful_upstream_window {
     use super::{ARTICLE_64K, Bencher, bench_per_command_pair, bench_stateful_window};
+
+    #[divan::bench(sample_count = 50, sample_size = 10)]
+    fn per_command_sixteen_small_replies(bencher: Bencher) {
+        use super::{BenchProxy, Builder, RoutingMode, black_box, read_exact_response_into};
+        use tokio::io::AsyncWriteExt;
+
+        let rt = Builder::new_current_thread().enable_all().build().unwrap();
+        let mut proxy = rt.block_on(BenchProxy::start(0, None, RoutingMode::PerCommand));
+        let requests = b"ARTICLE <bench@example.com>\r\n".repeat(16);
+        let response_len = proxy.response_len * 16;
+        proxy.response_buffer = vec![0; response_len].into_boxed_slice();
+        bencher
+            .counter(divan::counter::BytesCount::new(response_len))
+            .bench_local(|| {
+                black_box(rt.block_on(async {
+                    proxy.stream.write_all(&requests).await.unwrap();
+                    read_exact_response_into(
+                        &mut proxy.stream,
+                        &mut proxy.response_buffer,
+                        response_len,
+                    )
+                    .await
+                }))
+            });
+    }
 
     #[divan::bench(sample_count = 50, sample_size = 5)]
     fn article_pair_64k(bencher: Bencher) {
