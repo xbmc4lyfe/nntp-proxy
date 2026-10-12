@@ -83,6 +83,7 @@ fn spawn_backend(listener: TcpListener, response: Arc<[u8]>) {
             let Ok((stream, _)) = listener.accept().await else {
                 break;
             };
+            stream.set_nodelay(true).unwrap();
             let response = Arc::clone(&response);
             let group_response = Arc::clone(&group_response);
             let stat_response = Arc::clone(&stat_response);
@@ -145,6 +146,7 @@ fn spawn_proxy(listener: TcpListener, proxy: NntpProxy, mode: RoutingMode) {
             let Ok((stream, addr)) = listener.accept().await else {
                 break;
             };
+            stream.set_nodelay(true).unwrap();
             let proxy = proxy.clone();
             tokio::spawn(async move {
                 let _ = match mode {
