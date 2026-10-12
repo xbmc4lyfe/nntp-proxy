@@ -235,7 +235,12 @@ fn cases() -> Vec<Case> {
         ("788k", 788 * 1024),
         ("wire4m", WIRE_BUDGET_4M),
     ] {
-        for pacing in [Pacing::Upstream, Pacing::Downstream, Pacing::Both] {
+        for pacing in [
+            Pacing::None,
+            Pacing::Upstream,
+            Pacing::Downstream,
+            Pacing::Both,
+        ] {
             for cache in [PayloadCache::Disabled, PayloadCache::Enabled] {
                 cases.push(Case {
                     name: format!(
