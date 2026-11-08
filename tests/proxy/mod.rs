@@ -9,3 +9,4 @@ pub mod config;
 pub mod hybrid_mode;
 pub mod metrics;
 pub mod routing;
+pub mod stat_failover;
