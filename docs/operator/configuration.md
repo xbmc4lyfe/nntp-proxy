@@ -49,6 +49,7 @@ See [../../config.full.toml](../../config.full.toml) for a complete example.
 | `mode` | `hybrid` | `hybrid` is the default; `per-command` and `stateful` remain available explicit modes |
 | `backend_selection` | `least-loaded` | Or `weighted-round-robin` |
 | `adaptive_precheck` | `false` | Adaptive availability precheck for `STAT`/`HEAD` |
+| `lower_tier_stat_prefetch` | `"first-attempt"` | Background `STAT` probes that `ARTICLE`/`BODY` send to tier >0 backends with `stat_missing` enabled, so a primary-tier `430` can skip lower-tier misses. `"first-attempt"` probes each eligible lower-tier backend once per request, `"after-primary-miss"` probes only when the availability index already records a tier-0 `430` for the message ID, and `"off"` never prefetches. The retry `STAT` sweep after a primary-tier `430` runs in every mode. Consider `"off"` or `"after-primary-miss"` when the primary tier rarely misses and lower-tier pools are small. |
 
 ### `[routing.queue.backpressure]`
 

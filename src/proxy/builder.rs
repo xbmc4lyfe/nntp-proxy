@@ -183,6 +183,7 @@ impl NntpProxyBuilder {
 
         let adaptive_precheck = self.config.routing.adaptive_precheck;
         let queue_backpressure = self.config.routing.queue.backpressure.clone();
+        let lower_tier_stat_prefetch = self.config.routing.lower_tier_stat_prefetch;
 
         let backend_strategy = self.config.routing.backend_selection;
         let cache_config = self.config.cache;
@@ -208,7 +209,8 @@ impl NntpProxyBuilder {
                         .limits()
                         .expect("config validation establishes queue-pressure limits"),
                     queue_backpressure.all_busy_sleep_ms,
-                );
+                )
+                .with_lower_tier_stat_prefetch(lower_tier_stat_prefetch);
             for (idx, provider) in connection_providers.iter().enumerate() {
                 let backend_id = r.add_backend_with_slot(
                     servers[idx].name.clone(),
@@ -477,6 +479,20 @@ mod tests {
 
         assert_eq!(proxy.servers().len(), 3);
         assert_eq!(proxy.router.backend_count(), 3);
+    }
+
+    #[test]
+    fn test_builder_applies_lower_tier_stat_prefetch_to_router() {
+        let mut config = create_test_config();
+        config.routing.lower_tier_stat_prefetch = crate::config::LowerTierStatPrefetch::Off;
+        let proxy = NntpProxyBuilder::new(config)
+            .build_sync()
+            .expect("Failed to build proxy");
+
+        assert_eq!(
+            proxy.router.lower_tier_stat_prefetch(),
+            crate::config::LowerTierStatPrefetch::Off
+        );
     }
 
     #[test]

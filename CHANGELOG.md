@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `[routing].lower_tier_stat_prefetch` controls the background lower-tier `STAT` probes for `ARTICLE`/`BODY`: `"first-attempt"` (default), `"after-primary-miss"`, or `"off"`. The probes are overhead on small lower-tier pools when the primary tier rarely misses.
+
+### Fixed
+
+- An `ARTICLE`/`BODY` request sends at most one background `STAT` probe to each lower-tier backend. The probes were dispatched both before routing and again on the first backend attempt.
+
 ## [0.6.0] - 2026-11-05
 
 ### Added

@@ -73,7 +73,7 @@ Add a `[[servers]]` entry for each backend, with its own credentials, TLS settin
 
 For an article lookup, the proxy tries the next tier after every eligible server in the current tier has returned `430`. A remaining server in the current tier is tried first. A busy server, or a server that fails for that attempt, does not move the lookup to the next tier.
 
-Hybrid routing is the default. Independent commands share backend connections, and a command that needs reader state, such as `GROUP`, switches that client to a dedicated backend. `stateful` dedicates a backend connection from the start. `per-command` is for stateless commands such as `ARTICLE <message-id>`. `per-command` rejects a command that needs reader state. Select either explicit mode with `--routing-mode <MODE>`. See [Runtime and routing](docs/operator/runtime-and-routing.md). Selection and queue settings are in [Configuration](docs/operator/configuration.md).
+Hybrid routing is the default. Independent commands share backend connections, and a command that needs reader state, such as `GROUP`, switches that client to a dedicated backend. `stateful` dedicates a backend connection from the start. `per-command` is for stateless commands such as `ARTICLE <message-id>`. `per-command` rejects a command that needs reader state. Select either explicit mode with `--routing-mode <MODE>`. See [Runtime and routing](docs/operator/runtime-and-routing.md). Selection, queue, and lower-tier `STAT` prefetch settings are in [Configuration](docs/operator/configuration.md).
 
 ## Caching
 

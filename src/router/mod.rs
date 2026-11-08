@@ -45,7 +45,7 @@ use std::time::Duration;
 use tracing::{debug, info};
 
 use crate::cache::{ArticleAvailability, AvailabilityMask, AvailabilitySlot};
-use crate::config::{BackendSelectionStrategy, QueuePressureLimits};
+use crate::config::{BackendSelectionStrategy, LowerTierStatPrefetch, QueuePressureLimits};
 use crate::pool::DeadpoolConnectionProvider;
 use crate::types::{BackendId, ClientId, ServerName};
 use strategies::{LeastLoaded, WeightedRoundRobin};
@@ -486,6 +486,8 @@ pub struct BackendSelector {
     queue_backpressure_limits: QueuePressureLimits,
     /// Delay to apply when all eligible backends in a tier are hard-saturated.
     queue_backpressure_all_busy_sleep_ms: u64,
+    /// When ARTICLE/BODY requests probe lower tiers with background STATs.
+    lower_tier_stat_prefetch: LowerTierStatPrefetch,
 }
 
 impl Default for BackendSelector {
@@ -582,7 +584,28 @@ impl BackendSelector {
             queue_backpressure_limits: QueuePressureLimits::default(),
             queue_backpressure_all_busy_sleep_ms:
                 Self::DEFAULT_QUEUE_BACKPRESSURE_ALL_BUSY_SLEEP_MS,
+            lower_tier_stat_prefetch: LowerTierStatPrefetch::default(),
         }
+    }
+
+    /// Configure background lower-tier STAT probes for ARTICLE/BODY requests.
+    #[must_use]
+    pub const fn with_lower_tier_stat_prefetch(mut self, policy: LowerTierStatPrefetch) -> Self {
+        self.lower_tier_stat_prefetch = policy;
+        self
+    }
+
+    #[inline]
+    pub(crate) const fn lower_tier_stat_prefetch(&self) -> LowerTierStatPrefetch {
+        self.lower_tier_stat_prefetch
+    }
+
+    /// Whether the availability facts already show a tier-0 backend returning `430`.
+    pub(crate) fn has_primary_tier_miss(&self, availability: &ArticleAvailability) -> bool {
+        self.backend_ids_in_tier(0).any(|backend_id| {
+            self.availability_slot(backend_id)
+                .is_some_and(|slot| availability.is_missing_slot(slot))
+        })
     }
 
     /// Configure queue-pressure routing behavior.
