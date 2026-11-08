@@ -275,6 +275,7 @@ impl ClientSession {
 
         let mut availability = availability.unwrap_or_default();
         let mut unavailable_backends = SuppressedBackends::empty();
+        let budget = router.article_admission().start_request();
         let mut is_retry_attempt = false;
         let mut non_primary_tier_prefetch_started = false;
         let mut retry_stat_sweep_done = false;
@@ -305,6 +306,7 @@ impl ClientSession {
                         client_to_backend_bytes: io.client_to_backend_bytes,
                         backend_connection: io.backend_connection,
                         unavailable_backends: &mut unavailable_backends,
+                        budget,
                     },
                 )
                 .await?;
@@ -321,6 +323,7 @@ impl ClientSession {
                         client_to_backend_bytes: io.client_to_backend_bytes,
                         backend_connection: io.backend_connection,
                         unavailable_backends: &mut unavailable_backends,
+                        budget,
                     },
                     is_retry_attempt,
                 )
@@ -345,6 +348,10 @@ impl ClientSession {
                 Ok(BackendAttemptResult::BackendUnavailable) => {
                     is_retry_attempt = true;
                 }
+                // Answer as for an exhausted lookup so the client stops
+                // waiting. No miss was recorded for the backends left
+                // untried, so a later request still tries them.
+                Ok(BackendAttemptResult::DeadlineExpired) => break,
                 Ok(BackendAttemptResult::NoRetryableBackend) => {
                     let bytes_written = {
                         let client_write = io.client_writer.get_mut();

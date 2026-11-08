@@ -181,8 +181,16 @@ impl NntpProxyBuilder {
             None => MetricsCollector::new(self.config.servers.len()),
         };
 
+        metrics.attach_backend_loads(
+            connection_providers
+                .iter()
+                .map(DeadpoolConnectionProvider::load)
+                .collect(),
+        );
+
         let adaptive_precheck = self.config.routing.adaptive_precheck;
         let queue_backpressure = self.config.routing.queue.backpressure.clone();
+        let article_admission = self.config.routing.article.admission();
 
         let backend_strategy = self.config.routing.backend_selection;
         let cache_config = self.config.cache;
@@ -208,7 +216,8 @@ impl NntpProxyBuilder {
                         .limits()
                         .expect("config validation establishes queue-pressure limits"),
                     queue_backpressure.all_busy_sleep_ms,
-                );
+                )
+                .with_article_admission(article_admission);
             for (idx, provider) in connection_providers.iter().enumerate() {
                 let backend_id = r.add_backend_with_slot(
                     servers[idx].name.clone(),

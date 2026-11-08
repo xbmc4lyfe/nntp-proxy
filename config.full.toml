@@ -47,6 +47,18 @@ hard_waiters_per_connection_percent = 50
 # in the preferred tier is above the hard threshold.
 all_busy_sleep_ms = 1
 
+# Time limits for ARTICLE/BODY/HEAD/STAT lookups by message-id.
+[routing.article]
+# Total time one client request may spend across all backends before the proxy
+# answers 430. 0 disables the deadline. Set the client's article timeout just above.
+deadline_ms = 20000
+# Longest one attempt waits for a free connection on a backend.
+checkout_wait_ms = 3000
+# Skip a backend without queueing when its estimated connection wait is longer
+# than backlog_skip_percent of the attempt's wait.
+backlog_skip = true
+backlog_skip_percent = 100
+
 # Memory Configuration
 # These settings affect transport buffers and buffer pools, not article storage.
 [memory]

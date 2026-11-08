@@ -7,9 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `[routing.article]` options for article lookups: `deadline_ms` (default 20 s) bounds the total time one request spends across all backends before the proxy answers `430`, and `checkout_wait_ms` (default 3 s) sets the per-backend connection wait that was fixed before.
+- Backlog skipping (`backlog_skip`, `backlog_skip_percent`): a backend whose connection queue would not serve the request within its wait is skipped at once instead of queued on. Under heavy client load, small fallback pools could hold hundreds of waiters, each sitting out the full wait before failing. A skipped backend is not recorded as missing the article.
+- Per-backend `admission` counters in the stats file: backlog skips, checkout timeouts, deadline expiries, and the service-time average.
+
+### Changed
+
+- Busy-backend skips and checkout timeouts are summarised at `info` once per backend every 10 seconds instead of a `WARN` per request. Under heavy load the per-request warnings could reach tens of thousands within minutes.
+
 ### Fixed
 
-- Under load, a missing article could take 12–44 s to answer `430`, longer than NZBGet's 30-second article timeout, so the downloader recorded timeouts and blocked the server. Article requests now wait at most 3 s for a free connection on a backend, and `STAT` probes at most 2 s, before moving to the next backend. Previously each request waited the full 10-second pool timeout. A full pool is also no longer retried, which had doubled each wait.
+- Under load, a missing article could take 12–44 s to answer `430`, longer than a typical 30-second client article timeout, so the downloader recorded timeouts and blocked the server. Article requests now wait at most 3 s for a free connection on a backend, and `STAT` probes at most 2 s, before moving to the next backend. Previously each request waited the full 10-second pool timeout. A full pool is also no longer retried, which had doubled each wait.
 
 ## [0.6.0] - 2026-11-05
 

@@ -216,6 +216,9 @@ pub struct Routing {
     /// Queue behavior for routing decisions.
     #[serde(default)]
     pub queue: RoutingQueue,
+    /// Time limits for article lookups across backends.
+    #[serde(default)]
+    pub article: RoutingArticle,
 }
 
 impl Default for Routing {
@@ -225,7 +228,66 @@ impl Default for Routing {
             backend_selection: BackendSelectionStrategy::default(),
             adaptive_precheck: defaults::adaptive_precheck(),
             queue: RoutingQueue::default(),
+            article: RoutingArticle::default(),
         }
+    }
+}
+
+/// Time limits for `ARTICLE`/`BODY`/`HEAD`/`STAT` lookups by message-id.
+///
+/// Milliseconds rather than whole seconds so an experiment can try
+/// sub-second checkout waits without a rebuild.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct RoutingArticle {
+    /// Total time one client request may spend across all backend attempts
+    /// before the proxy answers `430`. `0` disables the deadline.
+    #[serde(default = "super::defaults::article_deadline_ms")]
+    pub deadline_ms: u64,
+    /// Longest one attempt waits for a free connection on a backend before
+    /// trying the next one. Must be greater than zero.
+    #[serde(default = "super::defaults::article_checkout_wait_ms")]
+    pub checkout_wait_ms: u64,
+    /// Skip a backend at once, without queueing, when its estimated
+    /// connection wait is longer than the attempt can wait.
+    #[serde(default = "super::defaults::article_backlog_skip")]
+    pub backlog_skip: bool,
+    /// Skip when the estimated wait exceeds this percentage of the attempt's
+    /// wait. Lower values skip sooner. Must be greater than zero.
+    #[serde(default = "super::defaults::article_backlog_skip_percent")]
+    pub backlog_skip_percent: u16,
+}
+
+impl Default for RoutingArticle {
+    fn default() -> Self {
+        Self {
+            deadline_ms: defaults::article_deadline_ms(),
+            checkout_wait_ms: defaults::article_checkout_wait_ms(),
+            backlog_skip: defaults::article_backlog_skip(),
+            backlog_skip_percent: defaults::article_backlog_skip_percent(),
+        }
+    }
+}
+
+impl RoutingArticle {
+    /// Routing limits for the router. Call after [`Config::validate`].
+    #[must_use]
+    pub fn admission(&self) -> crate::pool::admission::ArticleAdmission {
+        use crate::pool::admission::{ArticleAdmission, BacklogPolicy};
+        let deadline =
+            (self.deadline_ms > 0).then(|| std::time::Duration::from_millis(self.deadline_ms));
+        let backlog = if self.backlog_skip {
+            BacklogPolicy::SkipAbove {
+                percent: self.backlog_skip_percent,
+            }
+        } else {
+            BacklogPolicy::Queue
+        };
+        ArticleAdmission::new(
+            deadline,
+            std::time::Duration::from_millis(self.checkout_wait_ms),
+            backlog,
+        )
     }
 }
 

@@ -48,6 +48,8 @@ pub(super) enum BackendAttemptResult {
     BackendUnavailable,
     /// No backend is retryable without violating tier or availability rules.
     NoRetryableBackend,
+    /// The request used its whole deadline before a backend answered.
+    DeadlineExpired,
 }
 
 /// Mutable state for an article backend attempt loop
@@ -59,6 +61,7 @@ pub(super) struct ArticleAttemptState<'a> {
     pub client_to_backend_bytes: &'a mut ClientToBackendBytes,
     pub backend_connection: &'a mut Option<BackendLease>,
     pub unavailable_backends: &'a mut SuppressedBackends,
+    pub budget: crate::pool::admission::ArticleBudget,
 }
 
 #[derive(Clone, Copy)]
@@ -104,6 +107,14 @@ impl AuthoritativeArticleMissing {
 }
 
 type BackendTimings = (u64, u64, u64);
+
+/// Where an attempt gets its backend connection: the client's cached batch
+/// lease when it is for the same backend, otherwise a pool checkout bounded by
+/// `budget`.
+pub(super) struct BackendAttemptConnection<'a> {
+    pub(super) lease: &'a mut Option<BackendLease>,
+    pub(super) budget: crate::pool::admission::CheckoutBudget,
+}
 
 /// Parameters describing the response to write to the client
 #[derive(Clone, Copy)]
@@ -327,11 +338,19 @@ impl ClientSession {
         else {
             return Ok(BackendAttemptResult::BackendUnavailable);
         };
+        if state.budget.is_expired() {
+            return Ok(self.article_deadline_expired(provider, backend_id, request));
+        }
 
         let Some(attempt) = self
             .prepare_backend_attempt(provider, &backend, request, state, is_retry_attempt)
             .await?
         else {
+            // A checkout cut short by the deadline ends the request here, so
+            // the expiry is counted against the backend that used it up.
+            if state.budget.is_expired() {
+                return Ok(self.article_deadline_expired(provider, backend_id, request));
+            }
             return Ok(BackendAttemptResult::BackendUnavailable);
         };
 
@@ -394,6 +413,23 @@ impl ClientSession {
         Ok(BackendAttemptResult::Success)
     }
 
+    fn article_deadline_expired(
+        &self,
+        provider: &crate::pool::DeadpoolConnectionProvider,
+        backend_id: BackendId,
+        request: &RequestContext,
+    ) -> BackendAttemptResult {
+        provider.note_deadline_expiry();
+        debug!(
+            client = %self.client_addr,
+            backend = backend_id.as_index(),
+            command_verb = ?request.verb(),
+            msg_id = ?request.message_id_value(),
+            "Article request deadline expired before a backend answered"
+        );
+        BackendAttemptResult::DeadlineExpired
+    }
+
     pub(super) async fn parallel_retry_stat_sweep(
         &self,
         router: &Arc<BackendSelector>,
@@ -413,6 +449,10 @@ impl ClientSession {
         let Some(stat_request) = Self::stat_probe_request(request) else {
             return Ok(());
         };
+        if state.budget.is_expired() {
+            return Ok(());
+        }
+        let probe_budget = state.budget.probe();
 
         let mut candidates = Vec::new();
         for tier in router.tiers() {
@@ -443,12 +483,7 @@ impl ClientSession {
             let stat_request = stat_request.clone_for_background_probe();
             probes.push(async move {
                 let _guard = BackendSelector::guard_for_manual_backend(router, backend_id);
-                let conn = match provider
-                    .checkout_connection_guard_within(
-                        crate::constants::pool::STAT_PROBE_CHECKOUT_WAIT,
-                    )
-                    .await
-                {
+                let conn = match provider.checkout_for_attempt(probe_budget).await {
                     Ok(conn) => conn.activate(),
                     Err(_) => return RetryStatProbeOutcome::Unavailable(backend_id),
                 };
@@ -552,6 +587,7 @@ impl ClientSession {
         if candidates.is_empty() {
             return;
         }
+        let probe_budget = router.article_admission().probe();
 
         let router = Arc::clone(router);
         let cache = Arc::clone(&self.cache);
@@ -569,12 +605,7 @@ impl ClientSession {
                         .availability_slot(backend_id)
                         .expect("probe backend is registered");
                     let _guard = BackendSelector::guard_for_manual_backend(router, backend_id);
-                    let conn = match provider
-                        .checkout_connection_guard_within(
-                            crate::constants::pool::STAT_PROBE_CHECKOUT_WAIT,
-                        )
-                        .await
-                    {
+                    let conn = match provider.checkout_for_attempt(probe_budget).await {
                         Ok(conn) => conn.activate(),
                         Err(_) => return,
                     };
@@ -650,7 +681,10 @@ impl ClientSession {
                 provider,
                 backend,
                 request,
-                state.backend_connection,
+                BackendAttemptConnection {
+                    lease: state.backend_connection,
+                    budget: state.budget.checkout(),
+                },
                 is_retry_attempt,
             )
             .await,
@@ -957,8 +991,12 @@ impl ClientSession {
         provider: &crate::pool::DeadpoolConnectionProvider,
         backend_id: crate::types::BackendId,
         request: &RequestContext,
-        backend_connection: &mut Option<BackendLease>,
+        connection: BackendAttemptConnection<'_>,
     ) -> Result<crate::pool::ConnectionGuard> {
+        let BackendAttemptConnection {
+            lease: backend_connection,
+            budget,
+        } = connection;
         let checkout_status = provider.status_counts();
         let can_expand_or_use_idle =
             checkout_status.available > 0 || checkout_status.size < checkout_status.max_size;
@@ -994,12 +1032,7 @@ impl ClientSession {
                         pool_waiting = checkout_status.waiting,
                         "Requesting pooled connection after retiring unhealthy cached batch connection"
                     );
-                    provider
-                        .checkout_connection_guard_within(
-                            crate::constants::pool::ARTICLE_CHECKOUT_WAIT,
-                        )
-                        .await?
-                        .activate()
+                    provider.checkout_for_attempt(budget).await?.activate()
                 } else if can_expand_or_use_idle {
                     debug!(
                         client = %self.client_addr,
@@ -1016,12 +1049,7 @@ impl ClientSession {
                         "Using idle pool capacity before reusing cached batch connection"
                     );
                     *backend_connection = Some(BackendLease::new(cached_backend_id, guard));
-                    match provider
-                        .checkout_connection_guard_within(
-                            crate::constants::pool::ARTICLE_CHECKOUT_WAIT,
-                        )
-                        .await
-                    {
+                    match provider.checkout_for_attempt(budget).await {
                         Ok(conn) => conn.activate(),
                         Err(err) => {
                             debug!(
@@ -1086,10 +1114,7 @@ impl ClientSession {
                     pool_waiting = checkout_status.waiting,
                     "Requesting pooled connection after backend switch"
                 );
-                let conn = provider
-                    .checkout_connection_guard_within(crate::constants::pool::ARTICLE_CHECKOUT_WAIT)
-                    .await?
-                    .activate();
+                let conn = provider.checkout_for_attempt(budget).await?.activate();
                 let checkout_status = provider.status_counts();
                 trace!(
                     client = %self.client_addr,
@@ -1121,10 +1146,7 @@ impl ClientSession {
                     pool_waiting = checkout_status.waiting,
                     "Requesting pooled connection"
                 );
-                let conn = provider
-                    .checkout_connection_guard_within(crate::constants::pool::ARTICLE_CHECKOUT_WAIT)
-                    .await?
-                    .activate();
+                let conn = provider.checkout_for_attempt(budget).await?.activate();
                 let checkout_status = provider.status_counts();
                 trace!(
                     client = %self.client_addr,
@@ -1157,12 +1179,12 @@ impl ClientSession {
         provider: &crate::pool::DeadpoolConnectionProvider,
         backend: &ArticleBackend,
         request: &RequestContext,
-        backend_connection: &mut Option<BackendLease>,
+        connection: BackendAttemptConnection<'_>,
         stat_probe_retry_only: bool,
     ) -> Result<PreparedBackendAttempt<'_>> {
         let backend_id = backend.backend_id();
         let guard = self
-            .checkout_direct_backend_connection(provider, backend_id, request, backend_connection)
+            .checkout_direct_backend_connection(provider, backend_id, request, connection)
             .await?;
         trace!(
             client = %self.client_addr,
@@ -1693,12 +1715,16 @@ impl ClientSession {
     }
 }
 
-/// A full pool is still full a few milliseconds later, so retrying the same
-/// backend only doubles the wait; the router should move on to another one.
+/// A full or backlogged pool is still busy a few milliseconds later, so
+/// retrying the same backend only adds another wait; the router should move on
+/// to another one.
 fn is_busy_backend(error: &anyhow::Error) -> bool {
     matches!(
         error.downcast_ref::<crate::connection_error::ConnectionError>(),
-        Some(crate::connection_error::ConnectionError::PoolExhausted { .. })
+        Some(
+            crate::connection_error::ConnectionError::PoolExhausted { .. }
+                | crate::connection_error::ConnectionError::Backlogged { .. }
+        )
     )
 }
 
@@ -1721,7 +1747,8 @@ mod tests {
     use crate::session::SessionError;
     use crate::session::routing::CacheAction;
     use crate::types::{
-        BackendId, BufferSize, ClientAddress, ClientToBackendBytes, MessageId, ServerName,
+        BackendId, BackendToClientBytes, BufferSize, ClientAddress, ClientToBackendBytes,
+        MessageId, ServerName,
     };
     use std::pin::Pin;
     use std::sync::Arc;
@@ -2229,6 +2256,7 @@ mod tests {
             client_to_backend_bytes: &mut client_to_backend_bytes,
             backend_connection: &mut backend_connection,
             unavailable_backends: &mut unavailable_backends,
+            budget: crate::pool::admission::ArticleAdmission::default().start_request(),
         };
 
         let result = tokio::time::timeout(
@@ -2277,6 +2305,7 @@ mod tests {
             client_to_backend_bytes: &mut client_to_backend_bytes,
             backend_connection: &mut backend_connection,
             unavailable_backends: &mut unavailable_backends,
+            budget: crate::pool::admission::ArticleAdmission::default().start_request(),
         };
 
         let result = session
@@ -2328,6 +2357,7 @@ mod tests {
             client_to_backend_bytes: &mut client_to_backend_bytes,
             backend_connection: &mut backend_connection,
             unavailable_backends: &mut unavailable_backends,
+            budget: crate::pool::admission::ArticleAdmission::default().start_request(),
         };
 
         session
@@ -2377,6 +2407,7 @@ mod tests {
             client_to_backend_bytes: &mut client_to_backend_bytes,
             backend_connection: &mut backend_connection,
             unavailable_backends: &mut unavailable_backends,
+            budget: crate::pool::admission::ArticleAdmission::default().start_request(),
         };
 
         session
@@ -2435,6 +2466,7 @@ mod tests {
             client_to_backend_bytes: &mut client_to_backend_bytes,
             backend_connection: &mut backend_connection,
             unavailable_backends: &mut unavailable_backends,
+            budget: crate::pool::admission::ArticleAdmission::default().start_request(),
         };
 
         tokio::time::timeout(
@@ -2601,7 +2633,12 @@ mod tests {
                 &provider,
                 backend_id,
                 &request,
-                &mut backend_connection,
+                super::BackendAttemptConnection {
+                    lease: &mut backend_connection,
+                    budget: crate::pool::admission::ArticleAdmission::default()
+                        .start_request()
+                        .checkout(),
+                },
             )
             .await
             .expect("checkout should recover with a fresh pooled connection");
@@ -2636,6 +2673,7 @@ mod tests {
             client_to_backend_bytes: &mut client_to_backend_bytes,
             backend_connection: &mut backend_connection,
             unavailable_backends: &mut unavailable_backends,
+            budget: crate::pool::admission::ArticleAdmission::default().start_request(),
         };
 
         let result = session
@@ -2712,6 +2750,7 @@ mod tests {
             client_to_backend_bytes: &mut client_to_backend_bytes,
             backend_connection: &mut backend_connection,
             unavailable_backends: &mut unavailable_backends,
+            budget: crate::pool::admission::ArticleAdmission::default().start_request(),
         };
 
         let result = tokio::time::timeout(
@@ -2757,6 +2796,7 @@ mod tests {
             client_to_backend_bytes: &mut client_to_backend_bytes,
             backend_connection: &mut backend_connection,
             unavailable_backends: &mut unavailable_backends,
+            budget: crate::pool::admission::ArticleAdmission::default().start_request(),
         };
 
         let started = std::time::Instant::now();
@@ -2772,6 +2812,148 @@ mod tests {
         );
         assert_eq!(availability.missing_bits(), 0, "busy is not a 430 fact");
         assert_eq!(unavailable_backends.bits(), 0b0000_0001);
+    }
+
+    #[tokio::test]
+    async fn backlogged_small_pool_is_skipped_without_waiting() {
+        let session = test_session();
+        let (small_port, small_accepts) = spawn_greeting_server().await;
+        let small = DeadpoolConnectionProvider::builder("127.0.0.1", small_port)
+            .max_connections(1)
+            .build()
+            .unwrap();
+        let _held = small.checkout_connection_guard().await.unwrap();
+        // One connection that takes 10 s per command cannot serve a new
+        // checkout within the 3 s article checkout wait.
+        small.record_service_time(Duration::from_secs(10));
+        let good_response = b"222 0 <found@example.com> body follows\r\npayload\r\n.\r\n";
+        let (good_port, good_article_commands) = spawn_article_response_server(good_response).await;
+        let router = router_with_tiered_backends([
+            (small.clone(), 0),
+            (
+                DeadpoolConnectionProvider::builder("127.0.0.1", good_port)
+                    .max_connections(1)
+                    .build()
+                    .unwrap(),
+                0,
+            ),
+        ]);
+        let (mut client_writer, mut client_read, _client_write) = client_writer_pair().await;
+
+        let mut request = request_context(b"BODY <found@example.com>\r\n");
+        let mut availability = ArticleAvailability::new();
+        let mut client_to_backend_bytes = ClientToBackendBytes::zero();
+        let mut backend_connection = None;
+        let mut unavailable_backends = SuppressedBackends::empty();
+        let mut state = ArticleAttemptState {
+            availability: &mut availability,
+            client_to_backend_bytes: &mut client_to_backend_bytes,
+            backend_connection: &mut backend_connection,
+            unavailable_backends: &mut unavailable_backends,
+            budget: crate::pool::admission::ArticleAdmission::default().start_request(),
+        };
+
+        let started = std::time::Instant::now();
+        let first = session
+            .try_backend_for_article(&router, &mut request, &mut client_writer, &mut state, false)
+            .await
+            .expect("a backlogged backend is unavailable, not a session error");
+        assert!(matches!(first, BackendAttemptResult::BackendUnavailable));
+        assert_eq!(state.unavailable_backends.bits(), 0b0000_0001);
+        let second = session
+            .try_backend_for_article(&router, &mut request, &mut client_writer, &mut state, true)
+            .await
+            .expect("the next backend serves the article");
+        assert!(matches!(second, BackendAttemptResult::Success));
+
+        assert!(
+            started.elapsed() < crate::constants::pool::ARTICLE_CHECKOUT_WAIT / 3,
+            "a backlogged pool is skipped, not waited on: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(availability.missing_bits(), 0, "a skip is not a 430 fact");
+        assert_eq!(request.backend_id(), Some(BackendId::from_index(1)));
+        assert_eq!(good_article_commands.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            small_accepts.load(Ordering::SeqCst),
+            1,
+            "only the held connection"
+        );
+        let small_load = small.load().snapshot();
+        assert_eq!(small_load.backlog_skips, 1);
+        assert_eq!(small_load.busy_timeouts, 0);
+        assert_eq!(small.status_counts().waiting, 0, "the skip never queued");
+        finalize_backend_connection(&mut backend_connection);
+
+        let mut written = vec![0; good_response.len()];
+        tokio::time::timeout(Duration::from_secs(1), client_read.read_exact(&mut written))
+            .await
+            .expect("client response should be readable")
+            .expect("client read should succeed");
+        assert_eq!(written, good_response);
+    }
+
+    #[tokio::test]
+    async fn article_deadline_answers_430_in_bounded_time() {
+        let session = test_session();
+        let (port, _accepts) = spawn_greeting_server().await;
+        let provider = DeadpoolConnectionProvider::builder("127.0.0.1", port)
+            .max_connections(1)
+            .build()
+            .unwrap();
+        // A full pool with no service-time sample: nothing to skip on, so the
+        // request waits, and only its deadline can stop it early.
+        let _held = provider.checkout_connection_guard().await.unwrap();
+        let deadline = Duration::from_millis(300);
+        let mut router = BackendSelector::new().with_article_admission(
+            crate::pool::admission::ArticleAdmission::new(
+                Some(deadline),
+                crate::constants::pool::ARTICLE_CHECKOUT_WAIT,
+                crate::pool::admission::BacklogPolicy::SkipAbove { percent: 100 },
+            ),
+        );
+        router.add_backend(
+            ServerName::try_new("backend-0".to_string()).unwrap(),
+            provider.clone(),
+            0,
+        );
+        let router = Arc::new(router);
+        let (mut client_writer, client_read, _client_write) = client_writer_pair().await;
+
+        let mut request = request_context(b"BODY <deadline@example.com>\r\n");
+        let mut backend_connection = None;
+        let mut client_to_backend_bytes = ClientToBackendBytes::zero();
+        let mut backend_to_client_bytes = BackendToClientBytes::zero();
+        let started = std::time::Instant::now();
+        session
+            .route_and_execute_request(
+                Arc::clone(&router),
+                &mut request,
+                &mut client_writer,
+                &mut backend_connection,
+                &mut client_to_backend_bytes,
+                &mut backend_to_client_bytes,
+            )
+            .await
+            .expect("an expired deadline is answered, not a session error");
+        let elapsed = started.elapsed();
+
+        let mut line = String::new();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            BufReader::new(client_read).read_line(&mut line),
+        )
+        .await
+        .expect("client response should be readable")
+        .expect("client read should succeed");
+        let status = StatusCode::parse(line.as_bytes()).expect("response line has a status code");
+        assert_eq!(status.as_u16(), 430, "got {line:?}");
+        assert!(elapsed >= deadline, "the request waited for the backend");
+        assert!(
+            elapsed < crate::constants::pool::ARTICLE_CHECKOUT_WAIT / 2,
+            "the deadline, not the checkout wait, bounds the request: {elapsed:?}"
+        );
+        assert_eq!(provider.load().snapshot().deadline_expiries, 1);
     }
 
     #[tokio::test]
@@ -2795,6 +2977,7 @@ mod tests {
             client_to_backend_bytes: &mut client_to_backend_bytes,
             backend_connection: &mut backend_connection,
             unavailable_backends: &mut unavailable_backends,
+            budget: crate::pool::admission::ArticleAdmission::default().start_request(),
         };
 
         let result = tokio::time::timeout(
@@ -2852,6 +3035,7 @@ mod tests {
             client_to_backend_bytes: &mut client_to_backend_bytes,
             backend_connection: &mut backend_connection,
             unavailable_backends: &mut unavailable_backends,
+            budget: crate::pool::admission::ArticleAdmission::default().start_request(),
         };
 
         let first = session
@@ -2918,6 +3102,14 @@ mod tests {
                 client_to_backend_bytes: &mut client_to_backend_bytes,
                 backend_connection: &mut backend_connection,
                 unavailable_backends: &mut unavailable_backends,
+                // Two 10 s setup timeouts outlast the default 20 s request
+                // deadline; this test is about setup fallback, not the deadline.
+                budget: crate::pool::admission::ArticleAdmission::new(
+                    None,
+                    crate::constants::pool::ARTICLE_CHECKOUT_WAIT,
+                    crate::pool::admission::BacklogPolicy::Queue,
+                )
+                .start_request(),
             };
             let first = session
                 .try_backend_for_article(
@@ -3058,6 +3250,7 @@ mod tests {
             client_to_backend_bytes: &mut client_to_backend_bytes,
             backend_connection: &mut backend_connection,
             unavailable_backends: &mut unavailable_backends,
+            budget: crate::pool::admission::ArticleAdmission::default().start_request(),
         };
 
         let first = session
@@ -3173,6 +3366,7 @@ mod tests {
             client_to_backend_bytes: &mut client_to_backend_bytes,
             backend_connection: &mut backend_connection,
             unavailable_backends: &mut unavailable_backends,
+            budget: crate::pool::admission::ArticleAdmission::default().start_request(),
         };
 
         for (index, expected_mask) in [0b0000_0001, 0b0000_0011].into_iter().enumerate() {

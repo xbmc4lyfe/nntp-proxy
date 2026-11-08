@@ -486,6 +486,8 @@ pub struct BackendSelector {
     queue_backpressure_limits: QueuePressureLimits,
     /// Delay to apply when all eligible backends in a tier are hard-saturated.
     queue_backpressure_all_busy_sleep_ms: u64,
+    /// Deadline, checkout wait, and backlog skipping for article requests.
+    article_admission: crate::pool::admission::ArticleAdmission,
 }
 
 impl Default for BackendSelector {
@@ -582,7 +584,24 @@ impl BackendSelector {
             queue_backpressure_limits: QueuePressureLimits::default(),
             queue_backpressure_all_busy_sleep_ms:
                 Self::DEFAULT_QUEUE_BACKPRESSURE_ALL_BUSY_SLEEP_MS,
+            article_admission: crate::pool::admission::ArticleAdmission::default(),
         }
+    }
+
+    /// Configure article request deadlines and backlog skipping.
+    #[must_use]
+    pub const fn with_article_admission(
+        mut self,
+        admission: crate::pool::admission::ArticleAdmission,
+    ) -> Self {
+        self.article_admission = admission;
+        self
+    }
+
+    /// Deadline, checkout wait, and backlog skipping for article requests.
+    #[must_use]
+    pub const fn article_admission(&self) -> crate::pool::admission::ArticleAdmission {
+        self.article_admission
     }
 
     /// Configure queue-pressure routing behavior.
