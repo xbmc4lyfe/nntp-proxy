@@ -291,12 +291,43 @@ fn interval_ms() -> u64 {
     u64::try_from(SKIP_SUMMARY_INTERVAL.as_millis()).unwrap_or(u64::MAX)
 }
 
+/// Reply for an article request that ends before every eligible backend
+/// returned `430`: its deadline ran out, or every remaining backend was busy,
+/// skipped, or failed.
+///
+/// Downloaders treat the two codes differently. Many give up on
+/// an article on that server after `430` but retries it later after other
+/// errors, so the right choice is worth measuring rather than fixing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum UnavailableReply {
+    /// `430 No such article`.
+    #[serde(rename = "430")]
+    NoSuchArticle,
+    /// `503 Backend error`.
+    #[serde(rename = "503")]
+    BackendError,
+}
+
+impl UnavailableReply {
+    /// Wire bytes for this reply.
+    #[must_use]
+    pub const fn response(self) -> &'static [u8] {
+        match self {
+            Self::NoSuchArticle => crate::protocol::NO_SUCH_ARTICLE,
+            Self::BackendError => crate::protocol::BACKEND_ERROR,
+        }
+    }
+}
+
 /// Article routing limits from `[routing.article]`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ArticleAdmission {
     deadline: Option<Duration>,
     checkout_wait: Duration,
     backlog: BacklogPolicy,
+    /// `None` keeps the historical replies: `430` for an expired deadline and
+    /// `503` when no backend is left to try.
+    unavailable_reply: Option<UnavailableReply>,
 }
 
 impl Default for ArticleAdmission {
@@ -321,7 +352,31 @@ impl ArticleAdmission {
             deadline,
             checkout_wait,
             backlog,
+            unavailable_reply: None,
         }
+    }
+
+    /// Use `reply` both when the deadline expires and when no backend is left
+    /// to try. `None` keeps the default for each case.
+    #[must_use]
+    pub const fn with_unavailable_reply(mut self, reply: Option<UnavailableReply>) -> Self {
+        self.unavailable_reply = reply;
+        self
+    }
+
+    /// Reply when the request's deadline expires.
+    #[must_use]
+    pub fn deadline_reply(&self) -> UnavailableReply {
+        self.unavailable_reply
+            .unwrap_or(UnavailableReply::NoSuchArticle)
+    }
+
+    /// Reply when every backend still eligible for the request was busy,
+    /// skipped, or failed for this request, so none is left to try.
+    #[must_use]
+    pub fn no_backend_reply(&self) -> UnavailableReply {
+        self.unavailable_reply
+            .unwrap_or(UnavailableReply::BackendError)
     }
 
     /// Start the clock for one client article request.
@@ -596,6 +651,22 @@ mod tests {
         tokio::time::advance(Duration::from_secs(1)).await;
         assert!(budget.is_expired());
         assert_eq!(budget.checkout().wait(), Duration::ZERO);
+    }
+
+    #[test]
+    fn unavailable_reply_defaults_per_case_and_overrides_both() {
+        let default = ArticleAdmission::default();
+        assert_eq!(default.deadline_reply(), UnavailableReply::NoSuchArticle);
+        assert_eq!(default.no_backend_reply(), UnavailableReply::BackendError);
+
+        for reply in [
+            UnavailableReply::NoSuchArticle,
+            UnavailableReply::BackendError,
+        ] {
+            let set = default.with_unavailable_reply(Some(reply));
+            assert_eq!(set.deadline_reply(), reply);
+            assert_eq!(set.no_backend_reply(), reply);
+        }
     }
 
     #[tokio::test(start_paused = true)]

@@ -2893,41 +2893,19 @@ mod tests {
         assert_eq!(written, good_response);
     }
 
-    #[tokio::test]
-    async fn article_deadline_answers_430_in_bounded_time() {
+    /// Route one request through the full article retry loop and return the
+    /// status the client received with how long the request took.
+    async fn route_and_read_status(router: &Arc<BackendSelector>, line: &[u8]) -> (u16, Duration) {
         let session = test_session();
-        let (port, _accepts) = spawn_greeting_server().await;
-        let provider = DeadpoolConnectionProvider::builder("127.0.0.1", port)
-            .max_connections(1)
-            .build()
-            .unwrap();
-        // A full pool with no service-time sample: nothing to skip on, so the
-        // request waits, and only its deadline can stop it early.
-        let _held = provider.checkout_connection_guard().await.unwrap();
-        let deadline = Duration::from_millis(300);
-        let mut router = BackendSelector::new().with_article_admission(
-            crate::pool::admission::ArticleAdmission::new(
-                Some(deadline),
-                crate::constants::pool::ARTICLE_CHECKOUT_WAIT,
-                crate::pool::admission::BacklogPolicy::SkipAbove { percent: 100 },
-            ),
-        );
-        router.add_backend(
-            ServerName::try_new("backend-0".to_string()).unwrap(),
-            provider.clone(),
-            0,
-        );
-        let router = Arc::new(router);
         let (mut client_writer, client_read, _client_write) = client_writer_pair().await;
-
-        let mut request = request_context(b"BODY <deadline@example.com>\r\n");
+        let mut request = request_context(line);
         let mut backend_connection = None;
         let mut client_to_backend_bytes = ClientToBackendBytes::zero();
         let mut backend_to_client_bytes = BackendToClientBytes::zero();
         let started = std::time::Instant::now();
         session
             .route_and_execute_request(
-                Arc::clone(&router),
+                Arc::clone(router),
                 &mut request,
                 &mut client_writer,
                 &mut backend_connection,
@@ -2935,25 +2913,157 @@ mod tests {
                 &mut backend_to_client_bytes,
             )
             .await
-            .expect("an expired deadline is answered, not a session error");
+            .expect("the request is answered, not a session error");
         let elapsed = started.elapsed();
+        finalize_backend_connection(&mut backend_connection);
 
-        let mut line = String::new();
+        let mut status_line = String::new();
         tokio::time::timeout(
             Duration::from_secs(1),
-            BufReader::new(client_read).read_line(&mut line),
+            BufReader::new(client_read).read_line(&mut status_line),
         )
         .await
         .expect("client response should be readable")
         .expect("client read should succeed");
-        let status = StatusCode::parse(line.as_bytes()).expect("response line has a status code");
-        assert_eq!(status.as_u16(), 430, "got {line:?}");
-        assert!(elapsed >= deadline, "the request waited for the backend");
+        let status =
+            StatusCode::parse(status_line.as_bytes()).expect("response line has a status code");
+        (status.as_u16(), elapsed)
+    }
+
+    fn router_with_admission(
+        provider: DeadpoolConnectionProvider,
+        admission: crate::pool::admission::ArticleAdmission,
+    ) -> Arc<BackendSelector> {
+        let mut router = BackendSelector::new().with_article_admission(admission);
+        router.add_backend(
+            ServerName::try_new("backend-0".to_string()).unwrap(),
+            provider,
+            0,
+        );
+        Arc::new(router)
+    }
+
+    const SHORT_DEADLINE: Duration = Duration::from_millis(300);
+
+    fn short_deadline_admission() -> crate::pool::admission::ArticleAdmission {
+        crate::pool::admission::ArticleAdmission::new(
+            Some(SHORT_DEADLINE),
+            crate::constants::pool::ARTICLE_CHECKOUT_WAIT,
+            crate::pool::admission::BacklogPolicy::SkipAbove { percent: 100 },
+        )
+    }
+
+    /// A full pool with no service-time sample: nothing to skip on, so the
+    /// request waits, and only its deadline can stop it early.
+    async fn full_unsampled_pool() -> DeadpoolConnectionProvider {
+        let (port, _accepts) = spawn_greeting_server().await;
+        let provider = DeadpoolConnectionProvider::builder("127.0.0.1", port)
+            .max_connections(1)
+            .build()
+            .unwrap();
+        std::mem::forget(provider.checkout_connection_guard().await.unwrap());
+        provider
+    }
+
+    /// A full pool whose single connection takes 10 s per command, so a
+    /// checkout is skipped as backlogged at once.
+    async fn backlogged_pool() -> DeadpoolConnectionProvider {
+        let provider = full_unsampled_pool().await;
+        provider.record_service_time(Duration::from_secs(10));
+        provider
+    }
+
+    #[tokio::test]
+    async fn article_deadline_answers_430_in_bounded_time() {
+        let provider = full_unsampled_pool().await;
+        let router = router_with_admission(provider.clone(), short_deadline_admission());
+
+        let (status, elapsed) =
+            route_and_read_status(&router, b"BODY <deadline@example.com>\r\n").await;
+
+        assert_eq!(status, 430);
+        assert!(
+            elapsed >= SHORT_DEADLINE,
+            "the request waited for the backend"
+        );
         assert!(
             elapsed < crate::constants::pool::ARTICLE_CHECKOUT_WAIT / 2,
             "the deadline, not the checkout wait, bounds the request: {elapsed:?}"
         );
         assert_eq!(provider.load().snapshot().deadline_expiries, 1);
+    }
+
+    #[tokio::test]
+    async fn unavailable_reply_503_applies_to_an_expired_deadline() {
+        let provider = full_unsampled_pool().await;
+        let router = router_with_admission(
+            provider.clone(),
+            short_deadline_admission().with_unavailable_reply(Some(
+                crate::pool::admission::UnavailableReply::BackendError,
+            )),
+        );
+
+        let (status, elapsed) =
+            route_and_read_status(&router, b"BODY <deadline-503@example.com>\r\n").await;
+
+        assert_eq!(status, 503);
+        assert!(elapsed < crate::constants::pool::ARTICLE_CHECKOUT_WAIT / 2);
+        assert_eq!(provider.load().snapshot().deadline_expiries, 1);
+    }
+
+    #[tokio::test]
+    async fn every_backend_skipped_answers_503_by_default() {
+        let provider = backlogged_pool().await;
+        let router = router_with_admission(
+            provider.clone(),
+            crate::pool::admission::ArticleAdmission::default(),
+        );
+
+        let (status, elapsed) =
+            route_and_read_status(&router, b"BODY <all-busy@example.com>\r\n").await;
+
+        assert_eq!(status, 503, "unset keeps the historical reply");
+        assert!(elapsed < crate::constants::pool::ARTICLE_CHECKOUT_WAIT / 3);
+        assert_eq!(provider.load().snapshot().backlog_skips, 1);
+    }
+
+    #[tokio::test]
+    async fn unavailable_reply_430_applies_when_every_backend_is_skipped() {
+        let provider = backlogged_pool().await;
+        let router = router_with_admission(
+            provider.clone(),
+            crate::pool::admission::ArticleAdmission::default().with_unavailable_reply(Some(
+                crate::pool::admission::UnavailableReply::NoSuchArticle,
+            )),
+        );
+
+        let (status, elapsed) =
+            route_and_read_status(&router, b"BODY <all-busy-430@example.com>\r\n").await;
+
+        assert_eq!(status, 430);
+        assert!(elapsed < crate::constants::pool::ARTICLE_CHECKOUT_WAIT / 3);
+        assert_eq!(provider.load().snapshot().backlog_skips, 1);
+    }
+
+    #[tokio::test]
+    async fn authoritative_misses_answer_430_even_with_unavailable_reply_503() {
+        let (port, article_commands) =
+            spawn_article_response_server(b"430 No such article\r\n").await;
+        let provider = DeadpoolConnectionProvider::builder("127.0.0.1", port)
+            .max_connections(1)
+            .build()
+            .unwrap();
+        let router = router_with_admission(
+            provider,
+            crate::pool::admission::ArticleAdmission::default().with_unavailable_reply(Some(
+                crate::pool::admission::UnavailableReply::BackendError,
+            )),
+        );
+
+        let (status, _) = route_and_read_status(&router, b"BODY <missing@example.com>\r\n").await;
+
+        assert_eq!(status, 430, "a real miss on every backend is still a miss");
+        assert_eq!(article_commands.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

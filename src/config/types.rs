@@ -256,6 +256,12 @@ pub struct RoutingArticle {
     /// wait. Lower values skip sooner. Must be greater than zero.
     #[serde(default = "super::defaults::article_backlog_skip_percent")]
     pub backlog_skip_percent: u16,
+    /// Reply (`"430"` or `"503"`) when a request ends before every eligible
+    /// backend returned `430`: its deadline expired, or every remaining
+    /// backend was busy, skipped, or failed. Unset keeps `430` for an expired
+    /// deadline and `503` when no backend is left.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unavailable_reply: Option<crate::pool::admission::UnavailableReply>,
 }
 
 impl Default for RoutingArticle {
@@ -265,6 +271,7 @@ impl Default for RoutingArticle {
             checkout_wait_ms: defaults::article_checkout_wait_ms(),
             backlog_skip: defaults::article_backlog_skip(),
             backlog_skip_percent: defaults::article_backlog_skip_percent(),
+            unavailable_reply: None,
         }
     }
 }
@@ -288,6 +295,7 @@ impl RoutingArticle {
             std::time::Duration::from_millis(self.checkout_wait_ms),
             backlog,
         )
+        .with_unavailable_reply(self.unavailable_reply)
     }
 }
 
@@ -1028,6 +1036,37 @@ mod tests {
     use super::*;
 
     // RoutingMode tests
+    #[test]
+    fn routing_article_unavailable_reply_parses_and_defaults_to_unset() {
+        use crate::pool::admission::UnavailableReply;
+
+        let defaults: RoutingArticle = toml::from_str("").unwrap();
+        assert_eq!(defaults.unavailable_reply, None);
+        assert_eq!(
+            defaults.admission().deadline_reply(),
+            UnavailableReply::NoSuchArticle
+        );
+        assert_eq!(
+            defaults.admission().no_backend_reply(),
+            UnavailableReply::BackendError
+        );
+
+        let set: RoutingArticle = toml::from_str("unavailable_reply = \"503\"").unwrap();
+        assert_eq!(set.unavailable_reply, Some(UnavailableReply::BackendError));
+        assert_eq!(
+            set.admission().deadline_reply(),
+            UnavailableReply::BackendError
+        );
+
+        let set: RoutingArticle = toml::from_str("unavailable_reply = \"430\"").unwrap();
+        assert_eq!(
+            set.admission().no_backend_reply(),
+            UnavailableReply::NoSuchArticle
+        );
+
+        assert!(toml::from_str::<RoutingArticle>("unavailable_reply = \"500\"").is_err());
+    }
+
     #[test]
     fn test_routing_mode_default() {
         assert_eq!(RoutingMode::default(), RoutingMode::Hybrid);

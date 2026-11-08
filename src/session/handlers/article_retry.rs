@@ -244,19 +244,24 @@ impl ClientSession {
             .map_err(|e| SessionError::from(anyhow::Error::from(e)))
     }
 
-    async fn write_backend_error_response<W>(client_write: &mut W) -> Result<usize, SessionError>
-    where
-        W: AsyncWrite + Unpin,
-    {
+    /// Answer a request that ended before every eligible backend returned
+    /// `430`.
+    async fn write_unavailable_reply(
+        reply: crate::pool::admission::UnavailableReply,
+        io: &mut RequestExecutionIo<'_>,
+    ) -> Result<(), SessionError> {
+        let response = reply.response();
+        let client_write = io.client_writer.get_mut();
         client_write
-            .write_all(crate::protocol::BACKEND_ERROR)
+            .write_all(response)
             .await
             .map_err(|e| SessionError::from(anyhow::Error::from(e)))?;
         client_write
             .flush()
             .await
-            .map(|()| crate::protocol::BACKEND_ERROR.len())
-            .map_err(|e| SessionError::from(anyhow::Error::from(e)))
+            .map_err(|e| SessionError::from(anyhow::Error::from(e)))?;
+        *io.backend_to_client_bytes = io.backend_to_client_bytes.add(response.len());
+        Ok(())
     }
 
     async fn execute_article_retry_loop(
@@ -348,17 +353,21 @@ impl ClientSession {
                 Ok(BackendAttemptResult::BackendUnavailable) => {
                     is_retry_attempt = true;
                 }
-                // Answer as for an exhausted lookup so the client stops
-                // waiting. No miss was recorded for the backends left
-                // untried, so a later request still tries them.
-                Ok(BackendAttemptResult::DeadlineExpired) => break,
+                // No miss was recorded for the backends left untried, so a
+                // later request still tries them.
+                Ok(BackendAttemptResult::DeadlineExpired) => {
+                    return Self::write_unavailable_reply(
+                        router.article_admission().deadline_reply(),
+                        io,
+                    )
+                    .await;
+                }
                 Ok(BackendAttemptResult::NoRetryableBackend) => {
-                    let bytes_written = {
-                        let client_write = io.client_writer.get_mut();
-                        Self::write_backend_error_response(client_write).await?
-                    };
-                    *io.backend_to_client_bytes = io.backend_to_client_bytes.add(bytes_written);
-                    return Ok(());
+                    return Self::write_unavailable_reply(
+                        router.article_admission().no_backend_reply(),
+                        io,
+                    )
+                    .await;
                 }
                 Err(e @ SessionError::ClientDisconnect(_)) => {
                     debug!(

@@ -69,6 +69,7 @@ Time limits for `ARTICLE`, `BODY`, `HEAD`, and `STAT` lookups by message-id.
 | `checkout_wait_ms` | `3000` | Longest one attempt waits for a free connection on a backend, also cut to what is left of `deadline_ms` |
 | `backlog_skip` | `true` | Skip a backend at once, without queueing, when its estimated connection wait is too long |
 | `backlog_skip_percent` | `100` | Skip when the estimated wait is longer than this percentage of the attempt's wait. Lower values skip sooner |
+| `unavailable_reply` | unset | `"430"` or `"503"`: the reply when a request ends before every eligible backend returned `430`, either because `deadline_ms` ran out or because every remaining backend was busy, skipped, or failed. Unset answers `430` for an expired deadline and `503 Backend error` when no backend is left. A request that every eligible backend answered with `430` always gets `430` |
 
 The estimated wait is `(requests ahead in the pool queue) × (average time one
 command holds a connection) / (pool size)`. The average is a running mean of
@@ -81,6 +82,10 @@ A skipped or timed-out backend is unavailable for that request only. It is not
 recorded as missing the article, and the next request tries it again. As with
 any busy backend, a skip does not move the lookup to a lower-priority tier
 while another backend in the current tier has not answered `430`.
+
+Downloaders treat the two replies differently. a typical downloader stops
+trying an article on a server after `430` but retries it later after other
+errors, so `unavailable_reply` lets you compare both.
 
 Skips and checkout timeouts are summarised at `info` once per backend every
 10 seconds instead of logged per request.

@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `[routing.article]` options for article lookups: `deadline_ms` (default 20 s) bounds the total time one request spends across all backends before the proxy answers `430`, and `checkout_wait_ms` (default 3 s) sets the per-backend connection wait that was fixed before.
 - Backlog skipping (`backlog_skip`, `backlog_skip_percent`): a backend whose connection queue would not serve the request within its wait is skipped at once instead of queued on. Under heavy client load, small fallback pools could hold hundreds of waiters, each sitting out the full wait before failing. A skipped backend is not recorded as missing the article.
+- `[routing.article].unavailable_reply` (`"430"` or `"503"`) sets the reply when a request ends before every eligible backend returned `430`: an expired deadline, or no backend left because the rest were busy, skipped, or failed. Unset keeps `430` for the deadline and `503` for no backend left. A request every eligible backend answered with `430` still gets `430`.
 - Per-backend `admission` counters in the stats file: backlog skips, checkout timeouts, deadline expiries, and the service-time average.
 
 ### Changed
