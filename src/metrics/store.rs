@@ -65,6 +65,9 @@ pub(crate) struct PersistedBackend {
     send_micros_total: u64,
     recv_micros_total: u64,
     connection_failures: u64,
+    /// Older stats files predate this counter, so it defaults to zero.
+    #[serde(default)]
+    error_reply_failovers: u64,
     // Future v2 (retention tracking PR):
     //   oldest_served_article_age_secs, newest_missing_article_age_secs,
     //   retention_sample_count (for confidence interval calculation)
@@ -111,6 +114,7 @@ pub struct BackendStore {
     pub send_micros_total: AtomicU64,
     pub recv_micros_total: AtomicU64,
     pub connection_failures: AtomicU64,
+    pub error_reply_failovers: AtomicU64,
 }
 
 impl Default for BackendStore {
@@ -129,6 +133,7 @@ impl Default for BackendStore {
             send_micros_total: AtomicU64::new(0),
             recv_micros_total: AtomicU64::new(0),
             connection_failures: AtomicU64::new(0),
+            error_reply_failovers: AtomicU64::new(0),
         }
     }
 }
@@ -151,6 +156,7 @@ impl BackendStore {
             send_micros_total: self.send_micros_total.load(Ordering::Relaxed),
             recv_micros_total: self.recv_micros_total.load(Ordering::Relaxed),
             connection_failures: self.connection_failures.load(Ordering::Relaxed),
+            error_reply_failovers: self.error_reply_failovers.load(Ordering::Relaxed),
         }
     }
 
@@ -181,6 +187,8 @@ impl BackendStore {
             .store(persisted.recv_micros_total, Ordering::Relaxed);
         self.connection_failures
             .store(persisted.connection_failures, Ordering::Relaxed);
+        self.error_reply_failovers
+            .store(persisted.error_reply_failovers, Ordering::Relaxed);
     }
 }
 
@@ -597,6 +605,24 @@ mod tests {
         assert_eq!(new_store.total_commands.load(Ordering::Relaxed), 100);
         assert_eq!(new_store.bytes_sent.load(Ordering::Relaxed), 50000);
         assert_eq!(new_store.errors.load(Ordering::Relaxed), 5);
+    }
+
+    #[test]
+    fn test_backend_error_reply_failovers_persist_and_default_for_old_files() {
+        let store = BackendStore::default();
+        store.error_reply_failovers.store(7, Ordering::Relaxed);
+        let json = serde_json::to_value(store.to_persisted("backend-a")).unwrap();
+        assert_eq!(json["error_reply_failovers"], 7);
+
+        let mut legacy = json;
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("error_reply_failovers");
+        let persisted: PersistedBackend = serde_json::from_value(legacy).unwrap();
+        let restored = BackendStore::default();
+        restored.restore_from(&persisted);
+        assert_eq!(restored.error_reply_failovers.load(Ordering::Relaxed), 0);
     }
 
     #[test]

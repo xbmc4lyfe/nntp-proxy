@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- A non-430 error reply to a message-ID `ARTICLE`, `BODY`, `HEAD`, or `STAT` no longer ends the request. Some providers refuse articles they cannot serve with another code (for example `451 0 <message-id>`). The proxy now tries the next eligible backend instead of forwarding that reply. The backend is skipped for that request only and is not recorded as missing the article, so the tier rule still waits for real `430`s. A reply that says the session is unusable (`400`, `480`–`483`, `502`) also retires the connection. A new per-backend `error_reply_failovers` counter in the stats file counts these retries.
+
 ## [0.6.0] - 2026-11-05
 
 ### Added
