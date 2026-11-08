@@ -356,18 +356,17 @@ impl ClientSession {
                 Ok(BackendAttemptResult::BackendUnavailable) => {
                     is_retry_attempt = true;
                 }
-                // No miss was recorded for the backends left untried, so a
-                // later request still tries them.
-                Ok(BackendAttemptResult::DeadlineExpired) => {
+                // Some eligible backend never answered 430: it was busy,
+                // skipped, failed, or the deadline ran out first. No
+                // miss was recorded for it, so a later request still tries it,
+                // and the reply must not claim the article is missing unless
+                // the operator chose `430` for this case.
+                Ok(
+                    BackendAttemptResult::DeadlineExpired
+                    | BackendAttemptResult::NoRetryableBackend,
+                ) => {
                     return Self::write_unavailable_reply(
-                        router.article_admission().deadline_reply(),
-                        io,
-                    )
-                    .await;
-                }
-                Ok(BackendAttemptResult::NoRetryableBackend) => {
-                    return Self::write_unavailable_reply(
-                        router.article_admission().no_backend_reply(),
+                        router.article_admission().unavailable_reply(),
                         io,
                     )
                     .await;

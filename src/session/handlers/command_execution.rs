@@ -3357,15 +3357,31 @@ mod tests {
         provider
     }
 
+    /// Same-tier backends sharing one admission policy, in the given order.
+    fn router_with_admission_backends(
+        providers: Vec<DeadpoolConnectionProvider>,
+        admission: crate::pool::admission::ArticleAdmission,
+    ) -> Arc<BackendSelector> {
+        let mut router = BackendSelector::new().with_article_admission(admission);
+        for (index, provider) in providers.into_iter().enumerate() {
+            router.add_backend(
+                ServerName::try_new(format!("backend-{index}")).unwrap(),
+                provider,
+                0,
+            );
+        }
+        Arc::new(router)
+    }
+
     #[tokio::test]
-    async fn article_deadline_answers_430_in_bounded_time() {
+    async fn article_deadline_answers_503_in_bounded_time() {
         let provider = full_unsampled_pool().await;
         let router = router_with_admission(provider.clone(), short_deadline_admission());
 
         let (status, elapsed) =
             route_and_read_status(&router, b"BODY <deadline@example.com>\r\n").await;
 
-        assert_eq!(status, 430);
+        assert_eq!(status, 503, "nothing said the article is missing");
         assert!(
             elapsed >= SHORT_DEADLINE,
             "the request waited for the backend"
@@ -3378,21 +3394,52 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unavailable_reply_503_applies_to_an_expired_deadline() {
+    async fn unavailable_reply_430_applies_to_an_expired_deadline() {
         let provider = full_unsampled_pool().await;
         let router = router_with_admission(
             provider.clone(),
-            short_deadline_admission().with_unavailable_reply(Some(
-                crate::pool::admission::UnavailableReply::BackendError,
-            )),
+            short_deadline_admission()
+                .with_unavailable_reply(crate::pool::admission::UnavailableReply::NoSuchArticle),
         );
 
         let (status, elapsed) =
-            route_and_read_status(&router, b"BODY <deadline-503@example.com>\r\n").await;
+            route_and_read_status(&router, b"BODY <deadline-430@example.com>\r\n").await;
 
-        assert_eq!(status, 503);
+        assert_eq!(status, 430, "an explicit 430 is honoured");
         assert!(elapsed < crate::constants::pool::ARTICLE_CHECKOUT_WAIT / 2);
         assert_eq!(provider.load().snapshot().deadline_expiries, 1);
+    }
+
+    /// A false 430 seen under load: one tier-0 backend answered 430, the
+    /// slow tier-0 backend that had the article was still queued when the
+    /// deadline ran out, and the client was told the article is missing.
+    #[tokio::test]
+    async fn deadline_after_a_peer_430_answers_503_while_a_same_tier_backend_was_queued() {
+        let (missing_port, missing_lookups) =
+            spawn_article_response_server(b"430 No such article\r\n").await;
+        let missing = DeadpoolConnectionProvider::builder("127.0.0.1", missing_port)
+            .max_connections(1)
+            .build()
+            .unwrap();
+        let queued = full_unsampled_pool().await;
+        let router = router_with_admission_backends(
+            vec![missing, queued.clone()],
+            short_deadline_admission(),
+        );
+
+        let (status, _) =
+            route_and_read_status(&router, b"BODY <queued-peer@example.com>\r\n").await;
+
+        assert_eq!(
+            missing_lookups.load(Ordering::SeqCst),
+            1,
+            "the 430 peer was asked"
+        );
+        assert_eq!(queued.load().snapshot().deadline_expiries, 1);
+        assert_eq!(
+            status, 503,
+            "a queued backend never answered, so the article is not known missing"
+        );
     }
 
     fn give_up_admission() -> crate::pool::admission::ArticleAdmission {
@@ -3408,9 +3455,29 @@ mod tests {
         let (status, elapsed) =
             route_and_read_status(&router, b"BODY <all-busy@example.com>\r\n").await;
 
-        assert_eq!(status, 503, "unset keeps the historical reply");
+        assert_eq!(status, 503);
         assert!(elapsed < crate::constants::pool::ARTICLE_CHECKOUT_WAIT / 3);
         assert_eq!(provider.load().snapshot().backlog_skips, 1);
+    }
+
+    #[tokio::test]
+    async fn skipped_peer_after_a_430_answers_503_by_default() {
+        let (missing_port, missing_lookups) =
+            spawn_article_response_server(b"430 No such article\r\n").await;
+        let missing = DeadpoolConnectionProvider::builder("127.0.0.1", missing_port)
+            .max_connections(1)
+            .build()
+            .unwrap();
+        let skipped = backlogged_pool().await;
+        let router =
+            router_with_admission_backends(vec![missing, skipped.clone()], give_up_admission());
+
+        let (status, _) =
+            route_and_read_status(&router, b"BODY <skipped-peer@example.com>\r\n").await;
+
+        assert_eq!(missing_lookups.load(Ordering::SeqCst), 1);
+        assert_eq!(skipped.load().snapshot().backlog_skips, 1);
+        assert_eq!(status, 503, "the skipped backend was never asked");
     }
 
     #[tokio::test]
@@ -3418,9 +3485,8 @@ mod tests {
         let provider = backlogged_pool().await;
         let router = router_with_admission(
             provider.clone(),
-            give_up_admission().with_unavailable_reply(Some(
-                crate::pool::admission::UnavailableReply::NoSuchArticle,
-            )),
+            give_up_admission()
+                .with_unavailable_reply(crate::pool::admission::UnavailableReply::NoSuchArticle),
         );
 
         let (status, elapsed) =
@@ -3432,7 +3498,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn authoritative_misses_answer_430_even_with_unavailable_reply_503() {
+    async fn authoritative_misses_answer_430_with_the_default_unavailable_reply() {
         let (port, article_commands) =
             spawn_article_response_server(b"430 No such article\r\n").await;
         let provider = DeadpoolConnectionProvider::builder("127.0.0.1", port)
@@ -3441,9 +3507,7 @@ mod tests {
             .unwrap();
         let router = router_with_admission(
             provider,
-            crate::pool::admission::ArticleAdmission::default().with_unavailable_reply(Some(
-                crate::pool::admission::UnavailableReply::BackendError,
-            )),
+            crate::pool::admission::ArticleAdmission::default(),
         );
 
         let (status, _) = route_and_read_status(&router, b"BODY <missing@example.com>\r\n").await;
