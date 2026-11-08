@@ -14,7 +14,7 @@ use crate::session::handlers::cache_operations::{
     CacheLookupResult, write_cached_article_response,
 };
 use crate::session::handlers::command_execution::{
-    ArticleAttemptState, AuthoritativeArticleMissing, BackendAttemptResult,
+    ArticleAttemptState, AuthoritativeArticleMissing, BackendAttemptResult, BackloggedBackends,
 };
 use crate::types::{BackendToClientBytes, ClientToBackendBytes};
 use anyhow::Result;
@@ -280,6 +280,7 @@ impl ClientSession {
 
         let mut availability = availability.unwrap_or_default();
         let mut unavailable_backends = SuppressedBackends::empty();
+        let mut backlogged = BackloggedBackends::default();
         let budget = router.article_admission().start_request();
         let mut is_retry_attempt = false;
         let mut non_primary_tier_prefetch_started = false;
@@ -311,6 +312,7 @@ impl ClientSession {
                         client_to_backend_bytes: io.client_to_backend_bytes,
                         backend_connection: io.backend_connection,
                         unavailable_backends: &mut unavailable_backends,
+                        backlogged: &mut backlogged,
                         budget,
                     },
                 )
@@ -328,6 +330,7 @@ impl ClientSession {
                         client_to_backend_bytes: io.client_to_backend_bytes,
                         backend_connection: io.backend_connection,
                         unavailable_backends: &mut unavailable_backends,
+                        backlogged: &mut backlogged,
                         budget,
                     },
                     is_retry_attempt,
