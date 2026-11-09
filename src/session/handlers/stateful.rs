@@ -291,7 +291,7 @@ impl ClientSession {
                         .flush()
                         .await
                         .map_err(|error| StatefulLoopError::client(error.into()))?;
-                    state.add_backend_to_client(AUTH_ALREADY_AUTHENTICATED.len() as u64);
+                    state.add_local_to_client(AUTH_ALREADY_AUTHENTICATED.len() as u64);
                 }
             }
             AuthenticatedStatefulAction::InterceptCapabilities => {
@@ -308,7 +308,7 @@ impl ClientSession {
                         .flush()
                         .await
                         .map_err(|error| StatefulLoopError::client(error.into()))?;
-                    state.add_backend_to_client(capabilities.len() as u64);
+                    state.add_local_to_client(capabilities.len() as u64);
                 }
             }
             AuthenticatedStatefulAction::Reject(response) => {
@@ -323,7 +323,7 @@ impl ClientSession {
                         .flush()
                         .await
                         .map_err(|error| StatefulLoopError::client(error.into()))?;
-                    state.add_backend_to_client(response.len() as u64);
+                    state.add_local_to_client(response.len() as u64);
                 }
             }
         }
