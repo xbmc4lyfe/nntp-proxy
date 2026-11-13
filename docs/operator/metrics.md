@@ -171,6 +171,12 @@ scrape_configs:
 
 When the proxy runs in a container next to the scraper, use the container name and set `listen = "0.0.0.0:9469"` inside the container, without publishing the port on the host.
 
+## Dashboard and alert rules
+
+[`contrib/grafana`](../../contrib/grafana/README.md) has a Grafana dashboard
+for these metrics, its generator, and Prometheus/vmalert alerting rules with
+`promtool` tests.
+
 ## Example queries
 
 Share of commands each backend answered with `430`:

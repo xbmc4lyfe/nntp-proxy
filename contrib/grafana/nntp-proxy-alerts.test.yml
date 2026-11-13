@@ -1,0 +1,144 @@
+# promtool test rules nntp-proxy-alerts.test.yml
+rule_files:
+  - nntp-proxy-alerts.rules.yml
+evaluation_interval: 1m
+tests:
+  # One backend in a tier starts missing almost everything while its peer keeps
+  # finding articles: the miss-outlier alert fires for that backend only.
+  - interval: 1m
+    input_series:
+      - series: 'nntp_proxy_backend_commands_total{job="nntp-proxy",instance="p:9469",backend="backend-a",tier="0"}'
+        values: '0+600x90'
+      - series: 'nntp_proxy_backend_article_missing_total{job="nntp-proxy",instance="p:9469",backend="backend-a",tier="0"}'
+        values: '0+540x90'
+      - series: 'nntp_proxy_backend_commands_total{job="nntp-proxy",instance="p:9469",backend="backend-b",tier="0"}'
+        values: '0+600x90'
+      - series: 'nntp_proxy_backend_article_missing_total{job="nntp-proxy",instance="p:9469",backend="backend-b",tier="0"}'
+        values: '0+30x90'
+    alert_rule_test:
+      - eval_time: 80m
+        alertname: NntpBackendMissOutlier
+        exp_alerts:
+          - exp_labels: {severity: warning, instance: "p:9469", backend: backend-a, tier: "0"}
+            exp_annotations:
+              summary: "backend-a misses far more articles than its tier"
+              description: "Its 430 share is 42.5% above its tier's average for 30 minutes: lost retention, a bad server behind its DNS name, or an account problem."
+
+  # A download whose articles are gone everywhere: every backend misses
+  # together, so nothing fires.
+  - interval: 1m
+    input_series:
+      - series: 'nntp_proxy_backend_commands_total{job="nntp-proxy",instance="p:9469",backend="backend-a",tier="0"}'
+        values: '0+600x90'
+      - series: 'nntp_proxy_backend_article_missing_total{job="nntp-proxy",instance="p:9469",backend="backend-a",tier="0"}'
+        values: '0+590x90'
+      - series: 'nntp_proxy_backend_commands_total{job="nntp-proxy",instance="p:9469",backend="backend-b",tier="0"}'
+        values: '0+600x90'
+      - series: 'nntp_proxy_backend_article_missing_total{job="nntp-proxy",instance="p:9469",backend="backend-b",tier="0"}'
+        values: '0+585x90'
+    alert_rule_test:
+      - eval_time: 80m
+        alertname: NntpBackendMissOutlier
+        exp_alerts: []
+
+  # Logins refused continuously for 20+ minutes.
+  - interval: 1m
+    input_series:
+      - series: 'nntp_proxy_backend_connect_attempts_total{job="nntp-proxy",instance="p:9469",backend="backend-c",outcome="login_refused"}'
+        values: '0+2x60'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: NntpBackendLoginRefused
+        exp_alerts: []
+      - eval_time: 45m
+        alertname: NntpBackendLoginRefused
+        exp_alerts:
+          - exp_labels: {severity: warning, instance: "p:9469", backend: backend-c}
+            exp_annotations:
+              summary: "backend-c refuses logins"
+              description: "30 refused logins in 15 minutes: the account's connection limit is reached (another client sharing the account?) or the account has a problem."
+
+  # Unreachable: only failed connection attempts, none created.
+  - interval: 1m
+    input_series:
+      - series: 'nntp_proxy_backend_connect_attempts_total{job="nntp-proxy",instance="p:9469",backend="backend-d",outcome="failed"}'
+        values: '0+1x40'
+      - series: 'nntp_proxy_backend_connect_attempts_total{job="nntp-proxy",instance="p:9469",backend="backend-d",outcome="created"}'
+        values: '5x40'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: NntpBackendUnreachable
+        exp_alerts:
+          - exp_labels: {severity: warning, instance: "p:9469", backend: backend-d}
+            exp_annotations:
+              summary: "backend-d is unreachable"
+              description: "Every new connection failed for 10 minutes (DNS, network, TLS, or the server is down)."
+
+  # Proxy down.
+  - interval: 1m
+    input_series:
+      - series: 'up{job="nntp-proxy",instance="p:9469"}'
+        values: '1 1 0x10'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: NntpProxyDown
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: NntpProxyDown
+        exp_alerts:
+          - exp_labels: {severity: critical, job: nntp-proxy, instance: "p:9469"}
+            exp_annotations:
+              summary: "nntp-proxy p:9469 is not answering scrapes"
+              description: "No successful scrape for 5 minutes. Clients going through this proxy cannot download."
+
+  # Lots of 430s (counted in errors_total and error_replies_total) but no
+  # transport failures: the transport-error alert stays silent.
+  - interval: 1m
+    input_series:
+      - series: 'nntp_proxy_backend_commands_total{job="nntp-proxy",instance="p:9469",backend="backend-e"}'
+        values: '0+600x40'
+      - series: 'nntp_proxy_backend_errors_total{job="nntp-proxy",instance="p:9469",backend="backend-e"}'
+        values: '0+500x40'
+      - series: 'nntp_proxy_backend_error_replies_total{job="nntp-proxy",instance="p:9469",backend="backend-e",code_class="4xx"}'
+        values: '0+500x40'
+    alert_rule_test:
+      - eval_time: 35m
+        alertname: NntpBackendTransportErrors
+        exp_alerts: []
+
+  # A takedown: backend-s drops to the standing floor while backend-t keeps
+  # downloading. The info alert fires for backend-s once it has stayed low
+  # for half an hour.
+  - interval: 1m
+    input_series:
+      - series: 'nntp_proxy_backend_article_standing{job="nntp-proxy",instance="p:9469",backend="backend-s",tier="0"}'
+        values: '1 0.02x60'
+      - series: 'nntp_proxy_backend_article_standing{job="nntp-proxy",instance="p:9469",backend="backend-t",tier="0"}'
+        values: '1x60'
+      - series: 'nntp_proxy_backend_articles_total{job="nntp-proxy",instance="p:9469",backend="backend-t",tier="0"}'
+        values: '0+600x60'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: NntpBackendStandingLow
+        exp_alerts: []
+      - eval_time: 40m
+        alertname: NntpBackendStandingLow
+        exp_alerts:
+          - exp_labels: {severity: info, instance: "p:9469", backend: backend-s, tier: "0"}
+            exp_annotations:
+              summary: "backend-s has been demoted by article standing"
+              description: "Its standing has stayed below 0.1 for 30 minutes while the proxy was downloading (0.02 at most): it answered 430 for most recent lookups, usually a takedown of the current download on that provider."
+
+  # The same low standing on an idle proxy (no downloads) does not fire: the
+  # standing only changes with traffic, so it would otherwise stay low all
+  # night after the last download.
+  - interval: 1m
+    input_series:
+      - series: 'nntp_proxy_backend_article_standing{job="nntp-proxy",instance="p:9469",backend="backend-s",tier="0"}'
+        values: '0.02x60'
+      - series: 'nntp_proxy_backend_articles_total{job="nntp-proxy",instance="p:9469",backend="backend-t",tier="0"}'
+        values: '5000x60'
+    alert_rule_test:
+      - eval_time: 50m
+        alertname: NntpBackendStandingLow
+        exp_alerts: []
