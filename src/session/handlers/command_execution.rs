@@ -943,7 +943,16 @@ impl ClientSession {
                     Err(crate::connection_error::ConnectionError::Backlogged { .. }) => {
                         return RetryStatProbeOutcome::Backlogged { backend_id, budget };
                     }
-                    Err(_) => return RetryStatProbeOutcome::Unavailable(backend_id),
+                    Err(error) => {
+                        log_stat_probe_failure(
+                            &provider,
+                            backend_id,
+                            StatProbePhase::RetrySweep,
+                            StatProbeStep::Checkout,
+                            &error,
+                        );
+                        return RetryStatProbeOutcome::Unavailable(backend_id);
+                    }
                 };
                 // The probe is a command to this backend like any other, so
                 // it counts in commands_total next to the 430 it may record;
@@ -960,12 +969,31 @@ impl ClientSession {
                 .await
                 {
                     Ok(exchange) => exchange,
-                    Err(_) => return RetryStatProbeOutcome::Unavailable(backend_id),
+                    Err(error) => {
+                        log_stat_probe_failure(
+                            &provider,
+                            backend_id,
+                            StatProbePhase::RetrySweep,
+                            StatProbeStep::Exchange,
+                            &error,
+                        );
+                        return RetryStatProbeOutcome::Unavailable(backend_id);
+                    }
                 };
 
                 let status_code = exchange.status_code();
-                let Ok(conn) = exchange.observe_and_reuse().await else {
-                    return RetryStatProbeOutcome::Unavailable(backend_id);
+                let conn = match exchange.observe_and_reuse().await {
+                    Ok(conn) => conn,
+                    Err(error) => {
+                        log_stat_probe_failure(
+                            &provider,
+                            backend_id,
+                            StatProbePhase::RetrySweep,
+                            StatProbeStep::Drain,
+                            &error,
+                        );
+                        return RetryStatProbeOutcome::Unavailable(backend_id);
+                    }
                 };
                 let release = release_observed_probe_connection(conn, backend_id);
 
@@ -1108,7 +1136,16 @@ impl ClientSession {
                     let _guard = BackendSelector::guard_for_manual_backend(router, backend_id);
                     let conn = match provider.checkout_for_attempt(budget).await {
                         Ok(conn) => conn.activate(),
-                        Err(_) => return,
+                        Err(error) => {
+                            log_stat_probe_failure(
+                                &provider,
+                                backend_id,
+                                StatProbePhase::LowerTierPrefetch,
+                                StatProbeStep::Checkout,
+                                &error,
+                            );
+                            return;
+                        }
                     };
                     // Count the probe and its 430 in the same per-backend
                     // counters as direct commands, so commands_total and
@@ -1125,11 +1162,30 @@ impl ClientSession {
                     .await
                     {
                         Ok(exchange) => exchange,
-                        Err(_) => return,
+                        Err(error) => {
+                            log_stat_probe_failure(
+                                &provider,
+                                backend_id,
+                                StatProbePhase::LowerTierPrefetch,
+                                StatProbeStep::Exchange,
+                                &error,
+                            );
+                            return;
+                        }
                     };
                     let status_code = exchange.status_code();
-                    let Ok(conn) = exchange.observe_and_reuse().await else {
-                        return;
+                    let conn = match exchange.observe_and_reuse().await {
+                        Ok(conn) => conn,
+                        Err(error) => {
+                            log_stat_probe_failure(
+                                &provider,
+                                backend_id,
+                                StatProbePhase::LowerTierPrefetch,
+                                StatProbeStep::Drain,
+                                &error,
+                            );
+                            return;
+                        }
                     };
                     // Retirement does not invalidate the already-framed reply,
                     // so a 430 is still recorded below.
@@ -2351,6 +2407,63 @@ fn same_backend_retry_cannot_succeed(error: &anyhow::Error) -> bool {
 ///
 /// Queued bytes after the reply mean the backend sent something unrequested,
 /// so the socket cannot be trusted for another command and is retired.
+/// Which background STAT path a probe failure came from.
+#[derive(Debug, Clone, Copy)]
+enum StatProbePhase {
+    RetrySweep,
+    LowerTierPrefetch,
+}
+
+impl StatProbePhase {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::RetrySweep => "retry_sweep",
+            Self::LowerTierPrefetch => "lower_tier_prefetch",
+        }
+    }
+}
+
+/// The probe step that failed.
+#[derive(Debug, Clone, Copy)]
+enum StatProbeStep {
+    Checkout,
+    Exchange,
+    Drain,
+}
+
+/// A failed probe only marks the backend unavailable for the request, which
+/// is invisible from the client side. This dedicated target lets an operator
+/// enable just these lines (`RUST_LOG=info,nntp_proxy::stat_probe=debug`) to
+/// see why retries skipped a backend, without request text or credentials.
+fn log_stat_probe_failure(
+    provider: &crate::pool::DeadpoolConnectionProvider,
+    backend_id: BackendId,
+    phase: StatProbePhase,
+    step: StatProbeStep,
+    error: &dyn std::fmt::Display,
+) {
+    let backend = backend_id.as_index();
+    let pool = provider.name();
+    let phase = phase.as_str();
+    match step {
+        StatProbeStep::Checkout => debug!(
+            target: "nntp_proxy::stat_probe",
+            backend, pool, phase, error = %error,
+            "STAT probe checkout failed"
+        ),
+        StatProbeStep::Exchange => debug!(
+            target: "nntp_proxy::stat_probe",
+            backend, pool, phase, error = %error,
+            "STAT probe exchange failed"
+        ),
+        StatProbeStep::Drain => debug!(
+            target: "nntp_proxy::stat_probe",
+            backend, pool, phase, error = %error,
+            "STAT probe reply could not be drained"
+        ),
+    }
+}
+
 fn release_observed_probe_connection(
     conn: crate::pool::ConnectionGuard,
     backend_id: BackendId,
