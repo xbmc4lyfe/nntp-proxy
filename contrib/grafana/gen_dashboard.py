@@ -88,6 +88,10 @@ ts("Connections closed by reason", [(f'sum by (backend, reason) (rate(nntp_proxy
 ts("Health check failures", [(f'sum by (backend) (rate(nntp_proxy_backend_health_check_failures_total{{{B}}}[{RI}]))', "{{backend}}")], "ops", w=8)
 ts("Login backoff active", [(f'max by (backend) (nntp_proxy_backend_login_backoff{{{B}}})', "{{backend}}")], w=8, minv=0, maxv=1)
 flush()
+ts("Connection cap", [(f'max by (backend) (nntp_proxy_backend_connection_cap{{{B}}})', "{{backend}} cap"),
+   (f'sum by (backend) (nntp_proxy_backend_pool_connections{{{B}}})', "{{backend}} open")], w=24,
+   desc="Connections each backend may hold. With connection_cap = \"adaptive\" it drops to the accepted count on a refused login and climbs back one a minute, and past max_connections one every 10 minutes while saturated.")
+flush()
 
 row("Article admission")
 ts("Backlog skips and busy timeouts", [(f'sum by (backend) (rate(nntp_proxy_backend_backlog_skips_total{{{B}}}[{RI}]))', "{{backend}} skipped"),

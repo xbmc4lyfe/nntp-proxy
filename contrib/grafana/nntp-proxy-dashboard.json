@@ -1308,15 +1308,80 @@
       ]
     },
     {
+      "type": "timeseries",
+      "title": "Connection cap",
+      "description": "Connections each backend may hold. With connection_cap = \"adaptive\" it drops to the accepted count on a refused login and climbs back one a minute, and past max_connections one every 10 minutes while saturated.",
+      "id": 25,
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 55
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "stacking": {
+              "mode": "none"
+            },
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max by (backend) (nntp_proxy_backend_connection_cap{job=~\"$job\",instance=~\"$instance\",backend=~\"$backend\"})",
+          "legendFormat": "{{backend}} cap",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "sum by (backend) (nntp_proxy_backend_pool_connections{job=~\"$job\",instance=~\"$instance\",backend=~\"$backend\"})",
+          "legendFormat": "{{backend}} open",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ]
+    },
+    {
       "type": "row",
       "title": "Article admission",
-      "id": 25,
+      "id": 26,
       "collapsed": false,
       "gridPos": {
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 55
+        "y": 63
       },
       "panels": []
     },
@@ -1324,12 +1389,12 @@
       "type": "timeseries",
       "title": "Backlog skips and busy timeouts",
       "description": "Requests that passed over a backend because its queue was too long, or waited and gave up.",
-      "id": 26,
+      "id": 27,
       "gridPos": {
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 56
+        "y": 64
       },
       "datasource": {
         "type": "prometheus",
@@ -1389,12 +1454,12 @@
       "type": "timeseries",
       "title": "Last-resort waits",
       "description": "",
-      "id": 27,
+      "id": 28,
       "gridPos": {
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 56
+        "y": 64
       },
       "datasource": {
         "type": "prometheus",
@@ -1454,12 +1519,12 @@
       "type": "timeseries",
       "title": "Deadline expiries and error-reply failovers",
       "description": "",
-      "id": 28,
+      "id": 29,
       "gridPos": {
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 56
+        "y": 64
       },
       "datasource": {
         "type": "prometheus",
@@ -1519,12 +1584,12 @@
       "type": "timeseries",
       "title": "Service time (EWMA)",
       "description": "",
-      "id": 29,
+      "id": 30,
       "gridPos": {
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 64
+        "y": 72
       },
       "datasource": {
         "type": "prometheus",
@@ -1575,12 +1640,12 @@
       "type": "timeseries",
       "title": "Estimated connection wait",
       "description": "",
-      "id": 30,
+      "id": 31,
       "gridPos": {
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 64
+        "y": 72
       },
       "datasource": {
         "type": "prometheus",
@@ -1630,13 +1695,13 @@
     {
       "type": "row",
       "title": "Process and cache",
-      "id": 31,
+      "id": 32,
       "collapsed": false,
       "gridPos": {
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 72
+        "y": 80
       },
       "panels": []
     },
@@ -1644,12 +1709,12 @@
       "type": "timeseries",
       "title": "CPU cores",
       "description": "",
-      "id": 32,
+      "id": 33,
       "gridPos": {
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 73
+        "y": 81
       },
       "datasource": {
         "type": "prometheus",
@@ -1700,12 +1765,12 @@
       "type": "timeseries",
       "title": "Resident memory",
       "description": "",
-      "id": 33,
+      "id": 34,
       "gridPos": {
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 73
+        "y": 81
       },
       "datasource": {
         "type": "prometheus",
@@ -1756,12 +1821,12 @@
       "type": "timeseries",
       "title": "Open file descriptors / threads",
       "description": "",
-      "id": 34,
+      "id": 35,
       "gridPos": {
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 73
+        "y": 81
       },
       "datasource": {
         "type": "prometheus",
@@ -1821,12 +1886,12 @@
       "type": "timeseries",
       "title": "Cache hit ratio",
       "description": "",
-      "id": 35,
+      "id": 36,
       "gridPos": {
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 81
+        "y": 89
       },
       "datasource": {
         "type": "prometheus",
@@ -1879,12 +1944,12 @@
       "type": "timeseries",
       "title": "Client bytes",
       "description": "Updated when client sessions end; use backend article bytes for live throughput.",
-      "id": 36,
+      "id": 37,
       "gridPos": {
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 81
+        "y": 89
       },
       "datasource": {
         "type": "prometheus",
