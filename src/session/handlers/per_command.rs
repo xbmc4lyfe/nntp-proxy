@@ -1222,11 +1222,15 @@ impl ClientSession {
         while i < requests.len() {
             match &mut requests[i] {
                 ArticleWindowRequest::KnownMissing => {
-                    self.send_430_to_client(
-                        client_writer.get_mut(),
-                        &mut state.backend_to_client_bytes,
-                    )
-                    .await?;
+                    // A synthesized 430 is not backend work, but a client
+                    // stalling on it must not be charged to the next
+                    // article's slice: time it and close the slice here.
+                    let mut timed_writer = crate::io_util::StallTimer::new(client_writer.get_mut());
+                    let sent = self
+                        .send_430_to_client(&mut timed_writer, &mut state.backend_to_client_bytes)
+                        .await;
+                    window_delivery.add(None, timed_writer.stalled());
+                    sent?;
                 }
                 ArticleWindowRequest::SendUpstream {
                     backend,
