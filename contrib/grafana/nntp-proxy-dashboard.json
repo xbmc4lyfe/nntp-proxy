@@ -2162,8 +2162,8 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (pool, state) (nntp_proxy_buffer_pool_buffers{job=~\"$job\",instance=~\"$instance\"})",
-          "legendFormat": "{{pool}} {{state}}",
+          "expr": "sum by (instance, pool, state) (nntp_proxy_buffer_pool_buffers{job=~\"$job\",instance=~\"$instance\"})",
+          "legendFormat": "{{instance}} {{pool}} {{state}}",
           "datasource": {
             "type": "prometheus",
             "uid": "${datasource}"
@@ -2171,8 +2171,8 @@
         },
         {
           "refId": "B",
-          "expr": "max by (pool) (nntp_proxy_buffer_pool_max_buffers{job=~\"$job\",instance=~\"$instance\"})",
-          "legendFormat": "{{pool}} max",
+          "expr": "max by (instance, pool) (nntp_proxy_buffer_pool_max_buffers{job=~\"$job\",instance=~\"$instance\"})",
+          "legendFormat": "{{instance}} {{pool}} max",
           "datasource": {
             "type": "prometheus",
             "uid": "${datasource}"
@@ -2227,8 +2227,8 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (pool) (rate(nntp_proxy_buffer_pool_fallback_allocations_total{job=~\"$job\",instance=~\"$instance\"}[$__rate_interval]))",
-          "legendFormat": "{{pool}}",
+          "expr": "sum by (instance, pool) (rate(nntp_proxy_buffer_pool_fallback_allocations_total{job=~\"$job\",instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "{{instance}} {{pool}}",
           "datasource": {
             "type": "prometheus",
             "uid": "${datasource}"
