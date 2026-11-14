@@ -1582,14 +1582,247 @@
     },
     {
       "type": "timeseries",
-      "title": "Service time (EWMA)",
-      "description": "",
+      "title": "Delivery rate per connection",
+      "description": "Article bytes per busy second per connection, client stalls excluded. The short horizon follows the current download; compare backends to see who is actually fast for this release.",
       "id": 30,
       "gridPos": {
         "h": 8,
         "w": 12,
         "x": 0,
         "y": 72
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "stacking": {
+              "mode": "none"
+            },
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max by (backend) (nntp_proxy_backend_delivery_bytes_per_second{job=~\"$job\",instance=~\"$instance\",backend=~\"$backend\",horizon=\"short\"})",
+          "legendFormat": "{{backend}} 5s",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "max by (backend) (nntp_proxy_backend_delivery_bytes_per_second{job=~\"$job\",instance=~\"$instance\",backend=~\"$backend\",horizon=\"long\"})",
+          "legendFormat": "{{backend}} 5m",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "First-byte time (EWMA)",
+      "description": "Time from sending an article command to its first response. Close to the whole exchange time means the backend is waiting on its server (pipelining could help); a small share means it is bandwidth-bound.",
+      "id": 31,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 72
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "stacking": {
+              "mode": "none"
+            },
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max by (backend) (nntp_proxy_backend_ttfb_seconds{job=~\"$job\",instance=~\"$instance\",backend=~\"$backend\"})",
+          "legendFormat": "{{backend}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Leased idle connections",
+      "description": "Connections a client holds between its commands without an exchange running. High while requests wait elsewhere means capacity is reserved, not working.",
+      "id": 32,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 80
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "stacking": {
+              "mode": "none"
+            },
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (backend) (nntp_proxy_backend_pool_connections{job=~\"$job\",instance=~\"$instance\",backend=~\"$backend\",state=\"leased_idle\"})",
+          "legendFormat": "{{backend}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Client stall",
+      "description": "Seconds per second article writes spent blocked on a slow client (1.0 = one connection's worth of time held by the client).",
+      "id": 33,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 80
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 8,
+            "stacking": {
+              "mode": "none"
+            },
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "mean",
+            "max",
+            "lastNotNull"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (backend) (rate(nntp_proxy_backend_client_stall_seconds_total{job=~\"$job\",instance=~\"$instance\",backend=~\"$backend\"}[$__rate_interval]))",
+          "legendFormat": "{{backend}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          }
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Service time (EWMA)",
+      "description": "",
+      "id": 34,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 88
       },
       "datasource": {
         "type": "prometheus",
@@ -1640,12 +1873,12 @@
       "type": "timeseries",
       "title": "Estimated connection wait",
       "description": "",
-      "id": 31,
+      "id": 35,
       "gridPos": {
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 72
+        "y": 88
       },
       "datasource": {
         "type": "prometheus",
@@ -1695,13 +1928,13 @@
     {
       "type": "row",
       "title": "Process and cache",
-      "id": 32,
+      "id": 36,
       "collapsed": false,
       "gridPos": {
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 80
+        "y": 96
       },
       "panels": []
     },
@@ -1709,12 +1942,12 @@
       "type": "timeseries",
       "title": "CPU cores",
       "description": "",
-      "id": 33,
+      "id": 37,
       "gridPos": {
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 81
+        "y": 97
       },
       "datasource": {
         "type": "prometheus",
@@ -1765,12 +1998,12 @@
       "type": "timeseries",
       "title": "Resident memory",
       "description": "",
-      "id": 34,
+      "id": 38,
       "gridPos": {
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 81
+        "y": 97
       },
       "datasource": {
         "type": "prometheus",
@@ -1821,12 +2054,12 @@
       "type": "timeseries",
       "title": "Open file descriptors / threads",
       "description": "",
-      "id": 35,
+      "id": 39,
       "gridPos": {
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 81
+        "y": 97
       },
       "datasource": {
         "type": "prometheus",
@@ -1886,12 +2119,12 @@
       "type": "timeseries",
       "title": "Cache hit ratio",
       "description": "",
-      "id": 36,
+      "id": 40,
       "gridPos": {
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 89
+        "y": 105
       },
       "datasource": {
         "type": "prometheus",
@@ -1944,12 +2177,12 @@
       "type": "timeseries",
       "title": "Client bytes",
       "description": "Updated when client sessions end; use backend article bytes for live throughput.",
-      "id": 37,
+      "id": 41,
       "gridPos": {
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 89
+        "y": 105
       },
       "datasource": {
         "type": "prometheus",
