@@ -133,6 +133,20 @@ pub struct RawRoute;
 #[derive(Debug, Clone, Copy)]
 pub struct ArticleRoute<'a> {
     availability: &'a ArticleAvailability,
+    lookup: RouteLookup,
+}
+
+/// What an availability-routed request asks for. Per-command routing sends
+/// list and other non-article commands through the same availability path,
+/// so having availability does not make a request an article lookup.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RouteLookup {
+    /// Any other command; routed by capacity and load only.
+    #[default]
+    Other,
+    /// `ARTICLE`, `BODY`, `HEAD`, or `STAT` by message-id; weighed by
+    /// article standing when `[routing.article] standing = "adaptive"`.
+    Article,
 }
 
 /// Backend selected through article availability routing.
@@ -213,7 +227,10 @@ impl RouteRequest<'_, RawRoute> {
             _client_id: self._client_id,
             suppressed_backends: self.suppressed_backends,
             excluded_backends: self.excluded_backends,
-            mode: ArticleRoute { availability },
+            mode: ArticleRoute {
+                availability,
+                lookup: RouteLookup::Other,
+            },
             _lifetime: std::marker::PhantomData,
         }
     }
@@ -232,6 +249,13 @@ impl RouteRequest<'_, RawRoute> {
 }
 
 impl RouteRequest<'_, ArticleRoute<'_>> {
+    /// Mark this request as an article lookup so article standing applies.
+    #[must_use]
+    pub const fn for_lookup(mut self, lookup: RouteLookup) -> Self {
+        self.mode.lookup = lookup;
+        self
+    }
+
     #[must_use]
     pub fn suppressing_backends(mut self, suppressed_backends: SuppressedBackends) -> Self {
         self.suppressed_backends = suppressed_backends;
@@ -253,6 +277,10 @@ pub trait RouteMode: route_mode::Sealed {
     where
         Self: Sized;
 
+    fn lookup(request: &RouteRequest<'_, Self>) -> RouteLookup
+    where
+        Self: Sized;
+
     fn output(request: &RouteRequest<'_, Self>, backend: &BackendInfo) -> Result<Self::Output>
     where
         Self: Sized;
@@ -263,6 +291,10 @@ impl RouteMode for RawRoute {
 
     fn availability<'r>(_request: &'r RouteRequest<'_, Self>) -> Option<&'r ArticleAvailability> {
         None
+    }
+
+    fn lookup(_request: &RouteRequest<'_, Self>) -> RouteLookup {
+        RouteLookup::Other
     }
 
     fn output(_request: &RouteRequest<'_, Self>, backend: &BackendInfo) -> Result<Self::Output> {
@@ -277,6 +309,10 @@ impl RouteMode for ArticleRoute<'_> {
 
     fn availability<'r>(request: &'r RouteRequest<'_, Self>) -> Option<&'r ArticleAvailability> {
         Some(request.mode.availability)
+    }
+
+    fn lookup(request: &RouteRequest<'_, Self>) -> RouteLookup {
+        request.mode.lookup
     }
 
     fn output(request: &RouteRequest<'_, Self>, backend: &BackendInfo) -> Result<Self::Output> {
@@ -906,10 +942,11 @@ impl BackendSelector {
     fn select_backend(
         &self,
         availability: Option<&ArticleAvailability>,
+        lookup: RouteLookup,
         suppressed_backends: &SuppressedBackends,
         excluded_backends: &SuppressedBackends,
     ) -> Option<SelectedBackend<'_>> {
-        match self.selection_weighting(availability) {
+        match self.selection_weighting(lookup) {
             SelectionWeighting::Capacity => self.select_backend_weighed::<ByCapacity>(
                 availability,
                 suppressed_backends,
@@ -1092,12 +1129,9 @@ impl BackendSelector {
 
     /// Article lookups weigh backends by standing when it is turned on;
     /// everything else (group, overview, list commands) only by capacity.
-    fn selection_weighting(
-        &self,
-        availability: Option<&ArticleAvailability>,
-    ) -> SelectionWeighting {
-        match (availability, self.article_admission.standing()) {
-            (Some(_), crate::pool::admission::ArticleStanding::Adaptive) => {
+    fn selection_weighting(&self, lookup: RouteLookup) -> SelectionWeighting {
+        match (lookup, self.article_admission.standing()) {
+            (RouteLookup::Article, crate::pool::admission::ArticleStanding::Adaptive) => {
                 SelectionWeighting::Standing
             }
             _ => SelectionWeighting::Capacity,
@@ -1375,6 +1409,7 @@ impl BackendSelector {
             let selected = self
                 .select_backend(
                     availability,
+                    Mode::lookup(request),
                     &request.suppressed_backends,
                     &request.excluded_backends,
                 )
@@ -2009,7 +2044,11 @@ mod tests {
             let request = RouteRequest::new(ClientId::new());
             let backend = match availability {
                 Some(availability) => selector
-                    .route(request.with_availability(availability))
+                    .route(
+                        request
+                            .with_availability(availability)
+                            .for_lookup(RouteLookup::Article),
+                    )
                     .unwrap()
                     .backend_id(),
                 None => selector.route(request).unwrap(),
@@ -2027,7 +2066,11 @@ mod tests {
         let mut counts = vec![0; selector.backend_count().get()];
         for _ in 0..count {
             let backend = selector
-                .route(RouteRequest::new(ClientId::new()).with_availability(&availability))
+                .route(
+                    RouteRequest::new(ClientId::new())
+                        .with_availability(&availability)
+                        .for_lookup(RouteLookup::Article),
+                )
                 .unwrap()
                 .backend_id();
             counts[backend.as_index()] += 1;
@@ -2094,7 +2137,11 @@ mod tests {
 
         let availability = ArticleAvailability::new();
         let backend = selector
-            .route(RouteRequest::new(ClientId::new()).with_availability(&availability))
+            .route(
+                RouteRequest::new(ClientId::new())
+                    .with_availability(&availability)
+                    .for_lookup(RouteLookup::Article),
+            )
             .unwrap();
         assert_eq!(
             backend.backend_id(),
@@ -2164,6 +2211,38 @@ mod tests {
         assert!(
             counts[1] > 50,
             "group and list commands ignore standing: {counts:?}"
+        );
+    }
+
+    #[test]
+    fn adaptive_standing_ignores_availability_routed_non_article_commands() {
+        use crate::pool::admission::{ArticleLookupOutcome, ArticleStanding};
+        let selector = standing_selector(
+            BackendSelectionStrategy::LeastLoaded,
+            ArticleStanding::Adaptive,
+            &[("steady", 80, 0), ("taken-down", 70, 0)],
+        );
+        note_lookups(
+            &selector,
+            BackendId::from_index(1),
+            ArticleLookupOutcome::Missing,
+            200,
+        );
+
+        // Per-command LIST ACTIVE and similar go through availability routing
+        // without being article lookups.
+        let availability = ArticleAvailability::new();
+        let mut counts = vec![0; 2];
+        for _ in 0..150 {
+            let backend = selector
+                .route(RouteRequest::new(ClientId::new()).with_availability(&availability))
+                .unwrap()
+                .backend_id();
+            counts[backend.as_index()] += 1;
+        }
+        assert!(
+            counts[1] > 50,
+            "standing is for article lookups only: {counts:?}"
         );
     }
 

@@ -463,8 +463,14 @@ impl ClientSession {
                 (*state.unavailable_backends, state.budget.checkout())
             }
         };
+        let lookup = if crate::command::CommandHandler::article_lookup_request(request).is_some() {
+            crate::router::RouteLookup::Article
+        } else {
+            crate::router::RouteLookup::Other
+        };
         let route_request = crate::router::RouteRequest::new(self.client_id)
             .with_availability(state.availability)
+            .for_lookup(lookup)
             .suppressing_backends(suppressed)
             .excluding_backends(excluded_backends);
         let backend = match router.route(route_request) {

@@ -206,6 +206,7 @@ mod availability_standing_adaptive {
     };
     use nntp_proxy::cache::ArticleAvailability;
     use nntp_proxy::pool::admission::{ArticleAdmission, ArticleLookupOutcome, ArticleStanding};
+    use nntp_proxy::router::RouteLookup;
 
     fn make_adaptive_router(strategy: BackendSelectionStrategy) -> Arc<BackendSelector> {
         let mut selector = BackendSelector::with_strategy(strategy).with_article_admission(
@@ -241,7 +242,11 @@ mod availability_standing_adaptive {
         let avail = ArticleAvailability::new();
         bencher.bench(|| {
             let backend = router
-                .route(RouteRequest::new(black_box(client_id)).with_availability(black_box(&avail)))
+                .route(
+                    RouteRequest::new(black_box(client_id))
+                        .with_availability(black_box(&avail))
+                        .for_lookup(RouteLookup::Article),
+                )
                 .unwrap();
             router.complete_command(backend.backend_id());
             black_box(backend)
