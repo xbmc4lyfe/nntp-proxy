@@ -1,0 +1,139 @@
+# Example alerting rules for nntp-proxy's /metrics endpoint.
+# Works with Prometheus and vmalert. Adjust the `job` selector, thresholds
+# and `for:` durations to your deployment; the values here are starting points
+# chosen to fire only on conditions an operator can act on.
+groups:
+  - name: nntp-proxy
+    rules:
+      - alert: NntpProxyDown
+        expr: up{job="nntp-proxy"} < 1
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "nntp-proxy {{ $labels.instance }} is not answering scrapes"
+          description: "No successful scrape for 5 minutes. Clients going through this proxy cannot download."
+
+      - alert: NntpProxyRestarting
+        expr: changes(nntp_proxy_start_time_seconds{job="nntp-proxy"}[1h]) > 3
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "nntp-proxy {{ $labels.instance }} restarted {{ $value }} times in an hour"
+          description: "Likely a crash loop or an external restart loop. Check the process logs."
+
+      - alert: NntpBackendLoginRefused
+        expr: sum by (instance, backend) (increase(nntp_proxy_backend_connect_attempts_total{job="nntp-proxy",outcome="login_refused"}[15m])) > 5
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.backend }} refuses logins"
+          description: "{{ $value }} refused logins in 15 minutes: the account's connection limit is reached (another client sharing the account?) or the account has a problem."
+
+      - alert: NntpBackendUnreachable
+        expr: |
+          (sum by (instance, backend) (increase(nntp_proxy_backend_connect_attempts_total{job="nntp-proxy",outcome="failed"}[10m])) > 3)
+          and
+          (sum by (instance, backend) (increase(nntp_proxy_backend_connect_attempts_total{job="nntp-proxy",outcome="created"}[10m])) == 0)
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.backend }} is unreachable"
+          description: "Every new connection failed for 10 minutes (DNS, network, TLS, or the server is down)."
+
+      # A backend that misses far more often than the average of its tier. A
+      # download whose articles are gone everywhere raises every backend's miss
+      # share together and does not fire this.
+      - alert: NntpBackendMissOutlier
+        expr: |
+          (
+            sum by (instance, backend, tier) (rate(nntp_proxy_backend_article_missing_total{job="nntp-proxy"}[30m]))
+            / sum by (instance, backend, tier) (rate(nntp_proxy_backend_commands_total{job="nntp-proxy"}[30m]))
+          )
+          - on (instance, tier) group_left ()
+          avg by (instance, tier) (
+            sum by (instance, backend, tier) (rate(nntp_proxy_backend_article_missing_total{job="nntp-proxy"}[30m]))
+            / sum by (instance, backend, tier) (rate(nntp_proxy_backend_commands_total{job="nntp-proxy"}[30m]))
+          )
+          > 0.3
+          and on (instance, backend)
+          sum by (instance, backend) (rate(nntp_proxy_backend_commands_total{job="nntp-proxy"}[30m])) > 1
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.backend }} misses far more articles than its tier"
+          description: "Its 430 share is {{ $value | humanizePercentage }} above its tier's average for 30 minutes: lost retention, a bad server behind its DNS name, or an account problem."
+
+      # errors_total counts every backend error, 4xx/5xx replies included (430s too);
+      # subtracting error_replies_total leaves connection-level failures.
+      # Informational: a backend whose article standing stayed under a tenth
+      # for half an hour while the proxy was downloading. Usually a takedown
+      # on that provider for the current download; with
+      # routing.article.standing = "adaptive" the proxy already routes around
+      # it, so this is severity info for dashboards and history, not paging.
+      - alert: NntpBackendStandingLow
+        expr: |
+          max by (instance, backend, tier) (max_over_time(nntp_proxy_backend_article_standing{job="nntp-proxy"}[15m])) < 0.1
+          and on (instance)
+          sum by (instance) (rate(nntp_proxy_backend_articles_total{job="nntp-proxy"}[15m])) > 1
+        for: 15m
+        labels:
+          severity: info
+        annotations:
+          summary: "{{ $labels.backend }} has been demoted by article standing"
+          description: "Its standing has stayed below 0.1 for 30 minutes while the proxy was downloading ({{ $value | printf `%.2f` }} at most): it answered 430 for most recent lookups, usually a takedown of the current download on that provider."
+
+      - alert: NntpBackendTransportErrors
+        expr: |
+          (
+            (
+              sum by (instance, backend) (rate(nntp_proxy_backend_errors_total{job="nntp-proxy"}[15m]))
+              - sum by (instance, backend) (rate(nntp_proxy_backend_error_replies_total{job="nntp-proxy"}[15m]))
+            )
+            / sum by (instance, backend) (rate(nntp_proxy_backend_commands_total{job="nntp-proxy"}[15m]))
+          ) > 0.05
+          and on (instance, backend)
+          sum by (instance, backend) (rate(nntp_proxy_backend_commands_total{job="nntp-proxy"}[15m])) > 0.5
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.backend }} connection errors"
+          description: "{{ $value | humanizePercentage }} of commands hit connection errors (resets, timeouts, TLS) for 15 minutes."
+
+      - alert: NntpBackendServerErrors
+        expr: |
+          (
+            sum by (instance, backend) (rate(nntp_proxy_backend_error_replies_total{job="nntp-proxy",code_class="5xx"}[15m]))
+            / sum by (instance, backend) (rate(nntp_proxy_backend_commands_total{job="nntp-proxy"}[15m]))
+          ) > 0.1
+          and on (instance, backend)
+          sum by (instance, backend) (rate(nntp_proxy_backend_commands_total{job="nntp-proxy"}[15m])) > 0.5
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.backend }} returns server errors"
+          description: "{{ $value | humanizePercentage }} of commands got 5xx replies for 15 minutes."
+
+      - alert: NntpProxyMemoryHigh
+        expr: max by (instance) (nntp_proxy_process_resident_memory_bytes{job="nntp-proxy"}) > 1.5e9
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "nntp-proxy {{ $labels.instance }} uses {{ $value | humanize1024 }}B of memory"
+          description: "Above the threshold for 30 minutes. Check cache settings and look for steady growth (a leak)."
+
+      - alert: NntpProxyCpuHigh
+        expr: sum by (instance) (rate(nntp_proxy_process_cpu_seconds_total{job="nntp-proxy"}[10m])) > 3
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "nntp-proxy {{ $labels.instance }} uses {{ $value }} CPU cores"
+          description: "Sustained high CPU for 30 minutes."
