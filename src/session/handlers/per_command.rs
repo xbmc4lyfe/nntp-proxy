@@ -209,9 +209,10 @@ impl<'a> WindowDelivery<'a> {
 
 impl Drop for WindowDelivery<'_> {
     fn drop(&mut self) {
-        if let Some(provider) = self.provider
-            && self.bytes > 0
-        {
+        let Some(provider) = self.provider else {
+            return;
+        };
+        if self.bytes > 0 {
             let now = std::time::Instant::now();
             provider.delivery().record_article(
                 self.bytes,
@@ -219,6 +220,8 @@ impl Drop for WindowDelivery<'_> {
                 self.client_stall,
                 now,
             );
+        } else {
+            provider.delivery().record_client_stall(self.client_stall);
         }
     }
 }
@@ -1232,6 +1235,8 @@ impl ClientSession {
                                 .expect("backend connection is live")
                                 .fail_backend();
                             drop(requests);
+                            // Recovery is timed by the direct path; keep it out of the window.
+                            drop(window_delivery);
                             self.execute_pipelineable_commands_with_recorded_request_bytes_from(
                                 AccountedPipelineCommandIndex(i),
                                 PipelineCommandParams {
@@ -1282,6 +1287,9 @@ impl ClientSession {
                                 "upstream window request lost its pipelineability while forwarding its response"
                             ))
                         })?;
+                    if result.is_err() {
+                        window_delivery.add(None, delivered.1);
+                    }
                     match result {
                         Ok(next_conn) => {
                             window_delivery.add(delivered.0, delivered.1);
@@ -1304,6 +1312,8 @@ impl ClientSession {
                                 "Upstream window response read failed; retrying unread requests sequentially"
                             );
                             drop(requests);
+                            // Recovery is timed by the direct path; keep it out of the window.
+                            drop(window_delivery);
                             self.execute_pipelineable_commands_with_recorded_request_bytes_from(
                                 AccountedPipelineCommandIndex(i),
                                 PipelineCommandParams {
@@ -1389,6 +1399,8 @@ impl ClientSession {
                         .expect("backend connection is live")
                         .fail_backend();
                     drop(requests);
+                    // Recovery is timed by the direct path; keep it out of the window.
+                    drop(window_delivery);
                     self.execute_pipelineable_commands_with_recorded_request_bytes_from(
                         AccountedPipelineCommandIndex(i + 1),
                         PipelineCommandParams {

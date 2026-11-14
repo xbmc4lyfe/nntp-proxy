@@ -612,9 +612,17 @@ impl ClientSession {
         {
             Ok(response) => response,
             Err(e @ SessionError::ClientDisconnect(_)) => {
+                // A client that stalls and then abandons the transfer held
+                // the connection; count it even though nothing was delivered.
+                provider
+                    .delivery()
+                    .record_client_stall(timed_writer.stalled());
                 return Err(e);
             }
             Err(e) => {
+                provider
+                    .delivery()
+                    .record_client_stall(timed_writer.stalled());
                 state.unavailable_backends.suppress(backend_id);
                 return Err(e);
             }

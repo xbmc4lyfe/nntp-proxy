@@ -843,7 +843,11 @@ async fn test_per_command_body_window_error_replies_do_not_feed_delivery() -> Re
     .await?;
     for _ in 0..2 {
         let line = read_line(&mut reader, "refused window response").await?;
-        assert!(line.starts_with("503"), "{line}");
+        assert_eq!(
+            nntp_proxy::protocol::StatusCode::parse(line.as_bytes()).map(|status| status.as_u16()),
+            Some(503),
+            "{line}"
+        );
     }
     let delivery = proxy.connection_providers()[0]
         .delivery()

@@ -145,6 +145,15 @@ impl DeliveryStats {
         state.last_sample = Some(state.last_sample.map_or(now, |last| last.max(now)));
     }
 
+    /// Add time a write spent blocked on the client, for a transfer that did
+    /// not complete (and so is not a delivery sample).
+    pub fn record_client_stall(&self, client_stall: Duration) {
+        self.client_stall_micros.fetch_add(
+            u64::try_from(client_stall.as_micros()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+    }
+
     /// Fold one time-to-first-response sample into the average.
     pub fn record_ttfb(&self, ttfb: Duration) {
         let sample = u64::try_from(ttfb.as_micros()).unwrap_or(u64::MAX).max(1);
