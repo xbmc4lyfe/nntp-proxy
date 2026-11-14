@@ -142,3 +142,22 @@ tests:
       - eval_time: 50m
         alertname: NntpBackendStandingLow
         exp_alerts: []
+
+  # A pool exhausted for a whole download fires; a brief burst does not.
+  - interval: 1m
+    input_series:
+      - series: 'nntp_proxy_buffer_pool_fallback_allocations_total{job="nntp-proxy",instance="p:9469",pool="regular"}'
+        values: '0+300x30'
+      - series: 'nntp_proxy_buffer_pool_fallback_allocations_total{job="nntp-proxy",instance="p:9469",pool="capture"}'
+        values: '0x10 600 600x20'
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: NntpProxyBufferPoolExhausted
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              instance: p:9469
+              pool: regular
+            exp_annotations:
+              summary: "nntp-proxy p:9469 regular buffer pool is exhausted"
+              description: "5 fallback buffer allocations per second for 10 minutes. Raise memory.buffer_pool_count (regular) or memory.capture_pool_count (capture) above the number of concurrent client and backend connections."
