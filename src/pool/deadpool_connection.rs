@@ -599,13 +599,16 @@ impl TcpManager {
         let mut last_error = None;
         let mut skip_ipv6 = false;
         let mut tried: SmallVec<[SocketAddr; 4]> = SmallVec::new();
-        while let Some(lease) = self.address_load.reserve_least_loaded(addrs, |addr| {
+        while let Some(mut lease) = self.address_load.reserve_least_loaded(addrs, |addr| {
             tried.contains(&addr) || (skip_ipv6 && addr.is_ipv6())
         }) {
             let socket_addr = lease.addr();
             tried.push(socket_addr);
             match self.connect_socket_addr(socket_addr).await {
-                Ok(tcp_stream) => return Ok((tcp_stream, lease)),
+                Ok(tcp_stream) => {
+                    lease.mark_connected();
+                    return Ok((tcp_stream, lease));
+                }
                 Err(error) => {
                     if Self::is_ipv6_network_unreachable(socket_addr, &error) {
                         let resolver = match dns_resolver() {
