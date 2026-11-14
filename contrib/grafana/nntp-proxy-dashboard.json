@@ -1748,7 +1748,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (backend) (nntp_proxy_backend_pool_connections{job=~\"$job\",instance=~\"$instance\",backend=~\"$backend\",state=\"leased_idle\"})",
+          "expr": "sum by (backend) (nntp_proxy_backend_leased_idle_connections{job=~\"$job\",instance=~\"$instance\",backend=~\"$backend\"})",
           "legendFormat": "{{backend}}",
           "datasource": {
             "type": "prometheus",

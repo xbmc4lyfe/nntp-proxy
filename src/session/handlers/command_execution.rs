@@ -1440,8 +1440,12 @@ impl ClientSession {
             Some(BackendLease {
                 backend_id: cached_backend_id,
                 connection: mut guard,
-                ..
+                _idle: idle,
             }) if cached_backend_id == backend_id => {
+                // The connection is in use from here on. An unbound field
+                // would live to the end of the match, double-counting the
+                // connection while the checkouts below await.
+                drop(idle);
                 if !self.cached_batch_connection_is_healthy(&mut guard, backend_id, request) {
                     guard.fail_backend();
                     let checkout_status = provider.status_counts();
@@ -1514,8 +1518,9 @@ impl ClientSession {
                 let BackendLease {
                     backend_id: cached_backend_id,
                     connection: cached_conn,
-                    ..
+                    _idle: idle,
                 } = cached;
+                drop(idle);
                 trace!(
                     client = %self.client_addr,
                     cached_backend = cached_backend_id.as_index(),

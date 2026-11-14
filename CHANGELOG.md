@@ -26,7 +26,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `nntp_proxy_backend_delivery_bytes_per_second{horizon="short|long"}`: per-connection article delivery rate from decayed byte and busy-time sums, with client stalls excluded.
   - `nntp_proxy_backend_ttfb_seconds`: first-response average over every direct article attempt.
   - `nntp_proxy_backend_client_stall_seconds_total`: time article writes spent blocked on the client.
-  - A `leased_idle` state on `nntp_proxy_backend_pool_connections`: connections a client holds between commands.
+  - `nntp_proxy_backend_leased_idle_connections`: connections a client holds between commands (a subset of `in_use`).
   Direct article attempts are now timed every time instead of 1 in 16, so `nntp_proxy_backend_first_byte_seconds` covers all of them.
 - `[routing].lower_tier_stat_prefetch` controls the background lower-tier `STAT` probes for `ARTICLE`/`BODY`: `"first-attempt"` (default), `"after-primary-miss"`, or `"off"`. The probes are overhead on small lower-tier pools when the primary tier rarely misses.
 

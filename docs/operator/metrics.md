@@ -107,7 +107,8 @@ Every backend metric has the labels `backend` and `tier`, plus any listed here.
 | `nntp_proxy_backend_error_replies_total` | counter | `code_class` = `4xx`, `5xx` | Error status replies. `4xx` includes the `430`s above; subtract them for refused commands. |
 | `nntp_proxy_backend_errors_total` | counter | | All errors attributed to the backend: `4xx` and `5xx` replies plus transport and session failures. |
 | `nntp_proxy_backend_bytes_total` | counter | `direction` = `sent`, `received` | Bytes sent to and received from the backend. Per-command traffic is added per response; pinned (stateful) sessions add theirs every 100 loop iterations and when the session ends. |
-| `nntp_proxy_backend_pool_connections` | gauge | `state` = `idle`, `in_use`, `leased_idle` | Pooled connections. `leased_idle` is the part of `in_use` that a client holds between its commands without an exchange running; a large value while other requests wait means connections are reserved rather than working. |
+| `nntp_proxy_backend_pool_connections` | gauge | `state` = `idle`, `in_use` | Pooled connections. |
+| `nntp_proxy_backend_leased_idle_connections` | gauge | | The part of `in_use` that a client holds between its commands without an exchange running. A large value while other requests wait means connections are reserved rather than working. |
 | `nntp_proxy_backend_pool_max_connections` | gauge | | Current pool limit. Lower than `max_connections` while replacement cooldowns are active. |
 | `nntp_proxy_backend_connection_cap` | gauge | | Connections allowed before cooldowns. Equals `max_connections`, unless `connection_cap = "adaptive"` lowered it after a refused login or raised it past `max_connections` while saturated. See [Adaptive connection cap](configuration.md#adaptive-connection-cap). |
 | `nntp_proxy_backend_connection_cap_reductions_total` | counter | | Times a refused login lowered the adaptive cap. Starts at zero with each process. |

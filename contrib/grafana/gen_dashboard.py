@@ -108,7 +108,7 @@ ts("Delivery rate per connection", [(f'max by (backend) (nntp_proxy_backend_deli
 ts("First-byte time (EWMA)", [(f'max by (backend) (nntp_proxy_backend_ttfb_seconds{{{B}}})', "{{backend}}")], "s", w=12,
    desc="Time from sending an article command to its first response. Close to the whole exchange time means the backend is waiting on its server (pipelining could help); a small share means it is bandwidth-bound.")
 flush()
-ts("Leased idle connections", [(f'sum by (backend) (nntp_proxy_backend_pool_connections{{{B},state="leased_idle"}})', "{{backend}}")], w=12,
+ts("Leased idle connections", [(f'sum by (backend) (nntp_proxy_backend_leased_idle_connections{{{B}}})', "{{backend}}")], w=12,
    desc="Connections a client holds between its commands without an exchange running. High while requests wait elsewhere means capacity is reserved, not working.")
 ts("Client stall", [(f'sum by (backend) (rate(nntp_proxy_backend_client_stall_seconds_total{{{B}}}[{RI}]))', "{{backend}}")], "s", w=12,
    desc="Seconds per second article writes spent blocked on a slow client (1.0 = one connection's worth of time held by the client).")

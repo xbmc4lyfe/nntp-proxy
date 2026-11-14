@@ -1147,6 +1147,12 @@ impl ClientSession {
             backend_connection,
         } = params;
         let mut conn = Some(conn);
+        // Responses on one connection come back in order, so each one keeps
+        // the connection busy from the previous completion (or the window
+        // start) to its own; the slices add up to the connection's busy time
+        // without overlapping.
+        let mut busy_since = std::time::Instant::now();
+        let delivery_provider = router.backend_provider(backend_id);
         let mut i = 0;
         while i < requests.len() {
             match &mut requests[i] {
@@ -1202,19 +1208,31 @@ impl ClientSession {
                         in_flight += 1;
                     }
                     let response_conn = conn.take().expect("backend connection is live");
-                    let result = batch
+                    let (result, delivered) = batch
                         .with_context_mut(i, |mut request| async {
+                            let mut timed_writer =
+                                crate::io_util::StallTimer::new(client_writer.get_mut());
                             let result = self
                                 .forward_response_for_already_sent_request(
                                     response_conn,
-                                    client_writer.get_mut(),
+                                    &mut timed_writer,
                                     backend,
                                     &mut request,
                                     availability,
                                     &mut state.backend_to_client_bytes,
                                 )
                                 .await;
-                            (request, result)
+                            let delivered = matches!(
+                                request.kind(),
+                                crate::protocol::RequestKind::Article
+                                    | crate::protocol::RequestKind::Body
+                            )
+                            .then(|| request.response_metadata())
+                            .flatten()
+                            .map(|response| {
+                                (response.wire_len().get() as u64, timed_writer.stalled())
+                            });
+                            (request, (result, delivered))
                         })
                         .await
                         .map_err(|_| {
@@ -1224,6 +1242,18 @@ impl ClientSession {
                         })?;
                     match result {
                         Ok(next_conn) => {
+                            let now = std::time::Instant::now();
+                            if let (Some(provider), Some((bytes, stall))) =
+                                (delivery_provider, delivered)
+                            {
+                                provider.delivery().record_article(
+                                    bytes,
+                                    now.saturating_duration_since(busy_since),
+                                    stall,
+                                    now,
+                                );
+                            }
+                            busy_since = now;
                             conn = Some(next_conn);
                             guard
                                 .take()

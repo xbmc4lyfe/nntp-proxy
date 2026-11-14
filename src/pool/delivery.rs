@@ -78,6 +78,8 @@ pub struct DeliverySnapshot {
     pub client_stall_secs: f64,
     /// Connections held by client leases between commands.
     pub leased_idle: usize,
+    /// Article deliveries observed, including ones too short to use.
+    pub observed: u64,
 }
 
 /// Delivery measurements for one backend, shared by every clone of its
@@ -89,6 +91,8 @@ pub struct DeliveryStats {
     ttfb_micros: AtomicU64,
     client_stall_micros: AtomicU64,
     leased_idle: AtomicUsize,
+    /// Article deliveries observed, including ones too short to use.
+    observed: AtomicU64,
 }
 
 impl Default for DeliveryStats {
@@ -102,6 +106,7 @@ impl Default for DeliveryStats {
             ttfb_micros: AtomicU64::new(0),
             client_stall_micros: AtomicU64::new(0),
             leased_idle: AtomicUsize::new(0),
+            observed: AtomicU64::new(0),
         }
     }
 }
@@ -111,6 +116,7 @@ impl DeliveryStats {
     /// `busy` (command sent to response complete), of which `client_stall`
     /// was spent blocked on the client.
     pub fn record_article(&self, bytes: u64, busy: Duration, client_stall: Duration, now: Instant) {
+        self.observed.fetch_add(1, Ordering::Relaxed);
         self.client_stall_micros.fetch_add(
             u64::try_from(client_stall.as_micros()).unwrap_or(u64::MAX),
             Ordering::Relaxed,
@@ -190,6 +196,7 @@ impl DeliveryStats {
             ttfb_secs,
             client_stall_secs,
             leased_idle: self.leased_idle.load(Ordering::Relaxed),
+            observed: self.observed.load(Ordering::Relaxed),
         }
     }
 }
