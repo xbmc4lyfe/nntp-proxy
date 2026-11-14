@@ -129,6 +129,15 @@ groups:
           summary: "nntp-proxy {{ $labels.instance }} uses {{ $value | humanize1024 }}B of memory"
           description: "Above the threshold for 30 minutes. Check cache settings and look for steady growth (a leak)."
 
+      - alert: NntpProxyBufferPoolExhausted
+        expr: sum by (instance, pool) (rate(nntp_proxy_buffer_pool_fallback_allocations_total{job="nntp-proxy"}[5m])) > 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "nntp-proxy {{ $labels.instance }} {{ $labels.pool }} buffer pool is exhausted"
+          description: "{{ $value | humanize }} fallback buffer allocations per second for 10 minutes. Raise memory.buffer_pool_count (regular) or memory.capture_pool_count (capture) above the number of concurrent client and backend connections."
+
       - alert: NntpProxyCpuHigh
         expr: sum by (instance) (rate(nntp_proxy_process_cpu_seconds_total{job="nntp-proxy"}[10m])) > 3
         for: 30m

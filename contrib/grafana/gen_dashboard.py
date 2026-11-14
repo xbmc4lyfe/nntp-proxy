@@ -122,6 +122,11 @@ ts("CPU cores", [(f'sum by (instance) (rate(nntp_proxy_process_cpu_seconds_total
 ts("Resident memory", [(f'sum by (instance) (nntp_proxy_process_resident_memory_bytes{{{SEL}}})', "{{instance}}")], "bytes", w=8)
 ts("Open file descriptors / threads", [(f'sum by (instance) (nntp_proxy_process_open_fds{{{SEL}}})', "{{instance}} fds"), (f'sum by (instance) (nntp_proxy_process_threads{{{SEL}}})', "{{instance}} threads")], w=8)
 flush()
+ts("Buffer pools", [(f'sum by (pool, state) (nntp_proxy_buffer_pool_buffers{{{SEL}}})', "{{pool}} {{state}}"), (f'max by (pool) (nntp_proxy_buffer_pool_max_buffers{{{SEL}}})', "{{pool}} max")], w=12,
+   desc="Pooled I/O buffers. When in_use reaches max, every further request allocates a fallback buffer.")
+ts("Buffer fallback allocations", [(f'sum by (pool) (rate(nntp_proxy_buffer_pool_fallback_allocations_total{{{SEL}}}[{RI}]))', "{{pool}}")], "ops", w=12,
+   desc="Allocations outside an exhausted pool. Sustained > 0: raise memory.buffer_pool_count (regular) or capture_pool_count (capture).")
+flush()
 ts("Cache hit ratio", [(f'sum(rate(nntp_proxy_cache_lookups_total{{{SEL},result="hit"}}[{RI}])) / clamp_min(sum(rate(nntp_proxy_cache_lookups_total{{{SEL}}}[{RI}])), 1e-9)', "hit ratio")], "percentunit", w=12, minv=0, maxv=1)
 ts("Client bytes", [(f'sum by (direction) (rate(nntp_proxy_client_bytes_total{{{SEL}}}[{RI}]))', "{{direction}}")], "Bps", w=12,
    desc="Updated when client sessions end; use backend article bytes for live throughput.")
