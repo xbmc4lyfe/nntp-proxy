@@ -111,6 +111,9 @@ pub struct ConnectionCap {
     /// and a tick cannot both move the cap from the same reading.
     last_change: Mutex<Instant>,
     reductions: AtomicU64,
+    /// Held while computing and applying a pool size, so a resize computed
+    /// from an older cap or cooldown count can never land after a newer one.
+    resize: Mutex<()>,
 }
 
 impl ConnectionCap {
@@ -122,6 +125,7 @@ impl ConnectionCap {
             cap: AtomicUsize::new(configured),
             last_change: Mutex::new(Instant::now()),
             reductions: AtomicU64::new(0),
+            resize: Mutex::new(()),
         }
     }
 
@@ -140,6 +144,14 @@ impl ConnectionCap {
     #[must_use]
     pub fn current(&self) -> usize {
         self.cap.load(Ordering::Acquire)
+    }
+
+    /// Serialize pool resizes. Callers read the cap and cooldowns and resize
+    /// while holding this, so the last resize always reflects the latest state.
+    pub fn lock_resizes(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.resize
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Times a refused login lowered the cap.
