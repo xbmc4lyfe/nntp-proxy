@@ -978,7 +978,7 @@ pub(crate) mod tests {
                 current = Some((name.to_string(), kind.to_string()));
             } else {
                 let sample = parse_sample_line(line)
-                    .unwrap_or_else(|| panic!("unparseable sample line: {line:?}"));
+                    .unwrap_or_else(|| panic!("unparsable sample line: {line:?}"));
                 let (family, kind) = current.as_ref().expect("sample after a family header");
                 let belongs = if kind == "histogram" {
                     ["_bucket", "_sum", "_count"]
