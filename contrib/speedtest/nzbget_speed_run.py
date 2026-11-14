@@ -88,6 +88,9 @@ def main():
     nzb = sys.argv[1]
     seconds, warmup, label = arg("--seconds", 180.0), arg("--warmup", 45.0), arg("--label", "run")
 
+    # Fail on a bad metrics URL or NIC before anything is queued.
+    scrape()
+    nic_rx()
     delete_test_downloads()
     name = f"{PREFIX}{int(time.time())}-{label}"
     with open(nzb, "rb") as f:
@@ -99,8 +102,8 @@ def main():
 
     start = time.time()
     samples = []
-    prev, prev_t, prev_rx = scrape(), time.time(), nic_rx()
     try:
+        prev, prev_t, prev_rx = scrape(), time.time(), nic_rx()
         while time.time() - start < seconds:
             time.sleep(SAMPLE_SECS)
             status, cur, now, rx = rpc("status"), scrape(), time.time(), nic_rx()
