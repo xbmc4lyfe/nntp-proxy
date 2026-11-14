@@ -599,16 +599,13 @@ impl TcpManager {
         let mut last_error = None;
         let mut skip_ipv6 = false;
         let mut tried: SmallVec<[SocketAddr; 4]> = SmallVec::new();
-        while let Some(mut lease) = self.address_load.reserve_least_loaded(addrs, |addr| {
+        while let Some(lease) = self.address_load.reserve_least_loaded(addrs, |addr| {
             tried.contains(&addr) || (skip_ipv6 && addr.is_ipv6())
         }) {
             let socket_addr = lease.addr();
             tried.push(socket_addr);
             match self.connect_socket_addr(socket_addr).await {
-                Ok(tcp_stream) => {
-                    lease.mark_connected();
-                    return Ok((tcp_stream, lease));
-                }
+                Ok(tcp_stream) => return Ok((tcp_stream, lease)),
                 Err(error) => {
                     if Self::is_ipv6_network_unreachable(socket_addr, &error) {
                         let resolver = match dns_resolver() {
@@ -940,7 +937,10 @@ impl TcpManager {
     /// Open, greet, authenticate and configure one backend session.
     async fn setup_session(&self) -> Result<ReadyBackendConnection, ConnectionError> {
         tokio::time::timeout(crate::constants::timeout::CONNECTION, async {
-            let (mut stream, address) = self.create_optimized_stream().await?;
+            // The address counts as healthy only once the whole session is
+            // ready: one that accepts TCP but fails TLS, the greeting or
+            // login must cool down, or it would stay the emptiest choice.
+            let (mut stream, mut address) = self.create_optimized_stream().await?;
             let mut buffer = [0u8; 4096];
 
             self.consume_greeting(&mut stream, &mut buffer).await?;
@@ -955,6 +955,7 @@ impl TcpManager {
                 stream = stream.into_compressed(level)?;
             }
 
+            address.mark_connected();
             Ok(ReadyBackendConnection::new(
                 stream,
                 Arc::clone(&self.churn),
@@ -1434,6 +1435,40 @@ mod tests {
         accept_task.await.unwrap();
     }
 
+    /// An address that accepts TCP but never completes session setup cools
+    /// down; a completed setup leaves its address healthy.
+    #[tokio::test]
+    async fn failed_session_setup_cools_the_address_down() {
+        let broken = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let broken_addr = broken.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = broken.accept().await {
+                drop(stream); // accepts, then closes before any greeting
+            }
+        });
+        let manager = TcpManager::new(
+            broken_addr.ip().to_string(),
+            broken_addr.port(),
+            "broken".to_string(),
+            TcpManagerOptions {
+                compress: Some(false),
+                ..TcpManagerOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(manager.setup_session().await.is_err());
+        assert!(manager.address_load.is_cooling(broken_addr));
+
+        let (healthy_addr, _accepted) = spawn_login_server(|_| "281 ok\r\n").await;
+        let healthy = login_manager(healthy_addr);
+        let connection = healthy.setup_session().await.unwrap();
+        assert!(!healthy.address_load.is_cooling(healthy_addr));
+        assert_eq!(healthy.address_load.live_count(healthy_addr), 1);
+        drop(connection);
+        assert_eq!(healthy.address_load.live_count(healthy_addr), 0);
+        assert!(!healthy.address_load.is_cooling(healthy_addr));
+    }
+
     /// Connections from one backend spread evenly over its addresses, and a
     /// closed connection frees its address for the next one.
     #[tokio::test]
@@ -1462,7 +1497,9 @@ mod tests {
 
         let mut connections = Vec::new();
         for _ in 0..10 {
-            connections.push(manager.try_resolved_socket_addrs(&addrs).await.unwrap());
+            let (stream, mut lease) = manager.try_resolved_socket_addrs(&addrs).await.unwrap();
+            lease.mark_connected(); // as a completed session setup does
+            connections.push((stream, lease));
         }
         assert_eq!(manager.address_load.live_count(addrs[0]), 5);
         assert_eq!(manager.address_load.live_count(addrs[1]), 5);

@@ -111,6 +111,16 @@ impl AddressLoad {
     }
 
     #[cfg(test)]
+    pub(crate) fn is_cooling(&self, addr: SocketAddr) -> bool {
+        let now = Instant::now();
+        self.cooling
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(known, until)| *known == addr && *until > now)
+    }
+
+    #[cfg(test)]
     pub(crate) fn live_count(&self, addr: SocketAddr) -> usize {
         self.live
             .lock()
@@ -123,9 +133,9 @@ impl AddressLoad {
 
 /// One live (or connecting) connection's claim on its address.
 ///
-/// A lease dropped before [`Self::mark_connected`] means the connect failed
-/// or was cancelled (for example by the setup deadline), and puts the address
-/// on cooldown.
+/// A lease dropped before [`Self::mark_connected`] means the connection never
+/// became a ready session (TCP, TLS, greeting or login failed, or the setup
+/// deadline cancelled it), and puts the address on cooldown.
 #[derive(Debug)]
 pub(crate) struct AddressLease {
     load: Arc<AddressLoad>,
@@ -138,7 +148,7 @@ impl AddressLease {
         self.addr
     }
 
-    /// The TCP connect succeeded; the address is healthy again.
+    /// Session setup completed; the address is healthy again.
     pub(crate) fn mark_connected(&mut self) {
         self.connected = true;
         self.load.clear_cooldown(self.addr);
