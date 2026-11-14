@@ -799,7 +799,56 @@ async fn test_per_command_body_window_feeds_delivery_estimate() -> Result<()> {
     let delivery = proxy.connection_providers()[0]
         .delivery()
         .snapshot(std::time::Instant::now());
-    assert_eq!(delivery.observed, 2, "both window responses were recorded");
+    assert_eq!(
+        delivery.observed, 1,
+        "the window is recorded as one sample covering both responses"
+    );
+    Ok(())
+}
+
+/// Error replies forwarded through a window are not article deliveries.
+#[tokio::test]
+async fn test_per_command_body_window_error_replies_do_not_feed_delivery() -> Result<()> {
+    let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let backend_port = backend_listener.local_addr()?.port();
+    let _backend = spawn_delayed_pipeline_backend(
+        backend_listener,
+        &[
+            (
+                "BODY <refused-window-1@example>",
+                "503 Service temporarily unavailable\r\n",
+            ),
+            (
+                "BODY <refused-window-2@example>",
+                "503 Service temporarily unavailable\r\n",
+            ),
+        ],
+        &[],
+    );
+    let (proxy_port, proxy) = crate::test_helpers::spawn_proxy_with_config_handle(
+        pipeline_backend_config(backend_port, "BodyWindowRefused"),
+        RoutingMode::PerCommand,
+    )
+    .await?;
+    let client = connect_and_read_greeting(proxy_port).await?;
+    let (read_half, mut write_half) = client.into_split();
+    let mut reader = BufReader::new(read_half);
+    write_commands(
+        &mut write_half,
+        &[
+            "BODY <refused-window-1@example>\r\n",
+            "BODY <refused-window-2@example>\r\n",
+        ],
+    )
+    .await?;
+    for _ in 0..2 {
+        let line = read_line(&mut reader, "refused window response").await?;
+        assert!(line.starts_with("503"), "{line}");
+    }
+    let delivery = proxy.connection_providers()[0]
+        .delivery()
+        .snapshot(std::time::Instant::now());
+    assert_eq!(delivery.observed, 0, "error replies are not deliveries");
     Ok(())
 }
 

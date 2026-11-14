@@ -180,6 +180,49 @@ struct SingleBackendArticleWindow<'a> {
 
 struct UpstreamRequestIndex(usize);
 
+/// Article bytes delivered through one upstream window and the time the
+/// connection was busy with it, recorded as a single delivery sample when
+/// the window ends (including early exits). Only successful ARTICLE/BODY
+/// replies add bytes; client stalls are summed so they can be excluded.
+struct WindowDelivery<'a> {
+    provider: Option<&'a crate::pool::DeadpoolConnectionProvider>,
+    started: std::time::Instant,
+    bytes: u64,
+    client_stall: std::time::Duration,
+}
+
+impl<'a> WindowDelivery<'a> {
+    fn new(provider: Option<&'a crate::pool::DeadpoolConnectionProvider>) -> Self {
+        Self {
+            provider,
+            started: std::time::Instant::now(),
+            bytes: 0,
+            client_stall: std::time::Duration::ZERO,
+        }
+    }
+
+    fn add(&mut self, article_bytes: Option<u64>, client_stall: std::time::Duration) {
+        self.bytes += article_bytes.unwrap_or(0);
+        self.client_stall += client_stall;
+    }
+}
+
+impl Drop for WindowDelivery<'_> {
+    fn drop(&mut self) {
+        if let Some(provider) = self.provider
+            && self.bytes > 0
+        {
+            let now = std::time::Instant::now();
+            provider.delivery().record_article(
+                self.bytes,
+                now.saturating_duration_since(self.started),
+                self.client_stall,
+                now,
+            );
+        }
+    }
+}
+
 /// The batch connection a window may reuse, and the bound on a fresh checkout.
 struct ArticleWindowConnection<'a> {
     lease: &'a mut BatchBackendConnection,
@@ -1147,12 +1190,10 @@ impl ClientSession {
             backend_connection,
         } = params;
         let mut conn = Some(conn);
-        // Responses on one connection come back in order, so each one keeps
-        // the connection busy from the previous completion (or the window
-        // start) to its own; the slices add up to the connection's busy time
-        // without overlapping.
-        let mut busy_since = std::time::Instant::now();
-        let delivery_provider = router.backend_provider(backend_id);
+        // One sample per window: responses that arrive together forward in
+        // microseconds, so per-response slices would be discarded as too
+        // short while the first one absorbed the whole wait.
+        let mut window_delivery = WindowDelivery::new(router.backend_provider(backend_id));
         let mut i = 0;
         while i < requests.len() {
             match &mut requests[i] {
@@ -1222,6 +1263,7 @@ impl ClientSession {
                                     &mut state.backend_to_client_bytes,
                                 )
                                 .await;
+                            let stall = timed_writer.stalled();
                             let delivered = matches!(
                                 request.kind(),
                                 crate::protocol::RequestKind::Article
@@ -1229,9 +1271,9 @@ impl ClientSession {
                             )
                             .then(|| request.response_metadata())
                             .flatten()
-                            .map(|response| {
-                                (response.wire_len().get() as u64, timed_writer.stalled())
-                            });
+                            .filter(|response| response.status().is_success())
+                            .map(|response| response.wire_len().get() as u64);
+                            let delivered = (delivered, stall);
                             (request, (result, delivered))
                         })
                         .await
@@ -1242,18 +1284,7 @@ impl ClientSession {
                         })?;
                     match result {
                         Ok(next_conn) => {
-                            let now = std::time::Instant::now();
-                            if let (Some(provider), Some((bytes, stall))) =
-                                (delivery_provider, delivered)
-                            {
-                                provider.delivery().record_article(
-                                    bytes,
-                                    now.saturating_duration_since(busy_since),
-                                    stall,
-                                    now,
-                                );
-                            }
-                            busy_since = now;
+                            window_delivery.add(delivered.0, delivered.1);
                             conn = Some(next_conn);
                             guard
                                 .take()
