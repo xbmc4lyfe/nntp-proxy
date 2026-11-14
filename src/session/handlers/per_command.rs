@@ -181,29 +181,52 @@ struct SingleBackendArticleWindow<'a> {
 struct UpstreamRequestIndex(usize);
 
 /// Article bytes delivered through one upstream window and the time the
-/// connection was busy with it, recorded as a single delivery sample when
-/// the window ends (including early exits). Only successful ARTICLE/BODY
-/// replies add bytes; client stalls are summed so they can be excluded.
+/// connection spent on them, recorded as a single delivery sample when the
+/// window ends (including early exits).
+///
+/// Responses on one connection complete in order, so each response's busy
+/// slice runs from the previous completion (or the window start) to its own.
+/// Only successful ARTICLE/BODY slices count, so HEADs and error replies in
+/// a mixed window don't dilute the rate; the slices are summed before the
+/// minimum-duration check, because responses that arrive together forward
+/// in microseconds each.
 struct WindowDelivery<'a> {
     provider: Option<&'a crate::pool::DeadpoolConnectionProvider>,
-    started: std::time::Instant,
+    last_completion: std::time::Instant,
+    article_busy: std::time::Duration,
     bytes: u64,
-    client_stall: std::time::Duration,
+    /// Stall inside the counted article slices, subtracted from their busy time.
+    article_stall: std::time::Duration,
+    /// Stall on everything else (HEADs, errors, failed responses), counted
+    /// as client stall only.
+    other_stall: std::time::Duration,
 }
 
 impl<'a> WindowDelivery<'a> {
     fn new(provider: Option<&'a crate::pool::DeadpoolConnectionProvider>) -> Self {
         Self {
             provider,
-            started: std::time::Instant::now(),
+            last_completion: std::time::Instant::now(),
+            article_busy: std::time::Duration::ZERO,
             bytes: 0,
-            client_stall: std::time::Duration::ZERO,
+            article_stall: std::time::Duration::ZERO,
+            other_stall: std::time::Duration::ZERO,
         }
     }
 
+    /// One response finished; `article_bytes` is set only for a successful
+    /// ARTICLE/BODY reply.
     fn add(&mut self, article_bytes: Option<u64>, client_stall: std::time::Duration) {
-        self.bytes += article_bytes.unwrap_or(0);
-        self.client_stall += client_stall;
+        let now = std::time::Instant::now();
+        let slice = now.saturating_duration_since(self.last_completion);
+        self.last_completion = now;
+        if let Some(bytes) = article_bytes {
+            self.bytes += bytes;
+            self.article_busy += slice;
+            self.article_stall += client_stall;
+        } else {
+            self.other_stall += client_stall;
+        }
     }
 }
 
@@ -213,16 +236,14 @@ impl Drop for WindowDelivery<'_> {
             return;
         };
         if self.bytes > 0 {
-            let now = std::time::Instant::now();
             provider.delivery().record_article(
                 self.bytes,
-                now.saturating_duration_since(self.started),
-                self.client_stall,
-                now,
+                self.article_busy,
+                self.article_stall,
+                std::time::Instant::now(),
             );
-        } else {
-            provider.delivery().record_client_stall(self.client_stall);
         }
+        provider.delivery().record_client_stall(self.other_stall);
     }
 }
 
