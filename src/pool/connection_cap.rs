@@ -340,6 +340,23 @@ mod tests {
     }
 
     #[test]
+    fn a_refusal_at_the_cap_ends_probing_without_lowering_it() {
+        let (cap, start) = adaptive(80);
+        let now = start + PROBE_STEP;
+        cap.on_tick(PoolDemand::Saturated, now);
+        assert_eq!(cap.current(), 81);
+        // The 82nd login is refused with 81 open: the cap is already right.
+        assert_eq!(cap.on_login_refused(81, now), None);
+        assert_eq!(cap.reductions(), 0);
+        // But the climb now waits the full back-off step, not the probe step.
+        assert_eq!(cap.on_tick(PoolDemand::Saturated, now + PROBE_STEP), None);
+        assert_eq!(
+            cap.on_tick(PoolDemand::Saturated, now + CLIMB_STEP),
+            Some(CapChange::Raised { from: 81, to: 82 })
+        );
+    }
+
+    #[test]
     fn below_the_configured_size_climbs_back_without_demand() {
         let (cap, start) = adaptive(80);
         cap.on_login_refused(78, start);

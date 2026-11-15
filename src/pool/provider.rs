@@ -116,7 +116,11 @@ fn tick_connection_cap(
         return;
     }
     let status = pool.status();
-    let demand = if status.size >= status.max_size && status.available == 0 {
+    // Saturated means the cap itself is full, not just the pool: replacement
+    // cooldowns shrink the pool below the cap, and a pool full at that
+    // smaller size has not shown the provider accepts the cap, let alone one
+    // more.
+    let demand = if status.size >= cap.current() && status.available == 0 {
         PoolDemand::Saturated
     } else {
         PoolDemand::Headroom
@@ -2086,6 +2090,31 @@ mod tests {
         // At max_connections an idle pool does not creep past it.
         provider.tick_connection_cap_at(refused_at + CLIMB_STEP * 30);
         assert_eq!(provider.max_size(), 4);
+        provider.shutdown();
+    }
+
+    /// A pool shrunk by replacement cooldowns and full at that size has not
+    /// tested the cap, so the probe must not raise it.
+    #[tokio::test]
+    async fn adaptive_cap_does_not_probe_while_cooldowns_shrink_the_pool() {
+        use crate::pool::connection_cap::{ConnectionCapPolicy, PROBE_STEP};
+        let addr = spawn_limited_login_server(usize::MAX).await;
+        let provider = capped_provider(addr, 4, ConnectionCapPolicy::Adaptive);
+        let start = tokio::time::Instant::now();
+        provider.active_cooldowns.store(2, Ordering::Release);
+        sync_pool_size(&provider.pool, &provider.cap, &provider.active_cooldowns);
+        assert_eq!(provider.max_size(), 2);
+        let first = provider.checkout_connection_guard().await.unwrap();
+        let second = provider.checkout_connection_guard().await.unwrap();
+
+        provider.tick_connection_cap_at(start + PROBE_STEP * 2);
+        assert_eq!(
+            provider.connection_cap(),
+            4,
+            "two busy connections under a cap of 4 is not saturation"
+        );
+
+        drop((first, second));
         provider.shutdown();
     }
 

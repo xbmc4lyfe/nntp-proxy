@@ -689,8 +689,11 @@ impl ByGoodput {
     /// Measured rates are clamped up to this so one stalled transfer cannot
     /// shut a backend out entirely.
     const MIN_BYTES_PER_SEC: f64 = 10_000.0;
-    /// Weighted round-robin works in whole connections per this rate.
-    const WRR_UNIT_BYTES_PER_SEC: f64 = 250_000.0;
+    /// Weighted round-robin gives a backend its full connection count as
+    /// share at this per-connection rate and proportionally less below it.
+    /// Shares stay in whole connections, as for standing, so one cycle is at
+    /// most the tier's capacity and no backend gets a long burst.
+    const WRR_FULL_SHARE_BYTES_PER_SEC: f64 = 8_000_000.0;
 
     /// Standing times rate in MB/s; only ratios between backends matter.
     fn goodput(backend: &BackendInfo) -> f64 {
@@ -716,8 +719,9 @@ impl Weighing for ByGoodput {
     )]
     fn weight(backend: &BackendInfo) -> usize {
         let capacity = backend.provider.max_size() as f64;
-        let units = capacity * Self::goodput(backend) * 1_000_000.0 / Self::WRR_UNIT_BYTES_PER_SEC;
-        (units.ceil() as usize).max(1)
+        let share =
+            (Self::goodput(backend) * 1_000_000.0 / Self::WRR_FULL_SHARE_BYTES_PER_SEC).min(1.0);
+        ((capacity * share).ceil() as usize).max(1)
     }
 
     /// With the request being placed counted, this is the expected time for
@@ -1284,7 +1288,15 @@ impl BackendSelector {
     where
         F: Fn(&&BackendInfo) -> bool,
     {
-        let total_weight: usize = self.backends.iter().filter(&filter).map(W::weight).sum();
+        // Weights are read once: goodput weights move with every delivery,
+        // and a second read could put the position past the scanned total.
+        let weighted: smallvec::SmallVec<[(&BackendInfo, usize); 8]> = self
+            .backends
+            .iter()
+            .filter(&filter)
+            .map(|backend| (backend, W::weight(backend)))
+            .collect();
+        let total_weight: usize = weighted.iter().map(|&(_, weight)| weight).sum();
 
         if total_weight == 0 {
             return None;
@@ -1295,11 +1307,10 @@ impl BackendSelector {
             .fetch_add(1, Ordering::Relaxed)
             % total_weight;
 
-        self.backends
+        weighted
             .iter()
-            .filter(&filter)
-            .scan(0, |cumulative, backend| {
-                *cumulative += W::weight(backend);
+            .scan(0, |cumulative, &(backend, weight)| {
+                *cumulative += weight;
                 Some((*cumulative, backend))
             })
             .find(|(cumulative_weight, _)| position < *cumulative_weight)
@@ -1508,8 +1519,14 @@ impl BackendSelector {
     {
         match &self.strategy {
             SelectionStrategy::WeightedRoundRobin(wrr) => {
-                // Sum weights for backends passing filter
-                let total_weight: usize = self.backends.iter().filter(&filter).map(W::weight).sum();
+                // Read each weight once, as in select_capacity_weighted.
+                let weighted: smallvec::SmallVec<[(&BackendInfo, usize); 8]> = self
+                    .backends
+                    .iter()
+                    .filter(&filter)
+                    .map(|backend| (backend, W::weight(backend)))
+                    .collect();
+                let total_weight: usize = weighted.iter().map(|&(_, weight)| weight).sum();
 
                 if total_weight == 0 {
                     return None; // No backends match filter
@@ -1518,12 +1535,10 @@ impl BackendSelector {
                 // Select position in weighted distribution
                 let position = wrr.select_with_weight(total_weight)?;
 
-                // Find backend at that position
-                self.backends
+                weighted
                     .iter()
-                    .filter(&filter)
-                    .scan(0, |cumulative, backend| {
-                        *cumulative += W::weight(backend);
+                    .scan(0, |cumulative, &(backend, weight)| {
+                        *cumulative += weight;
                         Some((*cumulative, backend))
                     })
                     .find(|(cumulative_weight, _)| position < *cumulative_weight)
@@ -2327,6 +2342,21 @@ mod tests {
     }
 
     #[test]
+    fn goodput_round_robin_interleaves_backends_in_short_runs() {
+        use crate::pool::admission::ArticleStanding;
+        let selector = standing_selector(
+            BackendSelectionStrategy::WeightedRoundRobin,
+            ArticleStanding::Goodput,
+            &[("slow", 50, 0), ("fast", 50, 0)],
+        );
+        note_delivery(&selector, BackendId::from_index(0), 600_000);
+        note_delivery(&selector, BackendId::from_index(1), 3_600_000);
+        // Shares 4 and 23: both backends appear within every 27 lookups.
+        let counts = route_counts(&selector, Some(&ArticleAvailability::new()), 54);
+        assert_eq!(counts, vec![8, 46]);
+    }
+
+    #[test]
     fn goodput_discounts_a_fast_backend_that_is_missing_the_release() {
         use crate::pool::admission::{ArticleLookupOutcome, ArticleStanding};
         let selector = standing_selector(
@@ -2358,8 +2388,8 @@ mod tests {
             &[("measured", 50, 0), ("new", 50, 0)],
         );
         note_delivery(&selector, BackendId::from_index(0), 3_000_000);
-        // One full round-robin cycle: 600 units measured, 200 unmeasured.
-        let counts = route_counts(&selector, Some(&ArticleAvailability::new()), 800);
+        // Shares 19 (3 MB/s) and 7 (assumed 1 MB/s): a few full cycles.
+        let counts = route_counts(&selector, Some(&ArticleAvailability::new()), 104);
         assert!(
             counts[1] > 0,
             "an unmeasured backend is sampled: {counts:?}"
