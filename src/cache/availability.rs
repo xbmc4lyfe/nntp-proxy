@@ -349,6 +349,36 @@ mod tests {
     }
 
     #[test]
+    fn a_backbone_keeps_its_slot_and_epoch_across_registry_reloads() {
+        let directory = tempfile::tempdir().unwrap();
+        let servers = [
+            Server::builder("a.example", Port::try_new(119).unwrap())
+                .backbone("Omicron.")
+                .build()
+                .unwrap(),
+            Server::builder("b.example", Port::try_new(119).unwrap())
+                .backbone("omicron")
+                .build()
+                .unwrap(),
+        ];
+        let first = AvailabilityLayout::from_hybrid_registry(&servers, directory.path()).unwrap();
+        for _ in 0..3 {
+            let again =
+                AvailabilityLayout::from_hybrid_registry(&servers, directory.path()).unwrap();
+            assert_eq!(again.availability_epoch(), first.availability_epoch());
+            assert_eq!(again.identity_count(), first.identity_count());
+            assert_eq!(
+                again.slot_for_backend(BackendId::from_index(0)),
+                first.slot_for_backend(BackendId::from_index(0))
+            );
+        }
+        assert_eq!(
+            first.slot_for_backend(BackendId::from_index(0)),
+            first.slot_for_backend(BackendId::from_index(1))
+        );
+    }
+
+    #[test]
     fn a_backbone_never_collides_with_a_host_of_the_same_name() {
         let servers = [
             Server::builder("omicron", Port::try_new(119).unwrap())

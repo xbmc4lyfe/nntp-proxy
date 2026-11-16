@@ -438,8 +438,9 @@ backbone = "omicron"
 Group servers only when they really share an article store. A reseller with
 shorter retention, or a separate block on the same backbone that holds
 different articles, belongs under its own name: a `430` from it would hide
-articles the others have. With the disk cache on, cached `430`s are kept per
-backbone, so changing a server's `backbone` starts it with no cached misses.
+articles the others have. Saved `430`s (the availability state file and the
+disk cache) are kept per backbone, so changing a server's `backbone` starts it
+with no saved misses.
 The environment variable is `NNTP_SERVER_<N>_BACKBONE`. Startup logs each
 backbone with its servers.
 
@@ -503,6 +504,8 @@ Currently supported backend environment fields:
 - `PREWARM_CONNECTIONS` (non-negative integer; any other value stops startup)
 - `TIER`
 - `STATEFUL_SESSIONS` (`allowed` or `excluded`; any other value stops startup)
+- `CONNECTION_CAP` (`fixed` or `adaptive`; any other value stops startup)
+- `BACKBONE` (backbone name; blank means unset)
 
 Example:
 

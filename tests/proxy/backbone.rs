@@ -39,6 +39,8 @@ struct Backend {
     behaviour: Behaviour,
 }
 
+/// A backend that answers every message-ID lookup the same way. `contacts`
+/// counts lookups, or for a full account the logins it refused.
 async fn spawn_backend(behaviour: Behaviour, lookups: Arc<AtomicUsize>) -> Result<u16> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let port = listener.local_addr()?.port();
@@ -48,6 +50,7 @@ async fn spawn_backend(behaviour: Behaviour, lookups: Arc<AtomicUsize>) -> Resul
             tokio::spawn(async move {
                 let mut stream = BufReader::new(stream);
                 if matches!(behaviour, Behaviour::TooManyConnections) {
+                    lookups.fetch_add(1, Ordering::Relaxed);
                     let _ = stream
                         .get_mut()
                         .write_all(b"502 too many connections\r\n")
@@ -65,9 +68,10 @@ async fn spawn_backend(behaviour: Behaviour, lookups: Arc<AtomicUsize>) -> Resul
                     }
                     let command = line.trim_end().to_string();
                     let reply = match command.split_once(' ') {
-                        Some(("ARTICLE", id)) => {
+                        Some((verb @ ("ARTICLE" | "STAT"), id)) => {
                             lookups.fetch_add(1, Ordering::Relaxed);
                             match behaviour {
+                                Behaviour::Has if verb == "STAT" => format!("223 0 {id}\r\n"),
                                 Behaviour::Has => {
                                     format!("220 0 {id}\r\nSubject: x\r\n\r\nbody\r\n.\r\n")
                                 }
@@ -95,6 +99,13 @@ async fn spawn_backend(behaviour: Behaviour, lookups: Arc<AtomicUsize>) -> Resul
 }
 
 async fn start_proxy(backends: &[Backend]) -> Result<(u16, Vec<Arc<AtomicUsize>>)> {
+    start_proxy_with(backends, Routing::default()).await
+}
+
+async fn start_proxy_with(
+    backends: &[Backend],
+    routing: Routing,
+) -> Result<(u16, Vec<Arc<AtomicUsize>>)> {
     let mut servers = Vec::new();
     let mut counters = Vec::new();
     for (index, backend) in backends.iter().enumerate() {
@@ -115,7 +126,7 @@ async fn start_proxy(backends: &[Backend]) -> Result<(u16, Vec<Arc<AtomicUsize>>
     }
     let config = Config {
         servers,
-        routing: Routing::default(),
+        routing,
         ..Config::default()
     };
     let proxy = NntpProxy::builder(config)
@@ -232,6 +243,48 @@ async fn sibling_answers_after(failure: Behaviour) -> Result<()> {
         "a sibling on the same backbone must answer: {codes:?}"
     );
     assert_eq!(lookups(&counters[1]), 8);
+    assert!(
+        lookups(&counters[0]) > 0,
+        "the failing server must have been tried for the test to mean anything"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_adaptive_precheck_skips_a_backbone_sibling_in_a_lower_tier() -> Result<()> {
+    let routing = Routing {
+        adaptive_precheck: true,
+        ..Routing::default()
+    };
+    let (port, counters) = start_proxy_with(
+        &[
+            backend("reseller-a", 0, Some("omicron"), Behaviour::Missing),
+            backend("reseller-b", 1, Some("omicron"), Behaviour::Has),
+        ],
+        routing,
+    )
+    .await?;
+
+    let mut codes = Vec::new();
+    for index in 0..6 {
+        let client = connect_and_read_greeting(port).await?;
+        let mut client = BufReader::new(client);
+        client
+            .get_mut()
+            .write_all(format!("STAT <pre-{index}@example.com>\r\n").as_bytes())
+            .await?;
+        let mut line = String::new();
+        client.read_line(&mut line).await?;
+        codes.push(line.chars().take(3).collect::<String>());
+    }
+
+    assert!(codes.iter().all(|code| code == "430"), "{codes:?}");
+    assert!(lookups(&counters[0]) > 0);
+    assert_eq!(
+        lookups(&counters[1]),
+        0,
+        "the precheck must not ask a lower-tier server on the same backbone"
+    );
     Ok(())
 }
 

@@ -54,9 +54,12 @@ impl AvailabilityIdentity {
     /// with a host of the same spelling.
     pub(crate) fn for_server(server: &Server) -> Self {
         match server.backbone.as_deref().map(str::trim) {
-            Some(backbone) if !backbone.is_empty() => {
-                Self(format!("backbone={}", backbone.to_ascii_lowercase()))
-            }
+            // Canonicalized as a persisted identity will be, so a reload
+            // finds the same slot.
+            Some(backbone) if !backbone.is_empty() => Self(canonicalize_host(&format!(
+                "backbone={}",
+                backbone.to_ascii_lowercase()
+            ))),
             _ => Self::from(&server.host),
         }
     }
