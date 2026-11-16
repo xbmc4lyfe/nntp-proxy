@@ -62,11 +62,25 @@ pub(crate) async fn fingerprint(
                     refusals.push(format!("LIST ACTIVE {group} gave no usable line"));
                 }
             }
-            Ok(Reply::Line(line)) => refusals.push(format!(
-                "LIST ACTIVE answered \"{}\"",
-                line.chars().take(60).collect::<String>()
-            )),
-            Err(error) => refusals.push(format!("LIST ACTIVE failed: {error:#}")),
+            // Only a status code or a fixed description goes into the note:
+            // server text can echo account names and has no size limit.
+            Ok(Reply::Line(line)) => {
+                refusals.push(match crate::protocol::StatusCode::parse(line.as_bytes()) {
+                    Some(code) => format!("LIST ACTIVE was refused with status {}", code.as_u16()),
+                    None => "LIST ACTIVE got an unreadable reply".to_owned(),
+                })
+            }
+            Err(error) => {
+                tracing::debug!(backend = backend.as_index(), error = %format!("{error:#}"), "backbone probe: LIST ACTIVE failed");
+                refusals.push(
+                    match error.to_string().as_str() {
+                        "no connection" => "no connection could be made for LIST ACTIVE",
+                        "timed out" => "LIST ACTIVE timed out",
+                        _ => "LIST ACTIVE failed",
+                    }
+                    .to_owned(),
+                );
+            }
         }
     }
     if fingerprint.watermarks.is_empty() {

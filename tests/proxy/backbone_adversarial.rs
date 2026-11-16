@@ -428,9 +428,10 @@ fn assert_intact(before: &str, after: &str) {
     let parsed_before: toml::Value = toml::from_str(before).expect("the test's own config parses");
     let parsed_after: toml::Value = toml::from_str(after)
         .unwrap_or_else(|error| panic!("annotated config no longer parses: {error}\n{after}"));
+    // A final line without a newline gains one so a note cannot run into it.
     assert_eq!(
-        foreign_lines(before),
-        foreign_lines(after),
+        foreign_lines(before).trim_end_matches('\n'),
+        foreign_lines(after).trim_end_matches('\n'),
         "a line the check does not own changed:\n--- before\n{before}\n--- after\n{after}"
     );
     assert_eq!(
@@ -680,7 +681,7 @@ async fn list_single_line_errors_are_not_evidence() -> Result<()> {
             assert!(
                 running
                     .file()
-                    .contains(&format!("LIST ACTIVE answered \"{code}")),
+                    .contains(&format!("LIST ACTIVE was refused with status {code}")),
                 "{}",
                 running.file()
             );

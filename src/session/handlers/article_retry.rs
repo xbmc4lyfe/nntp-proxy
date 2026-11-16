@@ -520,6 +520,12 @@ impl ClientSession {
                 // miss was recorded for it, so a later request still tries it,
                 // and the reply must not claim the article is missing unless
                 // the operator chose `430` for this case.
+                // Backbone detection can move a backend onto a slot that
+                // already holds a 430 between the exhaustion check and the
+                // route; then nobody is left because every backend did
+                // answer 430, and the loop's normal 430 reply applies.
+                Ok(BackendAttemptResult::NoRetryableBackend)
+                    if availability.all_exhausted(router.availability_mask()) => {}
                 Ok(
                     BackendAttemptResult::DeadlineExpired
                     | BackendAttemptResult::NoRetryableBackend,
