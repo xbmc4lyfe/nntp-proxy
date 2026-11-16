@@ -39,7 +39,7 @@ struct Backend {
     behaviour: Behaviour,
 }
 
-/// A backend that answers every message-ID lookup the same way. `contacts`
+/// A backend that answers every message-ID lookup the same way. `lookups`
 /// counts lookups, or for a full account the logins it refused.
 async fn spawn_backend(behaviour: Behaviour, lookups: Arc<AtomicUsize>) -> Result<u16> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
