@@ -54,6 +54,14 @@ adaptive_precheck = false
 #                               primary-tier 430 still runs
 lower_tier_stat_prefetch = "first-attempt"
 
+# Work out which servers share a backbone (one article store) from the article
+# numbers they report, so a 430 from one skips the rest:
+#   "annotate" (default) - regroup servers by the evidence and write findings
+#                          into this file as "# backbone-check" comments
+#   "apply"              - regroup and only log
+#   "off"                - only per-server `backbone` values group servers
+backbone_detection = "annotate"
+
 # Queue backpressure keeps article routing from piling more work onto
 # already-saturated backend connection pools.
 [routing.queue.backpressure]
@@ -180,6 +188,9 @@ name = "Example News Server 1"
 # Servers with the same hostname share recorded article misses across ports,
 # accounts, and credentials. Hostname matching ignores ASCII case and one trailing
 # DNS dot.
+# Backbone this server resells. Servers on one backbone share recorded misses
+# too. "auto" (or left out) lets the proxy work it out; a named one is checked.
+# backbone = "auto"
 max_connections = 20
 # Lower tier numbers are tried first. Higher tiers are fallback/archive servers.
 tier = 0

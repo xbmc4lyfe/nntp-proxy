@@ -66,6 +66,17 @@ This file is mandatory guidance for AI agents working in this repository.
   payload variants are distinct.
 - The disk cache uses foyer hybrid with the psync I/O engine; do not switch it
   to io_uring.
+- Backbones (`src/backbone/`): servers on one backbone share one availability
+  slot, so a `430` from one skips the rest. Detection groups servers only from
+  matching `LIST ACTIVE` article numbers and retention; brand hints and
+  software quirks may name or support a group, never form one, because a wrong
+  grouping hides articles. The backend-to-slot table (`BackendSlots`) is shared
+  by the layout, router and caches and may change at runtime; read slots
+  through it, never cache one per backend. Known backbones and reseller brands
+  live in `src/backbone/backbones.toml` (developer data, not operator config);
+  resellers change backbones, so treat entries as hints. Config annotation
+  only adds or replaces `# backbone-check` comment lines and never changes a
+  value.
 
 ## Error Handling
 

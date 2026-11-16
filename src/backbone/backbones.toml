@@ -1,0 +1,72 @@
+# Known Usenet backbones and the reseller brands that sit on them.
+#
+# Developer-maintained, compiled into the binary; operators set `backbone` in
+# their own config instead. Resellers change backbones, sign extra deals, or
+# move a hostname to a new provider, so treat every entry as a hint that can go
+# stale. Detection never groups servers from this file alone: it only names a
+# group that article-number evidence (or the operator's config) already formed.
+#
+# A brand is matched, ignoring case and punctuation, inside a server's hostname
+# and greeting line. A brand listed under more than one backbone belongs to a
+# reseller that sells several backbones, so it is never used as a hint.
+
+[probe]
+# Busy groups every full-retention backbone carries. `LIST ACTIVE <group>`
+# answers with its highest and lowest article numbers; servers on one backbone
+# report the same numbers, give or take a few seconds of new posts.
+groups = ["alt.binaries.boneless", "alt.binaries.multimedia", "alt.binaries.teevee"]
+# How often to probe again after the first check at startup.
+interval_hours = 6
+
+[[backbone]]
+name = "omicron"
+brands = [
+    "AnonyNews", "Astraweb", "BinTube", "EasyNews", "ExtremeUsenet", "Fast-Usenet",
+    "Firstload", "Ixinews", "NewsLeecher", "Newsgroup Ninja", "Newshosting", "Ngroups",
+    "Prepaid-Usenet", "PureUsenet", "Shemes", "SimonNews", "SnelNL", "SunnyUsenet",
+    "Usenet-News", "Usenet.se", "Usenet4u", "UsenetBucket", "UsenetStorm", "Usenetserver",
+    "XLned", "iLoad USENET",
+    # Lists often give Eweka as its own backbone, but its article numbers and
+    # retention match Omicron's exactly (probe, 2026-11-16).
+    "Eweka",
+]
+
+[[backbone]]
+name = "usenetexpress"
+brands = [
+    "Binary Boy", "MaximumUSENET", "NewsDemon", "NewsgroupDirect", "ThunderNews",
+    "UsenetExpress", "UsenetNews", "UsenetPrime", "theCubeNet",
+]
+
+[[backbone]]
+name = "abavia"
+brands = [
+    "Bulknews", "CheapNews", "EasyUsenet", "FreeDiscussions", "Frugal Usenet", "Gebruikhet",
+    "HitNews", "I-Telligent", "LatinUsenet", "NewsGrabber", "NewsXS", "Spotnews",
+    "StingyUsenet", "TurboUsenet", "UseNight", "UsenetAgency", "UsenetDeal", "UsenetPrime",
+    "Usenetdiscounter", "Usenext", "XS News",
+]
+
+[[backbone]]
+name = "netnews"
+brands = ["Blocknews", "Frugal Usenet", "UsenetNow"]
+
+[[backbone]]
+name = "giganews"
+brands = ["Giganews", "NewsgroupDirect", "Supernews"]
+
+[[backbone]]
+name = "itshosted"
+brands = ["NewsgroupDirect", "Usenet.Farm", "UsenetNews"]
+
+[[backbone]]
+name = "uzoreto"
+brands = ["NewsgroupDirect", "UsenetNews", "ViperNews"]
+
+[[backbone]]
+name = "baseip"
+brands = ["Newshosting", "TweakNews"]
+
+[[backbone]]
+name = "elbracht"
+brands = ["Premium News", "United Newsserver"]

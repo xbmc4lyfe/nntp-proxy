@@ -15,9 +15,10 @@ pub use loading::{
     load_config_with_fallback,
 };
 pub use types::{
-    BackendSelectionStrategy, Cache, ClientAuth, CompressionCodec, Config, DiskCache, HealthCheck,
-    LogFormat, Logging, LowerTierStatPrefetch, Memory, MetricsEndpoint, Proxy, QueuePressureLimits,
-    Routing, RoutingArticle, RoutingMode, Server, StatefulSessions, UserCredentials,
+    BackboneDetection, BackendSelectionStrategy, Cache, ClientAuth, CompressionCodec, Config,
+    DiskCache, HealthCheck, LogFormat, Logging, LowerTierStatPrefetch, Memory, MetricsEndpoint,
+    Proxy, QueuePressureLimits, Routing, RoutingArticle, RoutingMode, Server, StatefulSessions,
+    UserCredentials,
 };
 pub(crate) use types::{REDACTED, redact};
 

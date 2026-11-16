@@ -6,3 +6,5 @@ flate = "flate"
 # Deliberate misspelling in the unknown-server-key config test.
 conections = "conections"
 ratatui = "ratatui"
+# A Usenet reseller brand in src/backbone/backbones.toml.
+Shemes = "Shemes"

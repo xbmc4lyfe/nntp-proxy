@@ -55,6 +55,35 @@ pub struct NntpProxy {
     pub(super) reader_message_id_failover: bool,
     /// Number of currently active client connections
     pub(super) active_clients: Arc<AtomicUsize>,
+    /// Backend-to-backbone grouping, shared with the router and caches so
+    /// backbone detection can regroup servers while running.
+    pub(super) availability_layout: crate::cache::AvailabilityLayout,
+    /// What backbone detection may do (`routing.backbone_detection`).
+    pub(super) backbone_detection: crate::config::BackboneDetection,
+}
+
+impl NntpProxy {
+    /// Start backbone detection in the background (see
+    /// `docs/operator/configuration.md#backbones`). `config_path` is the file
+    /// to write findings into, or `None` when the config came from the
+    /// environment.
+    pub fn spawn_backbone_detection(&self, config_path: Option<std::path::PathBuf>) {
+        crate::backbone::spawn(self.backbone_check(config_path));
+    }
+
+    /// A handle that runs one backbone check on demand, for tests and tools.
+    #[must_use]
+    pub fn backbone_check(&self, config_path: Option<std::path::PathBuf>) -> crate::BackboneCheck {
+        crate::backbone::Detector {
+            servers: Arc::clone(&self.servers),
+            providers: self.connection_providers.clone(),
+            buffer_pool: self.buffer_pool.clone(),
+            layout: self.availability_layout.clone(),
+            mode: self.backbone_detection,
+            config_path,
+            registry: crate::backbone::Registry::builtin(),
+        }
+    }
 }
 
 impl NntpProxy {

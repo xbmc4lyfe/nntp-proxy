@@ -449,6 +449,9 @@ pub struct TcpManager {
     events: Arc<SetupEvents>,
     /// Open-connection limit the pool's own size cannot be trusted to keep.
     pub(crate) slots: Arc<crate::pool::slot_gate::SlotGate>,
+    /// The latest greeting line, which often names the real backbone behind
+    /// a reseller. Kept for backbone detection; never contains credentials.
+    greeting: Arc<std::sync::Mutex<Option<Box<str>>>>,
 }
 
 /// Why a new backend session could not be set up, as operators act on it.
@@ -715,6 +718,7 @@ impl std::fmt::Debug for TcpManager {
             address_load,
             events,
             slots,
+            greeting,
         } = self;
         f.debug_struct("TcpManager")
             .field("host", host)
@@ -734,6 +738,7 @@ impl std::fmt::Debug for TcpManager {
             .field("address_load", address_load)
             .field("events", events)
             .field("slots", slots)
+            .field("greeting", greeting)
             .finish()
     }
 }
@@ -750,6 +755,14 @@ impl TcpManager {
         // `create` was cut off before it could count the attempt.
         self.churn.note_connect(ConnectOutcome::Failed);
         self.events.failed(self, error, Duration::ZERO);
+    }
+
+    /// The greeting the backend sent on its latest connection.
+    pub(crate) fn last_greeting(&self) -> Option<String> {
+        self.greeting
+            .lock()
+            .ok()
+            .and_then(|greeting| greeting.as_deref().map(str::to_owned))
     }
 
     /// Whether login backoff is currently keeping new connections away.
@@ -880,6 +893,7 @@ impl TcpManager {
             address_load: Arc::default(),
             events,
             slots: Arc::default(),
+            greeting: Arc::default(),
         })
     }
 
@@ -1076,6 +1090,11 @@ impl TcpManager {
                 backend: self.name.clone(),
                 greeting: greeting.trim().to_string(),
             });
+        }
+        if let Ok(mut last) = self.greeting.lock()
+            && last.as_deref() != Some(greeting.trim())
+        {
+            *last = Some(greeting.trim().into());
         }
 
         Ok(())

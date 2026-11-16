@@ -61,6 +61,7 @@ Unknown keys in `[logging]` are reported at startup. See [logging.md](logging.md
 | `backend_selection` | `least-loaded` | Or `weighted-round-robin` |
 | `adaptive_precheck` | `false` | Adaptive availability precheck for `STAT`/`HEAD` |
 | `reader_message_id_failover` | `false` | In hybrid mode, answer a pinned backend's `430` for a message-ID lookup from another backend. See [Runtime and routing](runtime-and-routing.md#message-id-lookups-in-a-reader-session) |
+| `backbone_detection` | `"annotate"` | What the proxy does with what it learns about which servers share a backbone. `"annotate"` regroups servers by the evidence and writes its findings into this file as comments; `"apply"` regroups and only logs; `"off"` never probes, so only `backbone` values group servers. See [Backbones](#backbones). |
 | `lower_tier_stat_prefetch` | `"first-attempt"` | Background `STAT` probes that `ARTICLE`/`BODY` send to tier >0 backends with `stat_missing` enabled, so a primary-tier `430` can skip lower-tier misses. `"first-attempt"` probes each eligible lower-tier backend once per request, `"after-primary-miss"` probes only when the availability index already records a tier-0 `430` for the message ID, and `"off"` never prefetches. The retry `STAT` sweep after a primary-tier `430` runs in every mode. Consider `"off"` or `"after-primary-miss"` when the primary tier rarely misses and lower-tier pools are small. |
 
 ### `[routing.queue.backpressure]`
@@ -341,7 +342,7 @@ password = "reader-password"
 | `connection_cap` | `"fixed"` | `"adaptive"` lets the pool size follow login refusals instead of always regrowing to `max_connections`. See [Adaptive connection cap](#adaptive-connection-cap) |
 | `stat_missing` | `0` | Probe missing articles with `STAT` before `ARTICLE`/`BODY`/`HEAD` on this backend. Enable it on backends that correctly return `430` to speed up retrying missing articles. |
 | `tier` | `0` | Lower tiers are preferred first |
-| `backbone` | unset | Usenet backbone the server resells, such as `"omicron"`. Servers naming the same backbone share `430`s: a miss on one skips the others. See [Backbones](#backbones) |
+| `backbone` | `"auto"` | Usenet backbone the server resells, such as `"omicron"`. Servers on the same backbone share `430`s: a miss on one skips the others. Unset or `"auto"`, the proxy works it out; a named backbone is checked and corrected when the evidence contradicts it. See [Backbones](#backbones) |
 | `stateful_sessions` | `"allowed"` | `"excluded"` keeps this backend out of stateful sessions (`GROUP`, `XOVER`, article-number commands) and other replies that carry article numbers, while it still serves message-ID requests. See [Article numbering across providers](#article-numbering-across-providers). |
 | `use_tls` | `false` | TLS to the backend |
 | `tls_verify_cert` | `true` | Keep enabled in production |
@@ -432,8 +433,8 @@ backbone = "omicron"
   server error, a refused login ("too many connections"), or bad credentials
   say nothing about the article, so another server on the same backbone is
   still tried.
-- **Unset**, a server shares `430`s only with servers on the same host, as
-  before.
+- **Several accounts act as one.** Five accounts on one backbone share one
+  set of `430`s, so adding accounts adds connections without adding lookups.
 
 Group servers only when they really share an article store. A reseller with
 shorter retention, or a separate block on the same backbone that holds
@@ -443,6 +444,62 @@ disk cache) are kept per backbone, so changing a server's `backbone` starts it
 with no saved misses.
 The environment variable is `NNTP_SERVER_<N>_BACKBONE`. Startup logs each
 backbone with its servers.
+
+#### Detection
+
+With `backbone` unset or `"auto"`, the proxy works the backbone out, and it
+checks every named one. About 15 seconds after startup, and every 6 hours
+after, it asks each server for `LIST ACTIVE` on a few busy groups over the
+server's own connection pool:
+
+- **Article numbers decide.** Each backbone numbers a group's articles
+  itself, so servers reading one store report the same highest article
+  number (give or take posts that arrived between the two queries), while
+  different backbones are millions or billions apart.
+- **Retention must match too.** The lowest article number shows how far back
+  a server keeps articles. Servers with the same numbering but different
+  retention are kept apart, since a `430` from the one that keeps less says
+  nothing about the other.
+- **Supporting checks.** Matching server software (its `HELP` text and the
+  wording of a `430`) counts as one more check. Brand names in the hostname or
+  greeting can name a group (from a list of known backbones built into the
+  proxy) but never form one.
+
+Matching numbers show one store, not one set of removals: servers of one
+backbone in different regions can act on takedown notices differently, so a
+`430` from one may hide an article another still serves. If a pair the proxy
+groups keeps rescuing each other's misses for you, give them different
+`backbone` names: detection keeps a name you set unless the numbers contradict
+it, and only suggests merging two names that turn out to share a store.
+
+A named backbone is overridden only when the numbers contradict it (another
+server with the same name reads a different store). Such a server is
+corrected while running: the server's `430`s
+follow the evidence until it changes, and an INFO line says so. When servers
+with one name disagree, the name stays with the larger group. A server that
+gives no article numbers (some refuse `LIST ACTIVE`) keeps its configured
+backbone, or shares only with its own host. Changes take effect without a
+restart, and a server that moves to another backbone later (a new reseller
+deal, or a hostname now pointing elsewhere) is regrouped at the next check.
+
+With `backbone_detection = "annotate"` (the default) each finding is written
+into the config file as a comment above the server's `backbone` line, or under
+its `name` when it has none:
+
+```toml
+[[servers]]
+name = "eweka"
+# backbone-check (2026-11-16): detected backbone "omicron": its article numbers and
+# backbone-check: retention match newshosting (met 7 of 7 checks)
+host = "news.eweka.nl"
+```
+
+Only lines starting with `# backbone-check` are ever added or replaced, and a
+finding that has not changed keeps its first date. The proxy never changes a
+`backbone` value itself: to adopt a finding, set the value yourself. A config
+loaded from environment variables, or a file the proxy cannot write (such as a
+read-only container mount), gets the findings in the log only; use `"apply"`
+to stop the write attempts.
 
 ### Article numbering across providers
 

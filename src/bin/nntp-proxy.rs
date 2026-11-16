@@ -53,7 +53,7 @@ fn main() -> Result<()> {
     let (loaded, startup_events) = nntp_proxy::logging::capture_startup_events(|| {
         runtime::load_and_log_config(args.common.config.as_str())
     });
-    let (mut config, _) = match loaded {
+    let (mut config, config_source) = match loaded {
         Ok(loaded) => loaded,
         Err(error) => {
             drop(startup_tui);
@@ -84,15 +84,32 @@ fn main() -> Result<()> {
     );
     startup_events.replay();
 
+    // Backbone findings go into the config file only when it came from one.
+    let config_file = match config_source {
+        nntp_proxy::config::ConfigSource::Environment => None,
+        nntp_proxy::config::ConfigSource::File
+        | nntp_proxy::config::ConfigSource::DefaultCreated => {
+            Some(std::path::PathBuf::from(args.common.config.as_str()))
+        }
+    };
+
     let threads = args.common.threads.or(Some(config.proxy.threads));
     RuntimeConfig::from_args(threads)
         .build_runtime()?
-        .block_on(run_proxy(args, config, ui_mode, log_buffer, startup_tui))
+        .block_on(run_proxy(
+            args,
+            config,
+            config_file,
+            ui_mode,
+            log_buffer,
+            startup_tui,
+        ))
 }
 
 async fn run_proxy(
     args: Args,
     config: nntp_proxy::config::Config,
+    config_file: Option<std::path::PathBuf>,
     ui_mode: UiMode,
     log_buffer: Option<tui::LogBuffer>,
     startup_tui: Option<tui::StartupTuiSession>,
@@ -134,6 +151,7 @@ async fn run_proxy(
     runtime::spawn_response_write_metrics_logger(response_write_metrics_period);
     runtime::spawn_tokio_runtime_metrics_logger();
     runtime::spawn_backend_summary_logger(&proxy, backend_summary_interval_secs);
+    proxy.spawn_backbone_detection(config_file);
 
     let (dashboard_handle, dashboard_shutdown_tx) =
         launch_dashboard_publisher(args.common.tui_listen, &proxy, log_buffer.clone()).await?;

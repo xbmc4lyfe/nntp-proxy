@@ -8,6 +8,8 @@ use std::fs;
 use std::hash::Hasher;
 use std::num::NonZeroU64;
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use twox_hash::XxHash64;
 
 const REGISTRY_MAGIC: &[u8; 8] = b"ANEGREG2";
@@ -56,12 +58,20 @@ impl AvailabilityIdentity {
         match server.backbone.as_deref().map(str::trim) {
             // Canonicalized as a persisted identity will be, so a reload
             // finds the same slot.
-            Some(backbone) if !backbone.is_empty() => Self(canonicalize_host(&format!(
-                "backbone={}",
-                backbone.to_ascii_lowercase()
-            ))),
+            Some(backbone) if !backbone.is_empty() && !is_auto(backbone) => {
+                Self::backbone(backbone)
+            }
             _ => Self::from(&server.host),
         }
+    }
+
+    /// The identity of a named backbone, spelled as [`Self::for_server`]
+    /// spells a configured one.
+    pub(crate) fn backbone(name: &str) -> Self {
+        Self(canonicalize_host(&format!(
+            "backbone={}",
+            name.trim().to_ascii_lowercase()
+        )))
     }
 
     /// Persistence preserves the configured hostname identity without DNS
@@ -77,6 +87,11 @@ impl AvailabilityIdentity {
     pub(crate) fn as_host(&self) -> &str {
         &self.0
     }
+}
+
+/// `backbone = "auto"` asks for detection, the same as leaving it out.
+pub(crate) fn is_auto(backbone: &str) -> bool {
+    backbone.trim().eq_ignore_ascii_case("auto")
 }
 
 fn canonicalize_host(host: &str) -> String {
@@ -147,13 +162,113 @@ impl fmt::Display for AvailabilitySlot {
     }
 }
 
-/// Immutable mapping from configured backend entries to provider host identities.
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// Which slot each backend records its `430`s under.
+///
+/// One table is shared by the layout, the router and the caches, so moving a
+/// backend to another backbone reaches every reader at once without a
+/// restart. A reader may act on the old slot for a request already in flight;
+/// that only records or skips under the identity the backend had a moment
+/// ago, which was true when the request started.
+#[derive(Debug)]
+pub(crate) struct BackendSlots {
+    slots: [AtomicU8; usize::BITS as usize],
+    len: AtomicUsize,
+    mask: AtomicUsize,
+    /// Serializes writers, so the mask is always recomputed from every
+    /// slot store before it; readers stay lock-free.
+    writer: std::sync::Mutex<()>,
+}
+
+impl BackendSlots {
+    #[must_use]
+    pub(crate) fn new(slots: &[AvailabilitySlot]) -> Self {
+        let table = Self {
+            slots: std::array::from_fn(|_| AtomicU8::new(0)),
+            len: AtomicUsize::new(0),
+            mask: AtomicUsize::new(0),
+            writer: std::sync::Mutex::new(()),
+        };
+        for (index, slot) in slots.iter().enumerate() {
+            table.set(BackendId::from_index(index), *slot);
+        }
+        table
+    }
+
+    #[must_use]
+    pub(crate) fn get(&self, backend: BackendId) -> AvailabilitySlot {
+        AvailabilitySlot(usize::from(
+            self.slots[backend.as_index()].load(Ordering::Relaxed),
+        ))
+    }
+
+    /// Slots any backend records under, for deciding when all are exhausted.
+    #[must_use]
+    pub(crate) fn mask(&self) -> AvailabilityMask {
+        AvailabilityMask(self.mask.load(Ordering::Relaxed))
+    }
+
+    pub(crate) fn set(&self, backend: BackendId, slot: AvailabilitySlot) {
+        let _writer = self
+            .writer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let index = backend.as_index();
+        let slot = u8::try_from(slot.index()).expect("slots fit the bitmap width");
+        self.slots[index].store(slot, Ordering::Relaxed);
+        self.len.fetch_max(index + 1, Ordering::Relaxed);
+        let len = self.len.load(Ordering::Relaxed);
+        let mask = self.slots[..len].iter().fold(0usize, |mask, slot| {
+            mask | (1usize << slot.load(Ordering::Relaxed))
+        });
+        self.mask.store(mask, Ordering::Relaxed);
+    }
+}
+
+/// Mapping from configured backend entries to provider identities.
+///
+/// The identity list is fixed for the process; the backend-to-slot table can
+/// change at runtime (see [`Self::reassign`]). Clones share that table.
+#[derive(Clone, Debug)]
 pub(crate) struct AvailabilityLayout {
-    backend_slots: Box<[AvailabilitySlot]>,
+    backend_slots: Arc<BackendSlots>,
     identities: Box<[AvailabilityIdentity]>,
-    mask: AvailabilityMask,
     epoch: LayoutEpoch,
+}
+
+impl PartialEq for AvailabilityLayout {
+    fn eq(&self, other: &Self) -> bool {
+        self.identities == other.identities
+            && self.epoch == other.epoch
+            && self.backend_slots.len.load(Ordering::Relaxed)
+                == other.backend_slots.len.load(Ordering::Relaxed)
+            && (0..self.backend_slots.len.load(Ordering::Relaxed)).all(|index| {
+                let backend = BackendId::from_index(index);
+                self.backend_slots.get(backend) == other.backend_slots.get(backend)
+            })
+    }
+}
+
+impl Eq for AvailabilityLayout {}
+
+/// The configured identities first, in server order, then `extra` ones a
+/// backend may move to later, without duplicates.
+fn identities_with_candidates(
+    servers: &[Server],
+    extra: &[AvailabilityIdentity],
+) -> Vec<AvailabilityIdentity> {
+    let mut identities = Vec::new();
+    let configured = servers.iter().map(AvailabilityIdentity::for_server);
+    // Every host stays registered so a backend can always fall back to
+    // sharing only with its own host.
+    let hosts = servers
+        .iter()
+        .map(|server| AvailabilityIdentity::from(&server.host));
+    for identity in configured.chain(hosts).chain(extra.iter().cloned()) {
+        if !identities.contains(&identity) {
+            identities.push(identity);
+        }
+    }
+    identities
 }
 
 impl AvailabilityLayout {
@@ -165,28 +280,31 @@ impl AvailabilityLayout {
         let backend_slots = (0..count)
             .map(|index| AvailabilitySlot::new(index).expect("synthetic count fits bitmap"))
             .collect::<Vec<_>>();
-        let mut mask = AvailabilityMask::empty();
-        for slot in &backend_slots {
-            mask.insert(*slot);
-        }
         Self {
-            backend_slots: backend_slots.into_boxed_slice(),
+            backend_slots: Arc::new(BackendSlots::new(&backend_slots)),
             identities: identities.into_boxed_slice(),
-            mask,
             epoch: LayoutEpoch::Derived,
         }
     }
 
     /// Build the compact current-process layout, deduplicating configured hosts.
+    #[cfg(test)]
     pub(crate) fn from_servers(servers: &[Server]) -> Result<Self, AvailabilityLayoutError> {
-        let mut identities = Vec::new();
+        Self::from_servers_with_candidates(servers, &[])
+    }
 
-        for server in servers {
-            let identity = AvailabilityIdentity::for_server(server);
-            if !identities.contains(&identity) {
-                identities.push(identity);
-            }
-        }
+    /// As [`Self::from_servers`], also registering `extra` identities (known
+    /// backbones) that backbone detection may move a backend to later.
+    pub(crate) fn from_servers_with_candidates(
+        servers: &[Server],
+        extra: &[AvailabilityIdentity],
+    ) -> Result<Self, AvailabilityLayoutError> {
+        let mut identities = identities_with_candidates(servers, extra);
+        // Candidates beyond the bitmap width are dropped. The configured
+        // identities come first, so they always stay; with more than 32
+        // servers some hosts may not, and moving such a server back to its
+        // own host is refused with a warning.
+        identities.truncate(usize::BITS as usize);
         let mut backend_slots = Vec::with_capacity(servers.len());
         for server in servers {
             let identity = AvailabilityIdentity::for_server(server);
@@ -199,21 +317,26 @@ impl AvailabilityLayout {
             );
         }
 
-        let mut mask = AvailabilityMask::empty();
-        for index in 0..identities.len() {
-            mask.insert(AvailabilitySlot::new(index).expect("validated slot"));
-        }
-
         Ok(Self {
-            backend_slots: backend_slots.into_boxed_slice(),
+            backend_slots: Arc::new(BackendSlots::new(&backend_slots)),
             identities: identities.into_boxed_slice(),
-            mask,
             epoch: LayoutEpoch::Derived,
         })
     }
 
     /// Load or atomically publish the hybrid registry before cache startup.
+    #[cfg(test)]
     pub(crate) fn from_hybrid_registry(servers: &[Server], cache_path: &Path) -> Result<Self> {
+        Self::from_hybrid_registry_with_candidates(servers, cache_path, &[])
+    }
+
+    /// As [`Self::from_hybrid_registry`], also registering `extra` identities
+    /// that backbone detection may move a backend to later.
+    pub(crate) fn from_hybrid_registry_with_candidates(
+        servers: &[Server],
+        cache_path: &Path,
+        extra: &[AvailabilityIdentity],
+    ) -> Result<Self> {
         fs::create_dir_all(cache_path)
             .with_context(|| format!("create hybrid cache directory {}", cache_path.display()))?;
         let path = cache_path.join("availability.registry");
@@ -225,13 +348,8 @@ impl AvailabilityLayout {
         let mut changed = loaded.is_none();
         let (mut identities, mut epoch) =
             loaded.unwrap_or_else(|| (Vec::new(), RegistryEpoch::fresh(None)));
-        let mut configured: Vec<AvailabilityIdentity> = Vec::with_capacity(servers.len());
-        for server in servers {
-            let identity = AvailabilityIdentity::for_server(server);
-            if !configured.contains(&identity) {
-                configured.push(identity);
-            }
-        }
+        let mut configured = identities_with_candidates(servers, extra);
+        configured.truncate(usize::BITS as usize);
         let unregistered = configured
             .iter()
             .filter(|identity| !identities.contains(identity))
@@ -270,7 +388,6 @@ impl AvailabilityLayout {
         }
 
         let mut backend_slots = Vec::with_capacity(servers.len());
-        let mut configured_mask = AvailabilityMask::empty();
         for server in servers {
             let identity = AvailabilityIdentity::for_server(server);
             let index = identities
@@ -279,20 +396,45 @@ impl AvailabilityLayout {
                 .expect("configured identity is in registry");
             let slot =
                 AvailabilitySlot::new(index).ok_or(AvailabilityLayoutError::TooManyIdentities)?;
-            configured_mask.insert(slot);
             backend_slots.push(slot);
         }
         Ok(Self {
-            backend_slots: backend_slots.into_boxed_slice(),
+            backend_slots: Arc::new(BackendSlots::new(&backend_slots)),
             identities: identities.into_boxed_slice(),
-            mask: configured_mask,
             epoch: LayoutEpoch::Registered(epoch),
         })
     }
 
     #[must_use]
     pub(crate) fn slot_for_backend(&self, backend: BackendId) -> AvailabilitySlot {
-        self.backend_slots[backend.as_index()]
+        self.backend_slots.get(backend)
+    }
+
+    /// The table the router reads, so a [`Self::reassign`] reaches it.
+    #[must_use]
+    pub(crate) fn shared_slots(&self) -> Arc<BackendSlots> {
+        Arc::clone(&self.backend_slots)
+    }
+
+    /// Move a backend's `430`s to another registered identity.
+    ///
+    /// Facts already recorded under the old identity stay true for it; the
+    /// backend just stops reading and writing them. Returns `false` when the
+    /// identity was never registered, which needs a restart to add.
+    pub(crate) fn reassign(&self, backend: BackendId, identity: &AvailabilityIdentity) -> bool {
+        match self.slot_for_identity(identity) {
+            Some(slot) => {
+                self.backend_slots.set(backend, slot);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The identity a backend currently records under.
+    #[must_use]
+    pub(crate) fn identity_for_backend(&self, backend: BackendId) -> &AvailabilityIdentity {
+        &self.identities[self.slot_for_backend(backend).index()]
     }
 
     #[must_use]

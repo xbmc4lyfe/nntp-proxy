@@ -1495,6 +1495,12 @@ impl DeadpoolConnectionProvider {
         self.pool.manager().login_backoff_active()
     }
 
+    /// The greeting line from this backend's latest connection, if any.
+    #[must_use]
+    pub fn last_greeting(&self) -> Option<String> {
+        self.pool.manager().last_greeting()
+    }
+
     /// Pool slots temporarily withheld after broken connections.
     #[must_use]
     pub fn active_cooldowns(&self) -> usize {
