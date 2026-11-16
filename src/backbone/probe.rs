@@ -62,11 +62,25 @@ pub(crate) async fn fingerprint(
                     refusals.push(format!("LIST ACTIVE {group} gave no usable line"));
                 }
             }
-            Ok(Reply::Line(line)) => refusals.push(format!(
-                "LIST ACTIVE answered \"{}\"",
-                line.chars().take(60).collect::<String>()
-            )),
-            Err(error) => refusals.push(format!("LIST ACTIVE failed: {error:#}")),
+            // Only a status code or a fixed description goes into the note:
+            // server text can echo account names and has no size limit.
+            Ok(Reply::Line(line)) => {
+                refusals.push(match crate::protocol::StatusCode::parse(line.as_bytes()) {
+                    Some(code) => format!("LIST ACTIVE was refused with status {}", code.as_u16()),
+                    None => "LIST ACTIVE got an unreadable reply".to_owned(),
+                })
+            }
+            Err(error) => {
+                tracing::debug!(backend = backend.as_index(), error = %format!("{error:#}"), "backbone probe: LIST ACTIVE failed");
+                refusals.push(
+                    match error.to_string().as_str() {
+                        "no connection" => "no connection could be made for LIST ACTIVE",
+                        "timed out" => "LIST ACTIVE timed out",
+                        _ => "LIST ACTIVE failed",
+                    }
+                    .to_owned(),
+                );
+            }
         }
     }
     if fingerprint.watermarks.is_empty() {
@@ -99,6 +113,36 @@ pub(crate) async fn fingerprint(
     fingerprint.software = any.then(|| software.finish());
     fingerprint.greeting = provider.last_greeting();
     fingerprint
+}
+
+/// Whether a server has an article: `Some` for a clear answer, `None` when
+/// the lookup was refused or failed, which says nothing about the article.
+pub(crate) async fn has_article(
+    provider: &DeadpoolConnectionProvider,
+    buffer_pool: &BufferPool,
+    backend: BackendId,
+    message_id: &str,
+) -> Option<bool> {
+    for verb in [b"STAT".as_slice(), b"HEAD".as_slice()] {
+        let request = RequestContext::from_verb_args(verb, message_id.as_bytes());
+        match command(provider, buffer_pool, backend, &request)
+            .await
+            .ok()?
+        {
+            Reply::Lines(_) => return Some(true),
+            Reply::Line(line) => {
+                match crate::protocol::StatusCode::parse(line.as_bytes()).map(|code| code.as_u16())
+                {
+                    Some(223 | 221) => return Some(true),
+                    Some(430) => return Some(false),
+                    // Some servers refuse STAT; HEAD answers the same question.
+                    Some(500 | 501) if verb == b"STAT" => {}
+                    _ => return None,
+                }
+            }
+        }
+    }
+    None
 }
 
 enum Reply {

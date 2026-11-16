@@ -174,6 +174,8 @@ pub(crate) struct BackendSlots {
     slots: [AtomicU8; usize::BITS as usize],
     len: AtomicUsize,
     mask: AtomicUsize,
+    /// Slots more than one backend records under.
+    shared: AtomicUsize,
     /// Serializes writers, so the mask is always recomputed from every
     /// slot store before it; readers stay lock-free.
     writer: std::sync::Mutex<()>,
@@ -186,6 +188,7 @@ impl BackendSlots {
             slots: std::array::from_fn(|_| AtomicU8::new(0)),
             len: AtomicUsize::new(0),
             mask: AtomicUsize::new(0),
+            shared: AtomicUsize::new(0),
             writer: std::sync::Mutex::new(()),
         };
         for (index, slot) in slots.iter().enumerate() {
@@ -207,6 +210,20 @@ impl BackendSlots {
         AvailabilityMask(self.mask.load(Ordering::Relaxed))
     }
 
+    /// Whether more than one backend records under `slot`.
+    #[must_use]
+    pub(crate) fn is_shared(&self, slot: AvailabilitySlot) -> bool {
+        self.shared.load(Ordering::Relaxed) & slot.bit() != 0
+    }
+
+    /// Backends that record under `slot` right now.
+    pub(crate) fn backends_on(&self, slot: AvailabilitySlot) -> Vec<BackendId> {
+        (0..self.len.load(Ordering::Relaxed))
+            .map(BackendId::from_index)
+            .filter(|backend| self.get(*backend) == slot)
+            .collect()
+    }
+
     pub(crate) fn set(&self, backend: BackendId, slot: AvailabilitySlot) {
         let _writer = self
             .writer
@@ -217,10 +234,15 @@ impl BackendSlots {
         self.slots[index].store(slot, Ordering::Relaxed);
         self.len.fetch_max(index + 1, Ordering::Relaxed);
         let len = self.len.load(Ordering::Relaxed);
-        let mask = self.slots[..len].iter().fold(0usize, |mask, slot| {
-            mask | (1usize << slot.load(Ordering::Relaxed))
-        });
+        let (mask, shared) =
+            self.slots[..len]
+                .iter()
+                .fold((0usize, 0usize), |(mask, shared), slot| {
+                    let bit = 1usize << slot.load(Ordering::Relaxed);
+                    (mask | bit, shared | (mask & bit))
+                });
         self.mask.store(mask, Ordering::Relaxed);
+        self.shared.store(shared, Ordering::Relaxed);
     }
 }
 
@@ -231,6 +253,7 @@ impl BackendSlots {
 #[derive(Clone, Debug)]
 pub(crate) struct AvailabilityLayout {
     backend_slots: Arc<BackendSlots>,
+    miss_sampler: Arc<super::miss_sampler::MissSampler>,
     identities: Box<[AvailabilityIdentity]>,
     epoch: LayoutEpoch,
 }
@@ -280,8 +303,10 @@ impl AvailabilityLayout {
         let backend_slots = (0..count)
             .map(|index| AvailabilitySlot::new(index).expect("synthetic count fits bitmap"))
             .collect::<Vec<_>>();
+        let slots = Arc::new(BackendSlots::new(&backend_slots));
         Self {
-            backend_slots: Arc::new(BackendSlots::new(&backend_slots)),
+            miss_sampler: Arc::new(super::miss_sampler::MissSampler::new(Arc::clone(&slots))),
+            backend_slots: slots,
             identities: identities.into_boxed_slice(),
             epoch: LayoutEpoch::Derived,
         }
@@ -317,8 +342,10 @@ impl AvailabilityLayout {
             );
         }
 
+        let slots = Arc::new(BackendSlots::new(&backend_slots));
         Ok(Self {
-            backend_slots: Arc::new(BackendSlots::new(&backend_slots)),
+            miss_sampler: Arc::new(super::miss_sampler::MissSampler::new(Arc::clone(&slots))),
+            backend_slots: slots,
             identities: identities.into_boxed_slice(),
             epoch: LayoutEpoch::Derived,
         })
@@ -398,8 +425,10 @@ impl AvailabilityLayout {
                 AvailabilitySlot::new(index).ok_or(AvailabilityLayoutError::TooManyIdentities)?;
             backend_slots.push(slot);
         }
+        let slots = Arc::new(BackendSlots::new(&backend_slots));
         Ok(Self {
-            backend_slots: Arc::new(BackendSlots::new(&backend_slots)),
+            miss_sampler: Arc::new(super::miss_sampler::MissSampler::new(Arc::clone(&slots))),
+            backend_slots: slots,
             identities: identities.into_boxed_slice(),
             epoch: LayoutEpoch::Registered(epoch),
         })
@@ -408,6 +437,12 @@ impl AvailabilityLayout {
     #[must_use]
     pub(crate) fn slot_for_backend(&self, backend: BackendId) -> AvailabilitySlot {
         self.backend_slots.get(backend)
+    }
+
+    /// Recent misses on shared backbones, for backbone detection's audits.
+    #[must_use]
+    pub(crate) fn miss_sampler(&self) -> Arc<super::miss_sampler::MissSampler> {
+        Arc::clone(&self.miss_sampler)
     }
 
     /// The table the router reads, so a [`Self::reassign`] reaches it.

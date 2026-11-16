@@ -1361,9 +1361,19 @@ impl<'pool> BackendResponseExchange<'pool> {
     ///
     /// For internal probes that read list-style replies such as `HELP` or
     /// `LIST ACTIVE`; the framer keeps the knowledge of where the reply ends.
-    pub(crate) async fn capture_text_lines_and_reuse(self) -> anyhow::Result<Vec<String>> {
-        let captured = self.capture_isolated_and_reuse().await?;
-        let bytes = captured.as_bytes();
+    pub(crate) async fn capture_text_lines_and_reuse(mut self) -> anyhow::Result<Vec<String>> {
+        // Bounded like other retained captures: a reply over the limit is
+        // drained and refused, so a hostile server cannot fill memory.
+        let mut chunks = crate::pool::ChunkedResponse::default();
+        let IsolatedCapture { retained, .. } = self
+            .receiving()?
+            .capture_isolated_chunked_optional(&mut chunks)
+            .await?;
+        let _reusable = self.into_connection().complete_success();
+        let captured =
+            retained.ok_or_else(|| anyhow::anyhow!("reply exceeds the capture limit"))?;
+        let owned = captured.bytes().to_vec();
+        let bytes = owned.as_slice();
         // The capture already ends before the terminator (and the final
         // content CRLF it shares), so the body is everything between the
         // status line and the content end.

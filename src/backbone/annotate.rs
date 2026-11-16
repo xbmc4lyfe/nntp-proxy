@@ -57,30 +57,90 @@ pub(crate) fn annotate(text: &str, server: &str, note: &str, date: &str) -> Opti
     let mut out = String::with_capacity(text.len() + 256);
     lines[..start].iter().for_each(|line| out.push_str(line));
     block[..anchor].iter().for_each(|line| out.push_str(line));
+    // A last line without a newline would otherwise run into the note.
+    if !out.is_empty() && out.strip_suffix('\n').is_none() {
+        out.push_str(newline);
+    }
     comment.iter().for_each(|line| out.push_str(line));
     block[anchor..].iter().for_each(|line| out.push_str(line));
     lines[end..].iter().for_each(|line| out.push_str(line));
     (out != text).then_some(out)
 }
 
-/// Whether a config line is one of this module's own comments.
+/// Whether a config line is one of this module's own comments: the marker
+/// followed by its date or a continuation colon, so an operator comment that
+/// merely starts with the same word is left alone.
 fn is_note(line: &str) -> bool {
-    line.trim_start().strip_prefix(MARKER).is_some()
+    line.trim_start()
+        .strip_prefix(MARKER)
+        .is_some_and(|rest| rest.strip_prefix(" (").is_some() || rest.strip_prefix(':').is_some())
+}
+
+/// For each line, whether it begins inside a multi-line string, where
+/// nothing is a header, key or note.
+fn inside_strings(lines: &[&str]) -> Vec<bool> {
+    let mut open: Option<&str> = None;
+    lines
+        .iter()
+        .map(|line| {
+            let starts_inside = open.is_some();
+            let mut rest = *line;
+            loop {
+                match open {
+                    Some(delimiter) => match rest.find(delimiter) {
+                        Some(at) => {
+                            rest = &rest[at + delimiter.len()..];
+                            open = None;
+                        }
+                        None => break,
+                    },
+                    None => {
+                        let code = rest.split('#').next().unwrap_or("");
+                        let next = ["\"\"\"", "'''"]
+                            .into_iter()
+                            .filter_map(|d| code.find(d).map(|at| (at, d)))
+                            .min();
+                        match next {
+                            Some((at, delimiter)) => {
+                                rest = &rest[at + delimiter.len()..];
+                                open = Some(delimiter);
+                            }
+                            None => break,
+                        }
+                    }
+                }
+            }
+            starts_inside
+        })
+        .collect()
 }
 
 /// Line range of the `[[servers]]` block whose `name` is `server`.
 fn server_block(lines: &[&str], server: &str) -> Option<(usize, usize)> {
+    let inside = inside_strings(lines);
+    let header = |index: usize| {
+        !inside[index] && lines[index].trim_start_matches('\u{feff}').trim() == "[[servers]]"
+    };
+    let table_start = |index: usize| {
+        !inside[index]
+            && lines[index]
+                .trim_start_matches('\u{feff}')
+                .trim_start()
+                .strip_prefix('[')
+                .is_some()
+    };
     let mut index = 0;
     while index < lines.len() {
-        if lines[index].trim() == "[[servers]]" {
+        if header(index) {
             let start = index + 1;
-            let end = lines[start..]
-                .iter()
-                .position(|line| line.trim_start().strip_prefix('[').is_some())
-                .map_or(lines.len(), |offset| start + offset);
-            let named = lines[start..end]
-                .iter()
-                .any(|line| key_of(line) == Some("name") && string_value(line) == Some(server));
+            let end = (start..lines.len())
+                .find(|&line| table_start(line))
+                .unwrap_or(lines.len());
+            let named = (start..end).any(|line| {
+                !inside[line]
+                    && key_of(lines[line]) == Some("name")
+                    && string_value(lines[line]).as_deref() == Some(server)
+            });
             if named {
                 return Some((start, end));
             }
@@ -102,11 +162,28 @@ fn key_of(line: &str) -> Option<&str> {
     Some(key.trim())
 }
 
-/// The basic-string value of a `key = "value"` line.
-fn string_value(line: &str) -> Option<&str> {
+/// The string value of a `key = "value"` or `key = 'value'` line, with the
+/// common escapes of a basic string undone.
+fn string_value(line: &str) -> Option<String> {
     let (_, value) = line.split_once('=')?;
-    let value = value.trim_start().strip_prefix('"')?;
-    value.split_once('"').map(|(value, _)| value)
+    let value = value.trim_start();
+    if let Some(literal) = value.strip_prefix('\'') {
+        return literal.split_once('\'').map(|(value, _)| value.to_owned());
+    }
+    let mut chars = value.strip_prefix('"')?.chars();
+    let mut out = String::new();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => return Some(out),
+            '\\' => match chars.next()? {
+                'n' => out.push('\n'),
+                't' => out.push('\t'),
+                other => out.push(other),
+            },
+            c => out.push(c),
+        }
+    }
+    None
 }
 
 /// The words of existing notes, without marker, date and line breaks.

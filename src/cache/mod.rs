@@ -21,6 +21,7 @@ mod availability_identity;
 mod availability_index;
 mod hybrid;
 mod hybrid_codec;
+mod miss_sampler;
 pub mod ttl;
 
 #[cfg(test)]
@@ -34,6 +35,7 @@ pub(crate) use availability_identity::{
 pub use availability_identity::{AvailabilityMask, AvailabilitySlot};
 pub use availability_index::AvailabilityIndex;
 pub use hybrid::{HybridArticleCache, HybridCacheConfig, HybridCacheStats};
+pub(crate) use miss_sampler::MissSampler;
 
 use crate::protocol::StatusCode;
 use crate::types::{BackendId, MessageId};
@@ -529,6 +531,8 @@ enum UnifiedCacheKind {
 pub struct UnifiedCache {
     kind: UnifiedCacheKind,
     update_slots: Arc<Semaphore>,
+    /// Samples misses on shared backbones for backbone detection.
+    miss_sampler: Option<Arc<miss_sampler::MissSampler>>,
 }
 
 impl UnifiedCache {
@@ -554,9 +558,11 @@ impl UnifiedCache {
         ttl: std::time::Duration,
         layout: AvailabilityLayout,
     ) -> Self {
+        let sampler = layout.miss_sampler();
         Self::new(UnifiedCacheKind::Availability(
             AvailabilityIndex::with_layout(ttl, layout),
         ))
+        .sampling(sampler)
     }
 
     /// Create a memory-only cache
@@ -570,9 +576,11 @@ impl UnifiedCache {
         ttl: std::time::Duration,
         layout: AvailabilityLayout,
     ) -> Self {
+        let sampler = layout.miss_sampler();
         Self::new(UnifiedCacheKind::Memory(
             ArticleCache::new(capacity, ttl).with_layout(layout),
         ))
+        .sampling(sampler)
     }
 
     /// Create a hybrid cache (async because foyer needs async initialization)
@@ -586,16 +594,24 @@ impl UnifiedCache {
         config: HybridCacheConfig,
         layout: AvailabilityLayout,
     ) -> anyhow::Result<Self> {
+        let sampler = layout.miss_sampler();
         Ok(Self::new(UnifiedCacheKind::Hybrid(
             HybridArticleCache::new_with_layout(config, layout).await?,
-        )))
+        ))
+        .sampling(sampler))
     }
 
     fn new(kind: UnifiedCacheKind) -> Self {
         Self {
             kind,
             update_slots: Arc::new(Semaphore::new(CACHE_UPDATE_CONCURRENCY)),
+            miss_sampler: None,
         }
+    }
+
+    fn sampling(mut self, sampler: Arc<miss_sampler::MissSampler>) -> Self {
+        self.miss_sampler = Some(sampler);
+        self
     }
 
     /// Reserve bounded capacity before a detached cache update owns response data.
@@ -761,6 +777,9 @@ impl UnifiedCache {
         message_id: MessageId<'_>,
         slot: AvailabilitySlot,
     ) {
+        if let Some(sampler) = &self.miss_sampler {
+            sampler.note(message_id.as_str(), slot);
+        }
         match &self.kind {
             UnifiedCacheKind::Availability(index) => {
                 index.record_availability_missing(&message_id, slot)

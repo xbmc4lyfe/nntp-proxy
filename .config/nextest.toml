@@ -13,3 +13,13 @@ slow-timeout = { period = "30s", terminate-after = 1 }
 
 [profile.ci.junit]
 path = "junit.xml"
+
+# Backbone-probe tests that wait out the probe's own 30 s per-command limit
+# against a hanging mock server; each still bounds itself with a timeout.
+[[profile.default.overrides]]
+filter = 'test(/backbone_adversarial::slow_/)'
+slow-timeout = { period = "240s", terminate-after = 1 }
+
+[[profile.ci.overrides]]
+filter = 'test(/backbone_adversarial::slow_/)'
+slow-timeout = { period = "240s", terminate-after = 1 }
