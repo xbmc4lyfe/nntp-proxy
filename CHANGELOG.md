@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Backbone detection (`[routing] backbone_detection`, default `"annotate"`): about 15 seconds after startup and every 6 hours, the proxy compares each server's `LIST ACTIVE` article numbers and retention on a few busy groups. Servers reading one article store share their `430`s, even with `backbone` unset (now the same as `"auto"`). A configured `backbone` that the numbers contradict is corrected while running, with an INFO line. Servers are regrouped without a restart, and findings are written into the config file as `# backbone-check` comments (`"apply"` only logs; `"off"` disables detection). Known backbones and reseller brands are in `src/backbone/backbones.toml`, used only to name groups. See [Backbones](docs/operator/configuration.md#backbones).
+
 - `connection_cap = "adaptive"` resets after 15 minutes unused: a cap probed above `max_connections` returns to it once no connection has been checked out for that long, and the next busy spell probes again from there. A cap learned during one download held for the rest of the process even when the account's situation had changed.
 
 - Per-server `backbone` (env `NNTP_SERVER_<N>_BACKBONE`): servers that name the same backbone share `430`s, so once one reseller of a backbone answers `430` the proxy skips the other resellers of it and moves on to other backbones. A refused lookup, a server error, a refused login, or bad credentials stay per server, so another server on the backbone is still tried. Unset, `430`s are shared only by servers on the same host, as before. See [Backbones](docs/operator/configuration.md#backbones).

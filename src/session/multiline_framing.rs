@@ -1356,6 +1356,38 @@ impl<'pool> BackendResponseExchange<'pool> {
         Ok(captured)
     }
 
+    /// Read a multiline reply as text lines (dot-unstuffing undone, status
+    /// line and terminator left out) and reuse the connection.
+    ///
+    /// For internal probes that read list-style replies such as `HELP` or
+    /// `LIST ACTIVE`; the framer keeps the knowledge of where the reply ends.
+    pub(crate) async fn capture_text_lines_and_reuse(self) -> anyhow::Result<Vec<String>> {
+        let captured = self.capture_isolated_and_reuse().await?;
+        let bytes = captured.as_bytes();
+        // The capture already ends before the terminator (and the final
+        // content CRLF it shares), so the body is everything between the
+        // status line and the content end.
+        let body = bytes
+            .get(captured.status_line_end().get()..captured.content_end().get())
+            .ok_or_else(|| anyhow::anyhow!("captured reply bounds are out of range"))?;
+        let body = body.strip_prefix(b"\r\n").unwrap_or(body);
+        if body.is_empty() {
+            return Ok(Vec::new());
+        }
+        Ok(body
+            .split(|&byte| byte == b'\n')
+            .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
+            .map(|line| {
+                if line.starts_with(b"..") {
+                    &line[1..]
+                } else {
+                    line
+                }
+            })
+            .map(|line| String::from_utf8_lossy(line).into_owned())
+            .collect())
+    }
+
     /// Drain the framed response and return its completed connection to the
     /// caller's routing policy. The exchange owns failure cleanup; only a
     /// response proven complete can produce the returned guard.

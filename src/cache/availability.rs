@@ -345,7 +345,65 @@ mod tests {
         assert_eq!(slot(0), slot(1), "same backbone, any spelling or host");
         assert_ne!(slot(0), slot(2), "different backbone");
         assert_ne!(slot(0), slot(3), "no backbone: keyed by host, not joined");
-        assert_eq!(layout.identity_count(), 3);
+        assert_eq!(
+            layout.shared_slots().mask().bits().count_ones(),
+            3,
+            "three identities in use; every host is also registered as a fallback"
+        );
+    }
+
+    #[test]
+    fn a_backend_moved_to_another_backbone_shares_its_430s_from_then_on() {
+        let servers = vec![
+            Server::builder("news.reseller-a.example", Port::try_new(563).unwrap())
+                .backbone("omicron")
+                .build()
+                .unwrap(),
+            Server::builder("news.reseller-b.example", Port::try_new(563).unwrap())
+                .build()
+                .unwrap(),
+        ];
+        let layout = AvailabilityLayout::from_servers_with_candidates(
+            &servers,
+            &[AvailabilityIdentity::backbone("abavia")],
+        )
+        .unwrap();
+        let router_view = layout.shared_slots();
+        let slot = |index| router_view.get(BackendId::from_index(index));
+        assert_ne!(slot(0), slot(1));
+        assert_eq!(router_view.mask().bits().count_ones(), 2);
+
+        assert!(layout.reassign(
+            BackendId::from_index(1),
+            &AvailabilityIdentity::backbone(" Omicron ")
+        ));
+        assert_eq!(slot(0), slot(1), "every holder of the table sees the move");
+        assert_eq!(
+            router_view.mask().bits().count_ones(),
+            1,
+            "a slot no backend uses any more must not hold up exhaustion"
+        );
+
+        let mut availability = ArticleAvailability::new();
+        availability.record_missing_slot(slot(0));
+        assert!(
+            availability.all_exhausted(router_view.mask()),
+            "a 430 from the first server now covers the moved one"
+        );
+
+        assert!(layout.reassign(
+            BackendId::from_index(1),
+            &AvailabilityIdentity::backbone("abavia")
+        ));
+        assert!(!layout.reassign(
+            BackendId::from_index(1),
+            &AvailabilityIdentity::backbone("never-registered")
+        ));
+        assert_eq!(
+            layout.identity_for_backend(BackendId::from_index(1)),
+            &AvailabilityIdentity::backbone("abavia"),
+            "a refused move leaves the backend where it was"
+        );
     }
 
     #[test]

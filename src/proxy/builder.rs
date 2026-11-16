@@ -200,20 +200,33 @@ impl NntpProxyBuilder {
         let backend_count = router::BackendCount::try_new(self.config.servers.len())
             .expect("config validation bounds backend count");
         let servers: Arc<[Server]> = self.config.servers.into();
+        let backbone_detection = self.config.routing.backbone_detection;
+        // Known backbones get a slot up front, so detection can move a
+        // server onto one without a restart.
+        let candidates = if backbone_detection == crate::config::BackboneDetection::Off {
+            Vec::new()
+        } else {
+            crate::backbone::candidate_identities(crate::backbone::Registry::builtin())
+        };
         let availability_layout = if let Some(cache) = &cache_config
             && cache.store_article_bodies
             && let Some(disk) = &cache.disk
         {
-            crate::cache::AvailabilityLayout::from_hybrid_registry(&servers, &disk.path)
-                .context("Failed to construct hybrid availability registry")?
+            crate::cache::AvailabilityLayout::from_hybrid_registry_with_candidates(
+                &servers,
+                &disk.path,
+                &candidates,
+            )
+            .context("Failed to construct hybrid availability registry")?
         } else {
-            crate::cache::AvailabilityLayout::from_servers(&servers)
+            crate::cache::AvailabilityLayout::from_servers_with_candidates(&servers, &candidates)
                 .context("Failed to construct backend availability layout")?
         };
         log_backbones(&servers);
 
         let router = Arc::new({
             let mut r = router::BackendSelector::with_strategy(backend_strategy)
+                .with_availability_slots(availability_layout.shared_slots())
                 .with_queue_backpressure(
                     queue_backpressure.enabled,
                     queue_backpressure
@@ -276,6 +289,7 @@ impl NntpProxyBuilder {
             routing_mode: self.routing_mode,
             memory,
             availability_layout,
+            backbone_detection,
         };
 
         Ok((ctx, cache_config))
@@ -470,6 +484,7 @@ pub(super) struct BuildContext {
     routing_mode: RoutingMode,
     memory: Memory,
     availability_layout: crate::cache::AvailabilityLayout,
+    backbone_detection: crate::config::BackboneDetection,
 }
 
 impl BuildContext {
@@ -489,6 +504,8 @@ impl BuildContext {
             adaptive_precheck: self.adaptive_precheck,
             reader_message_id_failover: self.reader_message_id_failover,
             active_clients: Arc::new(AtomicUsize::new(0)),
+            availability_layout: self.availability_layout,
+            backbone_detection: self.backbone_detection,
         }
     }
 }
@@ -501,6 +518,7 @@ fn log_backbones(servers: &[Server]) {
     for server in servers {
         if let Some(backbone) = server.backbone.as_deref().map(str::trim)
             && !backbone.is_empty()
+            && !crate::cache::is_auto_backbone(backbone)
         {
             backbones
                 .entry(backbone.to_ascii_lowercase())

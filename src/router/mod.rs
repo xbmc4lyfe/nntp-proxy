@@ -44,7 +44,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tracing::{debug, info};
 
-use crate::cache::{ArticleAvailability, AvailabilityMask, AvailabilitySlot};
+use crate::cache::{ArticleAvailability, AvailabilityMask, AvailabilitySlot, BackendSlots};
 use crate::config::{BackendSelectionStrategy, LowerTierStatPrefetch, QueuePressureLimits};
 use crate::pool::DeadpoolConnectionProvider;
 use crate::types::{BackendId, ClientId, ServerName};
@@ -318,7 +318,7 @@ impl RouteMode for ArticleRoute<'_> {
     fn output(request: &RouteRequest<'_, Self>, backend: &BackendInfo) -> Result<Self::Output> {
         ArticleBackend::from_availability_slot(
             backend.id,
-            backend.availability_slot,
+            backend.availability_slot(),
             request.mode.availability,
         )
         .ok_or_else(|| {
@@ -743,8 +743,9 @@ pub struct BackendSelector {
     sorted_tiers: smallvec::SmallVec<[u8; 4]>,
     /// Capacity-fair probe counter for the first availability-aware article attempt.
     initial_article_probe_counter: AtomicUsize,
-    /// Bitmap of distinct configured article-availability identities.
-    availability_mask: AvailabilityMask,
+    /// Which slot each backend records `430`s under, shared with the layout
+    /// so backbone detection can regroup backends while running.
+    availability_slots: Arc<BackendSlots>,
     /// Enable/disable per-connection queue-pressure filtering.
     queue_backpressure_enabled: bool,
     /// Validated soft and hard thresholds for queued requests per connection.
@@ -783,7 +784,7 @@ impl BackendSelector {
     #[inline]
     pub(crate) fn availability_slot(&self, backend_id: BackendId) -> Option<AvailabilitySlot> {
         self.find_backend(backend_id)
-            .map(|backend| backend.availability_slot)
+            .map(BackendInfo::availability_slot)
     }
 
     /// Create a guard for a backend already reserved by `route()`.
@@ -851,7 +852,7 @@ impl BackendSelector {
             strategy: selection_strategy,
             sorted_tiers: smallvec::SmallVec::new(),
             initial_article_probe_counter: AtomicUsize::new(0),
-            availability_mask: AvailabilityMask::empty(),
+            availability_slots: Arc::new(BackendSlots::new(&[])),
             queue_backpressure_enabled: Self::DEFAULT_QUEUE_BACKPRESSURE_ENABLED,
             queue_backpressure_limits: QueuePressureLimits::default(),
             queue_backpressure_all_busy_sleep_ms:
@@ -923,7 +924,7 @@ impl BackendSelector {
         let admission = self.article_admission;
         let mut unconfirmed = false;
         for backend in &self.backends {
-            if !availability.should_try_slot(backend.availability_slot) {
+            if !availability.should_try_slot(backend.availability_slot()) {
                 continue;
             }
             unconfirmed = true;
@@ -1034,16 +1035,16 @@ impl BackendSelector {
             }
         }
 
+        self.availability_slots.set(backend_id, availability_slot);
         self.backends.push(BackendInfo {
             id: backend_id,
-            availability_slot,
+            availability_slots: Arc::clone(&self.availability_slots),
             name,
             provider,
             pending_count: PendingCount::new(),
             stateful_count: StatefulCount::new(),
             tier,
         });
-        self.availability_mask.insert(availability_slot);
 
         // H4: Maintain sorted unique tiers (avoids Vec allocation in select_backend hot path)
         if !self.sorted_tiers.contains(&tier) {
@@ -1103,7 +1104,8 @@ impl BackendSelector {
         let is_available = |backend: &&BackendInfo| {
             !suppressed_backends.contains(backend.id)
                 && !excluded_backends.contains(backend.id)
-                && availability.is_none_or(|avail| avail.should_try_slot(backend.availability_slot))
+                && availability
+                    .is_none_or(|avail| avail.should_try_slot(backend.availability_slot()))
         };
 
         // H4: Tier filtering enabled - try tiers in order 0, 1, 2, ...
@@ -1187,7 +1189,7 @@ impl BackendSelector {
                     backend.tier == tier
                         && !excluded_backends.contains(backend.id)
                         && availability
-                            .is_none_or(|avail| avail.should_try_slot(backend.availability_slot))
+                            .is_none_or(|avail| avail.should_try_slot(backend.availability_slot()))
                 })
             {
                 tracing::debug!(
@@ -1274,13 +1276,25 @@ impl BackendSelector {
 
     fn availability_missing_in_tier(&self, availability: &ArticleAvailability, tier: u8) -> bool {
         self.backends.iter().any(|backend| {
-            backend.tier == tier && availability.is_missing_slot(backend.availability_slot)
+            backend.tier == tier && availability.is_missing_slot(backend.availability_slot())
         })
     }
 
     #[inline]
-    pub(crate) const fn availability_mask(&self) -> AvailabilityMask {
-        self.availability_mask
+    pub(crate) fn availability_mask(&self) -> AvailabilityMask {
+        self.availability_slots.mask()
+    }
+
+    /// Share the layout's slot table. Must be called before any backend is
+    /// added, so every backend reads the same table.
+    #[must_use]
+    pub(crate) fn with_availability_slots(mut self, slots: Arc<BackendSlots>) -> Self {
+        assert!(
+            self.backends.is_empty(),
+            "the slot table is shared before backends are added"
+        );
+        self.availability_slots = slots;
+        self
     }
 
     /// Select a backend by capacity weight, independent of current pending load.
@@ -1359,7 +1373,7 @@ impl BackendSelector {
                 pool = %backend.provider.name(),
                 tier,
                 selected = selected_backend == Some(backend.id),
-                should_try = availability.is_none_or(|avail| avail.should_try_slot(backend.availability_slot)),
+                should_try = availability.is_none_or(|avail| avail.should_try_slot(backend.availability_slot())),
                 availability_missing_bits,
                 pending,
                 checked_out,
@@ -1398,7 +1412,7 @@ impl BackendSelector {
             let mut has_non_over_hard = false;
             for backend in self.backends.iter().filter(|backend| backend.tier == tier) {
                 if suppressed_backends.contains(backend.id)
-                    || !availability.should_try_slot(backend.availability_slot)
+                    || !availability.should_try_slot(backend.availability_slot())
                 {
                     continue;
                 }

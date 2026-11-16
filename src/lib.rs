@@ -61,6 +61,7 @@ mod macros;
 // Module declarations
 pub mod args;
 pub mod auth;
+mod backbone;
 pub mod client;
 mod compression;
 pub mod connection_error;
@@ -88,6 +89,7 @@ pub mod types;
 
 // Public exports
 pub use args::{CommonArgs, UiMode};
+pub use backbone::Detector as BackboneCheck;
 pub use config::{
     Cache, Config, ConfigSource, RoutingMode, Server, create_default_config, has_server_env_vars,
     load_config, load_config_from_env, load_config_with_fallback,

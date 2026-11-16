@@ -8,7 +8,7 @@ use std::cmp::Ordering as CmpOrdering;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use crate::cache::AvailabilitySlot;
+use crate::cache::{AvailabilitySlot, BackendSlots};
 use crate::pool::DeadpoolConnectionProvider;
 use crate::types::{BackendId, ServerName};
 
@@ -196,8 +196,9 @@ impl Default for StatefulCount {
 pub struct BackendInfo {
     /// Backend identifier
     pub(super) id: BackendId,
-    /// Article-availability identity slot, shared by equivalent transports.
-    pub(super) availability_slot: AvailabilitySlot,
+    /// Table holding this backend's article-availability slot, shared by
+    /// equivalent transports and changed when backbone detection regroups.
+    pub(super) availability_slots: Arc<BackendSlots>,
     /// Server name for logging
     pub(super) name: ServerName,
     /// Connection provider for this backend
@@ -211,6 +212,12 @@ pub struct BackendInfo {
 }
 
 impl BackendInfo {
+    /// The slot this backend records `430`s under right now.
+    #[inline]
+    pub(super) fn availability_slot(&self) -> AvailabilitySlot {
+        self.availability_slots.get(self.id)
+    }
+
     /// Calculate load ratio (pending requests / max connections)
     ///
     /// Lower ratios indicate less loaded backends.

@@ -5,6 +5,7 @@
 //! and hybrid mode operations.
 
 pub mod backbone;
+pub mod backbone_detection;
 pub mod compression;
 pub mod config;
 pub mod hybrid_mode;

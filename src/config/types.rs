@@ -190,6 +190,39 @@ impl std::fmt::Display for LowerTierStatPrefetch {
     }
 }
 
+/// What the proxy does with what it learns about which servers share a
+/// backbone (see `docs/operator/configuration.md#backbones`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BackboneDetection {
+    /// Regroup servers by the evidence and write what was found as comments
+    /// into the config file, above each server's `backbone` line.
+    #[default]
+    Annotate,
+    /// Regroup servers by the evidence and log it, leaving the file alone.
+    Apply,
+    /// Never probe; only the `backbone` values in the config group servers.
+    Off,
+}
+
+impl BackboneDetection {
+    /// Get the configuration spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Annotate => "annotate",
+            Self::Apply => "apply",
+            Self::Off => "off",
+        }
+    }
+}
+
+impl std::fmt::Display for BackboneDetection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Main proxy configuration
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
 pub struct Config {
@@ -366,6 +399,9 @@ pub struct Routing {
     /// Time limits for article lookups across backends.
     #[serde(default)]
     pub article: RoutingArticle,
+    /// Detect which servers share a backbone and group their `430`s.
+    #[serde(default)]
+    pub backbone_detection: BackboneDetection,
 }
 
 impl Default for Routing {
@@ -378,6 +414,7 @@ impl Default for Routing {
             queue: RoutingQueue::default(),
             reader_message_id_failover: false,
             article: RoutingArticle::default(),
+            backbone_detection: BackboneDetection::default(),
         }
     }
 }

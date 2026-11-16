@@ -93,6 +93,10 @@ impl<B> Article<Framed<B>> {
         self.0.content_end()
     }
 
+    pub(crate) const fn status_line_end(&self) -> StatusLineEnd {
+        self.0.status_line_end()
+    }
+
     pub(crate) fn as_bytes(&self) -> &[u8]
     where
         B: StableBytes,
