@@ -113,16 +113,24 @@ fn tick_connection_cap(
     use super::connection_cap::{CapChange, PoolDemand};
     // No growth while logins are paused: nothing could test it.
     if pool.manager().login_backoff_active() {
+        cap.forget_idle();
         return;
     }
     let status = pool.status();
+    // Health checks borrow idle connections every few seconds; they are not
+    // use. A checkout between ticks is.
+    let client_busy = status
+        .size
+        .saturating_sub(status.available)
+        .saturating_sub(cap.health_checks_in_progress());
+    let checked_out_since_last_tick = cap.take_client_checkouts();
     // Saturated means the cap itself is full, not just the pool: replacement
     // cooldowns shrink the pool below the cap, and a pool full at that
     // smaller size has not shown the provider accepts the cap, let alone one
     // more.
     let demand = if status.size >= cap.current() && status.available == 0 {
         PoolDemand::Saturated
-    } else if status.size == status.available && status.waiting == 0 {
+    } else if client_busy == 0 && status.waiting == 0 && !checked_out_since_last_tick {
         PoolDemand::Idle
     } else {
         PoolDemand::Headroom
@@ -633,6 +641,10 @@ impl DeadpoolConnectionProvider {
 
         // Create metrics and shutdown channel if keepalive is enabled
         let metrics = Arc::new(HealthCheckMetrics::new());
+        let cap = Arc::new(super::connection_cap::ConnectionCap::new(
+            server.connection_cap,
+            max_size,
+        ));
         let shutdown_tx = keepalive_interval.map_or_else(
             || None,
             |interval| {
@@ -640,11 +652,13 @@ impl DeadpoolConnectionProvider {
 
                 // Spawn background health check task
                 let pool_clone = pool.clone();
+                let cap_for_health = Arc::clone(&cap);
                 let name_clone = server.name.to_string();
                 let metrics_clone = metrics.clone();
                 tokio::spawn(async move {
                     Self::run_periodic_health_checks(
                         pool_clone,
+                        cap_for_health,
                         name_clone,
                         interval,
                         rx,
@@ -657,10 +671,6 @@ impl DeadpoolConnectionProvider {
             },
         );
 
-        let cap = Arc::new(super::connection_cap::ConnectionCap::new(
-            server.connection_cap,
-            max_size,
-        ));
         let active_cooldowns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let cap_shutdown_tx = (server.connection_cap
             == super::connection_cap::ConnectionCapPolicy::Adaptive)
@@ -760,7 +770,10 @@ impl DeadpoolConnectionProvider {
         let mut attempt = *timeouts;
         let err = loop {
             match self.pool.timeout_get(&attempt).await {
-                Ok(connection) => return Ok(connection),
+                Ok(connection) => {
+                    self.cap.note_client_checkout();
+                    return Ok(connection);
+                }
                 Err(deadpool::managed::PoolError::Backend(ConnectionError::PoolExhausted {
                     ..
                 })) => {
@@ -1515,6 +1528,7 @@ impl DeadpoolConnectionProvider {
     /// Health check metrics are recorded in the provided metrics object.
     async fn run_periodic_health_checks(
         pool: Pool,
+        cap: Arc<super::connection_cap::ConnectionCap>,
         name: String,
         interval: std::time::Duration,
         mut shutdown_rx: broadcast::Receiver<()>,
@@ -1565,6 +1579,7 @@ impl DeadpoolConnectionProvider {
             timeouts.wait = Some(Duration::from_millis(HEALTH_CHECK_POOL_TIMEOUT_MS));
 
             for _ in 0..check_count {
+                let _health_check = cap.health_check();
                 if let Ok(mut conn_obj) = pool.timeout_get(&timeouts).await {
                     checked += 1;
 
@@ -2155,6 +2170,62 @@ mod tests {
         // may hold a slot; the pool must follow the reset cap either way.
         assert_eq!(provider.max_size(), provider.effective_max_size());
         assert!(provider.max_size() <= 2);
+        provider.shutdown();
+    }
+
+    /// A health check borrowing an idle connection is not use, so it neither
+    /// blocks nor restarts the idle reset.
+    #[tokio::test]
+    async fn health_checks_do_not_hold_off_the_idle_reset() {
+        use crate::pool::connection_cap::{ConnectionCapPolicy, IDLE_RESET, PROBE_STEP};
+        let addr = spawn_limited_login_server(usize::MAX).await;
+        let provider = capped_provider(addr, 2, ConnectionCapPolicy::Adaptive);
+        let start = tokio::time::Instant::now();
+        let first = provider.checkout_connection_guard().await.unwrap();
+        let second = provider.checkout_connection_guard().await.unwrap();
+        provider.tick_connection_cap_at(start + PROBE_STEP);
+        assert_eq!(provider.connection_cap(), 3);
+        drop((first, second));
+        provider.tick_connection_cap_at(start + PROBE_STEP);
+
+        // As the health checker does: mark, then borrow straight from the pool.
+        let health = provider.cap.health_check();
+        let borrowed = provider.pool.get().await.unwrap();
+        let idle = start + PROBE_STEP * 2;
+        provider.tick_connection_cap_at(idle);
+        provider.tick_connection_cap_at(idle + IDLE_RESET);
+        assert_eq!(provider.connection_cap(), 2);
+        drop((borrowed, health));
+        provider.shutdown();
+    }
+
+    /// A client checkout that starts and ends between two ticks is use.
+    #[tokio::test]
+    async fn a_checkout_between_ticks_restarts_the_idle_clock() {
+        use crate::pool::connection_cap::{ConnectionCapPolicy, IDLE_RESET, PROBE_STEP};
+        let addr = spawn_limited_login_server(usize::MAX).await;
+        let provider = capped_provider(addr, 2, ConnectionCapPolicy::Adaptive);
+        let start = tokio::time::Instant::now();
+        let first = provider.checkout_connection_guard().await.unwrap();
+        let second = provider.checkout_connection_guard().await.unwrap();
+        provider.tick_connection_cap_at(start + PROBE_STEP);
+        assert_eq!(provider.connection_cap(), 3);
+        drop((first, second));
+
+        let idle = start + PROBE_STEP * 2;
+        provider.tick_connection_cap_at(idle);
+        provider.tick_connection_cap_at(idle);
+        drop(provider.get_pooled_connection().await.unwrap());
+        let late = idle + IDLE_RESET;
+        provider.tick_connection_cap_at(late);
+        assert_eq!(
+            provider.connection_cap(),
+            3,
+            "the checkout restarted the clock"
+        );
+        provider.tick_connection_cap_at(late);
+        provider.tick_connection_cap_at(late + IDLE_RESET);
+        assert_eq!(provider.connection_cap(), 2);
         provider.shutdown();
     }
 

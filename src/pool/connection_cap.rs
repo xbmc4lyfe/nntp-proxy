@@ -23,10 +23,11 @@
 //!   `max_connections` it climbs whatever the demand; at or above it, only
 //!   while the pool is saturated.
 //!
-//! - **Reset when idle.** After [`IDLE_RESET`] with no connection checked
-//!   out, a cap above `max_connections` returns to it and the next busy spell
-//!   probes again. What an account allowed during the last burst says little
-//!   about it later, when other clients or the provider may have changed it.
+//! - **Reset when idle.** After [`IDLE_RESET`] with no client connection
+//!   checked out (health checks do not count), a cap above `max_connections`
+//!   returns to it and the next busy spell probes again. What an account
+//!   allowed during the last burst says little about it later, when other
+//!   clients or the provider may have changed it.
 //!
 //! There is no ceiling above `max_connections` other than the provider's own
 //! refusal, which brings the cap straight back down. A provider that never
@@ -106,7 +107,8 @@ pub enum PoolDemand {
     Saturated,
     /// Some allowed connections are idle or not opened.
     Headroom,
-    /// No connection is checked out and nothing is waiting for one.
+    /// No client has a connection checked out, took one since the last
+    /// tick, or is waiting for one.
     Idle,
 }
 
@@ -148,6 +150,12 @@ pub struct ConnectionCap {
     /// and a tick cannot both move the cap from the same reading.
     last_change: Mutex<CapClock>,
     reductions: AtomicU64,
+    /// Client checkouts since the last tick; any of them means the pool was
+    /// used, even one that started and ended between two ticks.
+    client_checkouts: AtomicU64,
+    /// Health-check checkouts in progress. They are not use, but the pool
+    /// status counts them as checked out.
+    health_checks: AtomicUsize,
     /// Held while computing and applying a pool size, so a resize computed
     /// from an older cap or cooldown count can never land after a newer one.
     resize: Mutex<()>,
@@ -166,6 +174,8 @@ impl ConnectionCap {
                 idle_since: None,
             }),
             reductions: AtomicU64::new(0),
+            client_checkouts: AtomicU64::new(0),
+            health_checks: AtomicUsize::new(0),
             resize: Mutex::new(()),
         }
     }
@@ -199,6 +209,39 @@ impl ConnectionCap {
     #[must_use]
     pub fn reductions(&self) -> u64 {
         self.reductions.load(Ordering::Relaxed)
+    }
+
+    /// A client took a connection from the pool.
+    pub fn note_client_checkout(&self) {
+        self.client_checkouts.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Whether a client took a connection since the previous call. Only the
+    /// cap ticker calls this.
+    pub fn take_client_checkouts(&self) -> bool {
+        self.client_checkouts.swap(0, Ordering::Relaxed) > 0
+    }
+
+    /// Mark a health-check checkout in progress until the guard drops.
+    #[must_use]
+    pub fn health_check(&self) -> HealthCheckGuard<'_> {
+        self.health_checks.fetch_add(1, Ordering::AcqRel);
+        HealthCheckGuard(self)
+    }
+
+    /// Health-check checkouts in progress.
+    #[must_use]
+    pub fn health_checks_in_progress(&self) -> usize {
+        self.health_checks.load(Ordering::Acquire)
+    }
+
+    /// A tick could not judge demand (logins are paused), so an idle spell
+    /// cannot be assumed to have continued through it.
+    pub fn forget_idle(&self) {
+        self.last_change
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .idle_since = None;
     }
 
     /// A login was refused while the provider had accepted `open`
@@ -266,6 +309,16 @@ impl ConnectionCap {
         self.cap.store(to, Ordering::Release);
         last_change.at = now;
         Some(CapChange::Raised { from, to })
+    }
+}
+
+/// Counts one health-check checkout while alive.
+#[derive(Debug)]
+pub struct HealthCheckGuard<'a>(&'a ConnectionCap);
+
+impl Drop for HealthCheckGuard<'_> {
+    fn drop(&mut self) {
+        self.0.health_checks.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
