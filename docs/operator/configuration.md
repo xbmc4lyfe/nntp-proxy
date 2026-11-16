@@ -392,6 +392,10 @@ With `connection_cap = "adaptive"` the pool remembers a size that works:
   the pool is saturated.
 - **Paused during login backoff.** The cap does not climb while logins are
   paused.
+- **Reset when unused.** After 15 minutes with no connection checked out, a
+  cap above `max_connections` returns to it, and the next busy spell probes
+  again at one connection per minute. What the account allowed during the last
+  burst may not hold later.
 
 Each refusal also restarts the climb timer. The cap starts at
 `max_connections` on every restart. Replacement cooldowns shrink the pool

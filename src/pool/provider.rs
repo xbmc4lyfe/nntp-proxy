@@ -122,11 +122,24 @@ fn tick_connection_cap(
     // more.
     let demand = if status.size >= cap.current() && status.available == 0 {
         PoolDemand::Saturated
+    } else if status.size == status.available && status.waiting == 0 {
+        PoolDemand::Idle
     } else {
         PoolDemand::Headroom
     };
-    let Some(CapChange::Raised { from, to }) = cap.on_tick(demand, now) else {
-        return;
+    let (from, to) = match cap.on_tick(demand, now) {
+        Some(CapChange::Raised { from, to }) => (from, to),
+        Some(CapChange::Reset { from, to }) => {
+            sync_pool_size(pool, cap, active_cooldowns);
+            info!(
+                pool = %name,
+                from,
+                to,
+                "Connection cap back to max_connections after the pool sat unused"
+            );
+            return;
+        }
+        Some(CapChange::Lowered { .. }) | None => return,
     };
     sync_pool_size(pool, cap, active_cooldowns);
     if to > cap.configured() {
@@ -2115,6 +2128,33 @@ mod tests {
         );
 
         drop((first, second));
+        provider.shutdown();
+    }
+
+    /// A cap probed past `max_connections` shrinks the pool back once
+    /// nothing has used it for the idle period.
+    #[tokio::test]
+    async fn adaptive_cap_resets_after_the_pool_sits_unused() {
+        use crate::pool::connection_cap::{ConnectionCapPolicy, IDLE_RESET, PROBE_STEP};
+        let addr = spawn_limited_login_server(usize::MAX).await;
+        let provider = capped_provider(addr, 2, ConnectionCapPolicy::Adaptive);
+        let start = tokio::time::Instant::now();
+        let first = provider.checkout_connection_guard().await.unwrap();
+        let second = provider.checkout_connection_guard().await.unwrap();
+        provider.tick_connection_cap_at(start + PROBE_STEP);
+        assert_eq!(provider.connection_cap(), 3);
+        assert_eq!(provider.max_size(), 3);
+
+        drop((first, second));
+        let idle = start + PROBE_STEP * 2;
+        provider.tick_connection_cap_at(idle);
+        assert_eq!(provider.connection_cap(), 3, "not idle long enough yet");
+        provider.tick_connection_cap_at(idle + IDLE_RESET);
+        assert_eq!(provider.connection_cap(), 2);
+        // Dropped guards retire their connections, so a replacement cooldown
+        // may hold a slot; the pool must follow the reset cap either way.
+        assert_eq!(provider.max_size(), provider.effective_max_size());
+        assert!(provider.max_size() <= 2);
         provider.shutdown();
     }
 
