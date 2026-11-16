@@ -341,6 +341,7 @@ password = "reader-password"
 | `connection_cap` | `"fixed"` | `"adaptive"` lets the pool size follow login refusals instead of always regrowing to `max_connections`. See [Adaptive connection cap](#adaptive-connection-cap) |
 | `stat_missing` | `0` | Probe missing articles with `STAT` before `ARTICLE`/`BODY`/`HEAD` on this backend. Enable it on backends that correctly return `430` to speed up retrying missing articles. |
 | `tier` | `0` | Lower tiers are preferred first |
+| `backbone` | unset | Usenet backbone the server resells, such as `"omicron"`. Servers naming the same backbone share `430`s: a miss on one skips the others. See [Backbones](#backbones) |
 | `stateful_sessions` | `"allowed"` | `"excluded"` keeps this backend out of stateful sessions (`GROUP`, `XOVER`, article-number commands) and other replies that carry article numbers, while it still serves message-ID requests. See [Article numbering across providers](#article-numbering-across-providers). |
 | `use_tls` | `false` | TLS to the backend |
 | `tls_verify_cert` | `true` | Keep enabled in production |
@@ -403,6 +404,46 @@ from the current cap. `nntp_proxy_backend_connection_cap` and
 `nntp_proxy_backend_connection_cap_reductions_total` show it; the
 environment variable is `NNTP_SERVER_<N>_CONNECTION_CAP`.
 
+### Backbones
+
+Many providers resell one of a few backbones, and resellers of one backbone
+serve the same article store. If one answers `430` for an article, asking
+another reseller of that backbone costs a round trip and very rarely finds it.
+
+Name the backbone on each server:
+
+```toml
+[[servers]]
+name = "newshosting"
+host = "news.newshosting.com"
+backbone = "omicron"
+
+[[servers]]
+name = "usenetserver"
+host = "news.usenetserver.com"
+backbone = "omicron"
+```
+
+- **A `430` covers the whole backbone.** It marks the article missing on every
+  server with the same `backbone` (compared case-insensitively), in every
+  tier. The proxy moves on to other backbones, and answers `430` once every
+  backbone it can reach has answered `430`.
+- **Other failures stay per server.** A refused lookup (such as `451`), a
+  server error, a refused login ("too many connections"), or bad credentials
+  say nothing about the article, so another server on the same backbone is
+  still tried.
+- **Unset**, a server shares `430`s only with servers on the same host, as
+  before.
+
+Group servers only when they really share an article store. A reseller with
+shorter retention, or a separate block on the same backbone that holds
+different articles, belongs under its own name: a `430` from it would hide
+articles the others have. Saved `430`s (the availability state file and the
+disk cache) are kept per backbone, so changing a server's `backbone` starts it
+with no saved misses.
+The environment variable is `NNTP_SERVER_<N>_BACKBONE`. Startup logs each
+backbone with its servers.
+
 ### Article numbering across providers
 
 Each provider numbers the articles in a group independently. In `hybrid` and
@@ -463,6 +504,8 @@ Currently supported backend environment fields:
 - `PREWARM_CONNECTIONS` (non-negative integer; any other value stops startup)
 - `TIER`
 - `STATEFUL_SESSIONS` (`allowed` or `excluded`; any other value stops startup)
+- `CONNECTION_CAP` (`fixed` or `adaptive`; any other value stops startup)
+- `BACKBONE` (backbone name; blank means unset)
 
 Example:
 

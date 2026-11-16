@@ -949,6 +949,15 @@ pub struct Server {
         skip_serializing_if = "crate::pool::connection_cap::ConnectionCapPolicy::is_default"
     )]
     pub connection_cap: crate::pool::connection_cap::ConnectionCapPolicy,
+    /// Usenet backbone this server reads from, such as `"omicron"`. Servers
+    /// naming the same backbone (case-insensitive) share article facts: a
+    /// `430` from one marks the article missing on all of them, because
+    /// resellers of one backbone serve the same article store. Other
+    /// failures (connection limits, bad credentials, server errors) stay
+    /// per server, so another server on the backbone is still tried. Unset,
+    /// a server shares facts only with servers on the same host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backbone: Option<String>,
     /// Wire compression for backend connections (RFC 8054 COMPRESS DEFLATE)
     /// None (default) = auto-detect, Some(true) = require, Some(false) = disable
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1000,6 +1009,7 @@ impl std::fmt::Debug for Server {
             tier,
             stateful_sessions,
             connection_cap,
+            backbone,
             compress,
             compress_level,
             backend_idle_timeout,
@@ -1023,6 +1033,7 @@ impl std::fmt::Debug for Server {
             .field("tier", tier)
             .field("stateful_sessions", stateful_sessions)
             .field("connection_cap", connection_cap)
+            .field("backbone", backbone)
             .field("compress", compress)
             .field("compress_level", compress_level)
             .field("backend_idle_timeout", backend_idle_timeout)
@@ -1075,6 +1086,7 @@ pub struct ServerBuilder {
     tier: u8,
     stateful_sessions: StatefulSessions,
     connection_cap: crate::pool::connection_cap::ConnectionCapPolicy,
+    backbone: Option<String>,
     compress: Option<bool>,
     compress_level: Option<u32>,
     backend_idle_timeout: Option<Duration>,
@@ -1107,6 +1119,7 @@ impl ServerBuilder {
             tier: 0,
             stateful_sessions: StatefulSessions::Allowed,
             connection_cap: crate::pool::connection_cap::ConnectionCapPolicy::Fixed,
+            backbone: None,
             compress: None,
             compress_level: None,
             backend_idle_timeout: None,
@@ -1224,6 +1237,13 @@ impl ServerBuilder {
         self
     }
 
+    /// Set the Usenet backbone this server shares article facts with
+    #[must_use]
+    pub fn backbone(mut self, backbone: impl Into<String>) -> Self {
+        self.backbone = Some(backbone.into());
+        self
+    }
+
     /// Set wire compression mode (RFC 8054 COMPRESS DEFLATE)
     #[must_use]
     pub const fn compress(mut self, compress: Option<bool>) -> Self {
@@ -1318,6 +1338,7 @@ impl ServerBuilder {
             tier: self.tier,
             stateful_sessions: self.stateful_sessions,
             connection_cap: self.connection_cap,
+            backbone: self.backbone,
             compress: self.compress,
             compress_level: self.compress_level,
             backend_idle_timeout: self
@@ -1806,6 +1827,15 @@ mod tests {
         let json = r#""none""#;
         let codec: CompressionCodec = serde_json::from_str(json).unwrap();
         assert_eq!(codec, CompressionCodec::None);
+    }
+
+    #[test]
+    fn test_server_backbone_deserializes_and_defaults_to_none() {
+        let base = "host = \"news.example.com\"\nport = 119\nname = \"a\"";
+        let server: Server = toml::from_str(base).unwrap();
+        assert_eq!(server.backbone, None);
+        let server: Server = toml::from_str(&format!("{base}\nbackbone = \"omicron\"")).unwrap();
+        assert_eq!(server.backbone.as_deref(), Some("omicron"));
     }
 
     #[test]

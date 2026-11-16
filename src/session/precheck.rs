@@ -433,9 +433,17 @@ async fn query_all_backends(
     availability: &ArticleAvailability,
 ) -> Vec<QueryResult> {
     let mut results = Vec::with_capacity(deps.router.backend_count().get());
+    // Later tiers skip slots an earlier tier answered `430` for: a backbone
+    // can span tiers, and its other servers serve the same articles.
+    let mut learned = *availability;
 
     for tier in deps.router.tiers() {
-        let tier_results = query_tier_backends(deps, request, tier, availability).await;
+        let tier_results = query_tier_backends(deps, request, tier, &learned).await;
+        for result in &tier_results {
+            if let QueryResult::Missing(backend) = result {
+                learned.record_missing_slot(backend.availability_slot());
+            }
+        }
         let found = tier_results
             .iter()
             .any(|result| matches!(result, QueryResult::Found(_, _)));
@@ -462,8 +470,8 @@ async fn query_all_backends_racing(
     let mut learned = *initial_availability;
 
     for tier in deps.router.tiers() {
-        let mut pending =
-            spawn_racing_backend_queries_for_tier(deps, request, tier, initial_availability);
+        // `learned`, not the initial availability: a backbone can span tiers.
+        let mut pending = spawn_racing_backend_queries_for_tier(deps, request, tier, &learned);
         let tier_results_start = results.len();
 
         while let Some(result) = pending.next().await {

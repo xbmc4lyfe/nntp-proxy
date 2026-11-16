@@ -436,6 +436,7 @@ pub fn parse_server_from_env<E: EnvProvider>(index: usize, env: &E) -> Result<Op
                 .unwrap_or_else(|error| panic!("Invalid {connection_cap_key}: {error}"))
         },
     );
+    let backbone = env_set(env, &format!("NNTP_SERVER_{index}_BACKBONE"));
     // Fail loudly: a typo silently falling back to "open every connection"
     // would defeat the point of lowering it.
     let prewarm_key = format!("NNTP_SERVER_{index}_PREWARM_CONNECTIONS");
@@ -467,6 +468,7 @@ pub fn parse_server_from_env<E: EnvProvider>(index: usize, env: &E) -> Result<Op
         tier,
         stateful_sessions,
         connection_cap,
+        backbone,
         compress: None,
         compress_level: None,
         backend_idle_timeout: crate::config::defaults::backend_idle_timeout(),
@@ -774,6 +776,7 @@ pub fn create_default_config() -> Config {
             tier: 0,
             stateful_sessions: crate::config::StatefulSessions::default(),
             connection_cap: crate::pool::connection_cap::ConnectionCapPolicy::default(),
+            backbone: None,
             compress: None,
             compress_level: None,
             backend_idle_timeout: defaults::backend_idle_timeout(),
@@ -1178,6 +1181,19 @@ mod tests {
 
         let server = parse_server_from_env(0, &env).unwrap().unwrap();
         assert_eq!(server.stat_missing, 3);
+    }
+
+    #[test]
+    fn test_parse_server_from_env_backbone() {
+        let mut env = MockEnv::new();
+        env.set("NNTP_SERVER_0_HOST", "news.example.com")
+            .set("NNTP_SERVER_0_BACKBONE", "Omicron");
+        let server = parse_server_from_env(0, &env).unwrap().unwrap();
+        assert_eq!(server.backbone.as_deref(), Some("Omicron"));
+
+        env.set("NNTP_SERVER_0_BACKBONE", " ");
+        let server = parse_server_from_env(0, &env).unwrap().unwrap();
+        assert_eq!(server.backbone, None, "blank means unset");
     }
 
     #[test]
