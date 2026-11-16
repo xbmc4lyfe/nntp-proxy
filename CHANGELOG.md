@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `connection_cap = "adaptive"` resets after 15 minutes unused: a cap probed above `max_connections` returns to it once no connection has been checked out for that long, and the next busy spell probes again from there. A cap learned during one download held for the rest of the process even when the account's situation had changed.
+
 - `[routing.article] standing = "goodput"` weighs each backend within a tier by its standing times its measured per-connection delivery rate (article bytes per busy second over about a minute). The backends that deliver the most article bytes per connection get first attempts and absorb the queue when every connection is busy; free connections are still used before any queue. On one production release the per-connection rates differed by 18× between tier-0 backends (3.6 MB/s against 0.2 MB/s), and routing by occupancy alone ignored this.
 
 - Background `STAT` probe failures (checkout, exchange, or reading the reply) log at `DEBUG` under the `nntp_proxy::stat_probe` target with the backend, pool, phase, and error. They were dropped silently, so there was no way to see why a retry skipped a backend. Enable them with `RUST_LOG=info,nntp_proxy::stat_probe=debug`.

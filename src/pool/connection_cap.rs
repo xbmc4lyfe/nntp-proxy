@@ -23,6 +23,12 @@
 //!   `max_connections` it climbs whatever the demand; at or above it, only
 //!   while the pool is saturated.
 //!
+//! - **Reset when idle.** After [`IDLE_RESET`] with no client connection
+//!   checked out (health checks do not count), a cap above `max_connections`
+//!   returns to it and the next busy spell probes again. What an account
+//!   allowed during the last burst says little about it later, when other
+//!   clients or the provider may have changed it.
+//!
 //! There is no ceiling above `max_connections` other than the provider's own
 //! refusal, which brings the cap straight back down. A provider that never
 //! refuses ends up with as many connections as the load keeps busy.
@@ -40,6 +46,10 @@ pub const PROBE_STEP: Duration = Duration::from_secs(60);
 /// steps. Each step past the last refusal is one login the provider may
 /// refuse again.
 pub const CLIMB_STEP: Duration = Duration::from_secs(5 * 60);
+
+/// Time with no connection checked out after which a cap above
+/// `max_connections` falls back to it.
+pub const IDLE_RESET: Duration = Duration::from_secs(15 * 60);
 
 /// How often a backend's cap is re-evaluated.
 pub const TICK: Duration = Duration::from_secs(15);
@@ -97,13 +107,27 @@ pub enum PoolDemand {
     Saturated,
     /// Some allowed connections are idle or not opened.
     Headroom,
+    /// No client has a connection checked out, took one since the last
+    /// tick, or is waiting for one.
+    Idle,
 }
 
 /// A change the caller should apply to the pool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CapChange {
-    Lowered { from: usize, to: usize },
-    Raised { from: usize, to: usize },
+    Lowered {
+        from: usize,
+        to: usize,
+    },
+    Raised {
+        from: usize,
+        to: usize,
+    },
+    /// Back to `max_connections` after [`IDLE_RESET`] unused.
+    Reset {
+        from: usize,
+        to: usize,
+    },
 }
 
 /// When the cap last moved and whether the provider has refused a login
@@ -112,6 +136,8 @@ pub enum CapChange {
 struct CapClock {
     at: Instant,
     refused: bool,
+    /// Start of the current unused spell, if the pool is unused now.
+    idle_since: Option<Instant>,
 }
 
 /// Current cap and when it last moved, shared by every clone of a provider.
@@ -124,6 +150,12 @@ pub struct ConnectionCap {
     /// and a tick cannot both move the cap from the same reading.
     last_change: Mutex<CapClock>,
     reductions: AtomicU64,
+    /// Client checkouts since the last tick; any of them means the pool was
+    /// used, even one that started and ended between two ticks.
+    client_checkouts: AtomicU64,
+    /// Health-check checkouts in progress. They are not use, but the pool
+    /// status counts them as checked out.
+    health_checks: AtomicUsize,
     /// Held while computing and applying a pool size, so a resize computed
     /// from an older cap or cooldown count can never land after a newer one.
     resize: Mutex<()>,
@@ -139,8 +171,11 @@ impl ConnectionCap {
             last_change: Mutex::new(CapClock {
                 at: Instant::now(),
                 refused: false,
+                idle_since: None,
             }),
             reductions: AtomicU64::new(0),
+            client_checkouts: AtomicU64::new(0),
+            health_checks: AtomicUsize::new(0),
             resize: Mutex::new(()),
         }
     }
@@ -176,6 +211,39 @@ impl ConnectionCap {
         self.reductions.load(Ordering::Relaxed)
     }
 
+    /// A client took a connection from the pool.
+    pub fn note_client_checkout(&self) {
+        self.client_checkouts.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Whether a client took a connection since the previous call. Only the
+    /// cap ticker calls this.
+    pub fn take_client_checkouts(&self) -> bool {
+        self.client_checkouts.swap(0, Ordering::Relaxed) > 0
+    }
+
+    /// Mark a health-check checkout in progress until the guard drops.
+    #[must_use]
+    pub fn health_check(&self) -> HealthCheckGuard<'_> {
+        self.health_checks.fetch_add(1, Ordering::AcqRel);
+        HealthCheckGuard(self)
+    }
+
+    /// Health-check checkouts in progress.
+    #[must_use]
+    pub fn health_checks_in_progress(&self) -> usize {
+        self.health_checks.load(Ordering::Acquire)
+    }
+
+    /// A tick could not judge demand (logins are paused), so an idle spell
+    /// cannot be assumed to have continued through it.
+    pub fn forget_idle(&self) {
+        self.last_change
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .idle_since = None;
+    }
+
     /// A login was refused while the provider had accepted `open`
     /// connections from this pool. Lowers the cap to that count (never below
     /// one) and restarts the climb timer.
@@ -188,10 +256,8 @@ impl ConnectionCap {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Any refusal restarts the climb, even one that does not lower the cap.
-        *last_change = CapClock {
-            at: now,
-            refused: true,
-        };
+        last_change.at = now;
+        last_change.refused = true;
         let from = self.current();
         let to = open.max(1);
         if to >= from {
@@ -205,7 +271,8 @@ impl ConnectionCap {
     /// Re-evaluate the cap. Grows it by one when the step interval has
     /// passed since the last change: [`PROBE_STEP`] before any refusal,
     /// [`CLIMB_STEP`] after one. At or above `max_connections` it grows only
-    /// while the pool is saturated.
+    /// while the pool is saturated. After [`IDLE_RESET`] unused, a cap above
+    /// `max_connections` returns to it and probing starts over.
     pub fn on_tick(&self, demand: PoolDemand, now: Instant) -> Option<CapChange> {
         if self.policy == ConnectionCapPolicy::Fixed {
             return None;
@@ -215,6 +282,18 @@ impl ConnectionCap {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let from = self.current();
+        if demand == PoolDemand::Idle {
+            let since = *last_change.idle_since.get_or_insert(now);
+            if from > self.configured && now.saturating_duration_since(since) >= IDLE_RESET {
+                let to = self.configured;
+                self.cap.store(to, Ordering::Release);
+                last_change.at = now;
+                last_change.refused = false;
+                return Some(CapChange::Reset { from, to });
+            }
+        } else {
+            last_change.idle_since = None;
+        }
         if from >= self.configured && demand != PoolDemand::Saturated {
             return None;
         }
@@ -230,6 +309,16 @@ impl ConnectionCap {
         self.cap.store(to, Ordering::Release);
         last_change.at = now;
         Some(CapChange::Raised { from, to })
+    }
+}
+
+/// Counts one health-check checkout while alive.
+#[derive(Debug)]
+pub struct HealthCheckGuard<'a>(&'a ConnectionCap);
+
+impl Drop for HealthCheckGuard<'_> {
+    fn drop(&mut self) {
+        self.0.health_checks.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -391,6 +480,72 @@ mod tests {
             cap.on_tick(PoolDemand::Headroom, later + CLIMB_STEP),
             Some(CapChange::Raised { from: 50, to: 51 })
         );
+    }
+
+    #[test]
+    fn an_unused_pool_drops_back_to_the_configured_size_and_probes_again() {
+        let (cap, start) = adaptive(80);
+        let mut now = start;
+        for _ in 0..3 {
+            now += PROBE_STEP;
+            cap.on_tick(PoolDemand::Saturated, now);
+        }
+        cap.on_login_refused(82, now);
+        assert_eq!(cap.current(), 82);
+
+        let idle = now + PROBE_STEP;
+        assert_eq!(cap.on_tick(PoolDemand::Idle, idle), None);
+        assert_eq!(
+            cap.on_tick(PoolDemand::Idle, idle + IDLE_RESET - Duration::from_secs(1)),
+            None
+        );
+        let reset = idle + IDLE_RESET;
+        assert_eq!(
+            cap.on_tick(PoolDemand::Idle, reset),
+            Some(CapChange::Reset { from: 82, to: 80 })
+        );
+        assert_eq!(cap.on_tick(PoolDemand::Idle, reset + IDLE_RESET), None);
+        assert_eq!(cap.reductions(), 1, "a reset is not a refusal");
+
+        // The refusal is forgotten: the next busy spell probes at probe speed.
+        assert_eq!(
+            cap.on_tick(PoolDemand::Saturated, reset + PROBE_STEP),
+            Some(CapChange::Raised { from: 80, to: 81 })
+        );
+    }
+
+    #[test]
+    fn any_use_restarts_the_idle_clock() {
+        let (cap, start) = adaptive(80);
+        let now = start + PROBE_STEP;
+        cap.on_tick(PoolDemand::Saturated, now);
+        assert_eq!(cap.current(), 81);
+
+        cap.on_tick(PoolDemand::Idle, now);
+        let busy = now + IDLE_RESET - Duration::from_secs(15);
+        cap.on_tick(PoolDemand::Headroom, busy);
+        assert_eq!(
+            cap.on_tick(PoolDemand::Idle, now + IDLE_RESET),
+            None,
+            "the busy tick restarted the idle spell"
+        );
+        assert_eq!(
+            cap.on_tick(PoolDemand::Idle, now + IDLE_RESET * 2),
+            Some(CapChange::Reset { from: 81, to: 80 })
+        );
+    }
+
+    #[test]
+    fn an_unused_pool_below_the_configured_size_still_climbs_back() {
+        let (cap, start) = adaptive(80);
+        cap.on_login_refused(79, start);
+        assert_eq!(
+            cap.on_tick(PoolDemand::Idle, start + CLIMB_STEP),
+            Some(CapChange::Raised { from: 79, to: 80 })
+        );
+        // Idle at the configured size: nothing to reset.
+        assert_eq!(cap.on_tick(PoolDemand::Idle, start + IDLE_RESET * 2), None);
+        assert_eq!(cap.current(), 80);
     }
 
     #[test]
