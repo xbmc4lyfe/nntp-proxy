@@ -13,21 +13,22 @@ const WIDTH: usize = 92;
 /// The text with `server`'s notes replaced by `note` (dated `date`), or
 /// `None` when the server is not in the file or nothing would change.
 pub(crate) fn annotate(text: &str, server: &str, note: &str, date: &str) -> Option<String> {
+    let note = &sanitize(note);
     let lines: Vec<&str> = text.split_inclusive('\n').collect();
     let (start, end) = server_block(&lines, server)?;
     let existing: Vec<&str> = lines[start..end]
         .iter()
         .copied()
-        .filter(|line| line.trim_start().starts_with(MARKER))
+        .filter(|line| is_note(line))
         .collect();
-    if note_text(&existing) == normalize_spaces(note) {
+    if comparable(&note_text(&existing)) == comparable(note) {
         return None;
     }
 
     let block: Vec<&str> = lines[start..end]
         .iter()
         .copied()
-        .filter(|line| !line.trim_start().starts_with(MARKER))
+        .filter(|line| !is_note(line))
         .collect();
     let anchor = block
         .iter()
@@ -62,6 +63,11 @@ pub(crate) fn annotate(text: &str, server: &str, note: &str, date: &str) -> Opti
     (out != text).then_some(out)
 }
 
+/// Whether a config line is one of this module's own comments.
+fn is_note(line: &str) -> bool {
+    line.trim_start().strip_prefix(MARKER).is_some()
+}
+
 /// Line range of the `[[servers]]` block whose `name` is `server`.
 fn server_block(lines: &[&str], server: &str) -> Option<(usize, usize)> {
     let mut index = 0;
@@ -70,7 +76,7 @@ fn server_block(lines: &[&str], server: &str) -> Option<(usize, usize)> {
             let start = index + 1;
             let end = lines[start..]
                 .iter()
-                .position(|line| line.trim_start().starts_with('['))
+                .position(|line| line.trim_start().strip_prefix('[').is_some())
                 .map_or(lines.len(), |offset| start + offset);
             let named = lines[start..end]
                 .iter()
@@ -89,7 +95,7 @@ fn server_block(lines: &[&str], server: &str) -> Option<(usize, usize)> {
 /// The key of a `key = value` line, ignoring comments.
 fn key_of(line: &str) -> Option<&str> {
     let line = line.trim_start();
-    if line.starts_with('#') {
+    if line.strip_prefix('#').is_some() {
         return None;
     }
     let (key, _) = line.split_once('=')?;
@@ -122,6 +128,38 @@ fn note_text(lines: &[&str]) -> String {
 
 fn normalize_spaces(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Server reply text can carry control characters, which TOML forbids even
+/// in comments; one would leave the file unloadable.
+fn sanitize(note: &str) -> String {
+    note.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
+}
+
+/// A note's wording without its check counts, so a count that moves by one
+/// between checks does not rewrite the file every few hours.
+fn comparable(note: &str) -> String {
+    let words: Vec<&str> = note.split_whitespace().collect();
+    let mut kept = Vec::with_capacity(words.len());
+    let mut index = 0;
+    while index < words.len() {
+        let is_count = |word: &str| word.chars().all(|c| c.is_ascii_digit()) && !word.is_empty();
+        if words[index] == "(met"
+            && words.get(index + 2) == Some(&"of")
+            && words.get(index + 1).is_some_and(|w| is_count(w))
+            && words.get(index + 3).is_some_and(|w| is_count(w))
+        {
+            kept.push("(met");
+            kept.push("of");
+            index += 4;
+        } else {
+            kept.push(words[index]);
+            index += 1;
+        }
+    }
+    kept.join(" ")
 }
 
 /// `note` as marker comment lines: the first dated, the rest continuing.
@@ -236,6 +274,48 @@ max_connections = 10
         assert_eq!(annotate(CONFIG, "gamma", "detected", "2026-11-16"), None);
         let commented = CONFIG.replace("name = \"beta\"", "# name = \"beta\"");
         assert_eq!(annotate(&commented, "beta", "detected", "2026-11-16"), None);
+    }
+
+    #[test]
+    fn a_moved_check_count_alone_does_not_rewrite_the_note() {
+        let once = annotate(
+            CONFIG,
+            "beta",
+            "detected omicron (met 13 of 14 checks)",
+            "2026-11-16",
+        )
+        .unwrap();
+        assert_eq!(
+            annotate(
+                &once,
+                "beta",
+                "detected omicron (met 14 of 14 checks)",
+                "2026-11-17"
+            ),
+            None
+        );
+        assert!(
+            annotate(
+                &once,
+                "beta",
+                "detected abavia (met 14 of 14 checks)",
+                "2026-11-17"
+            )
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn control_characters_from_a_server_never_reach_the_file() {
+        let out = annotate(
+            CONFIG,
+            "beta",
+            "could not check: 501 bad\u{1b}[0m\u{0}x",
+            "2026-11-16",
+        )
+        .unwrap();
+        assert!(!out.chars().any(|c| c.is_control() && c != '\n'));
+        toml::from_str::<toml::Value>(&out).expect("the annotated file still parses");
     }
 
     #[test]

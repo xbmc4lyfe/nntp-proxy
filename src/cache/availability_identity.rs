@@ -174,6 +174,9 @@ pub(crate) struct BackendSlots {
     slots: [AtomicU8; usize::BITS as usize],
     len: AtomicUsize,
     mask: AtomicUsize,
+    /// Serializes writers, so the mask is always recomputed from every
+    /// slot store before it; readers stay lock-free.
+    writer: std::sync::Mutex<()>,
 }
 
 impl BackendSlots {
@@ -183,6 +186,7 @@ impl BackendSlots {
             slots: std::array::from_fn(|_| AtomicU8::new(0)),
             len: AtomicUsize::new(0),
             mask: AtomicUsize::new(0),
+            writer: std::sync::Mutex::new(()),
         };
         for (index, slot) in slots.iter().enumerate() {
             table.set(BackendId::from_index(index), *slot);
@@ -204,6 +208,10 @@ impl BackendSlots {
     }
 
     pub(crate) fn set(&self, backend: BackendId, slot: AvailabilitySlot) {
+        let _writer = self
+            .writer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let index = backend.as_index();
         let slot = u8::try_from(slot.index()).expect("slots fit the bitmap width");
         self.slots[index].store(slot, Ordering::Relaxed);
@@ -292,8 +300,10 @@ impl AvailabilityLayout {
         extra: &[AvailabilityIdentity],
     ) -> Result<Self, AvailabilityLayoutError> {
         let mut identities = identities_with_candidates(servers, extra);
-        // Candidates beyond the bitmap width are dropped; the configured
-        // identities and hosts come first, so they always stay.
+        // Candidates beyond the bitmap width are dropped. The configured
+        // identities come first, so they always stay; with more than 32
+        // servers some hosts may not, and moving such a server back to its
+        // own host is refused with a warning.
         identities.truncate(usize::BITS as usize);
         let mut backend_slots = Vec::with_capacity(servers.len());
         for server in servers {

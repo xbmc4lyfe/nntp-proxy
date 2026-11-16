@@ -15,8 +15,9 @@ use tracing::{info, warn};
 
 /// Let pools and the first clients settle before the first probe.
 const FIRST_PROBE_DELAY: Duration = Duration::from_secs(15);
-/// Longest one server's probe may take before it counts as unanswered.
-const PROBE_LIMIT: Duration = Duration::from_secs(120);
+/// Longer than every probe command's own checkout and reply limits combined,
+/// so it only catches a probe that hangs outside them.
+const PROBE_LIMIT: Duration = Duration::from_secs(360);
 
 /// Everything the detection task needs from the running proxy.
 pub struct Detector {
@@ -161,14 +162,40 @@ impl Detector {
         if updated == text {
             return;
         }
+        // Skip this round if the operator saved the file while we worked;
+        // the next check annotates their version.
+        if std::fs::read_to_string(path).ok().as_deref() != Some(text.as_str()) {
+            return;
+        }
+        // A copy of the file as it was before the first note, kept once.
+        let backup = path.with_extension("toml.before-backbone-check");
+        if !backup.exists() {
+            let _ = std::fs::copy(path, &backup);
+        }
         // Written in place, not renamed over: a config bind-mounted into a
-        // container is a single file whose inode must stay.
-        match std::fs::write(path, &updated) {
+        // container is a single file whose inode must stay. A failed or short
+        // write is detected by reading back and undone with the original.
+        let written = std::fs::write(path, &updated).and_then(|()| {
+            if std::fs::read_to_string(path)? == updated {
+                Ok(())
+            } else {
+                Err(std::io::Error::other(
+                    "the file read back differs from what was written",
+                ))
+            }
+        });
+        match written {
             Ok(()) => {
                 info!(path = %path.display(), "Backbone check wrote its findings into the config file as comments")
             }
             Err(error) => {
-                if !UNWRITABLE_REPORTED.swap(true, Ordering::Relaxed) {
+                // A refused write (read-only file) leaves the original;
+                // anything else is put back.
+                let intact = std::fs::read_to_string(path).ok().as_deref() == Some(text.as_str())
+                    || std::fs::write(path, &text).is_ok();
+                if !intact {
+                    warn!(path = %path.display(), backup = %backup.display(), %error, "Backbone check could not write the config file or put the original back; restore it from the backup");
+                } else if !UNWRITABLE_REPORTED.swap(true, Ordering::Relaxed) {
                     info!(
                         path = %path.display(),
                         %error,
@@ -238,6 +265,10 @@ pub(crate) fn describe(servers: &[Server], index: usize, verdict: &Verdict) -> S
             against,
         } => format!(
             "config says \"{configured}\", but its article numbers differ from {against}'s, which is also set to \"{configured}\"; we think it is on {placed}{matches}{checks}. Its 430s follow the evidence until that changes"
+        ),
+        Finding::SameStoreOtherName { other } => format!(
+            "kept {placed} as configured, though its article numbers and retention match {}, which are on \"{other}\"{checks}. Give them the same backbone to share their 430s",
+            verdict.peers.join(", ")
         ),
         Finding::Detected => format!("detected {placed}{matches}{checks}"),
         Finding::Alone => {

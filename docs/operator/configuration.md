@@ -465,8 +465,16 @@ server's own connection pool:
   greeting can name a group (from a list of known backbones built into the
   proxy) but never form one.
 
-A named backbone the numbers contradict (another server with the same name
-reads a different store) is corrected while running: the server's `430`s
+Matching numbers show one store, not one set of removals: servers of one
+backbone in different regions can act on takedown notices differently, so a
+`430` from one may hide an article another still serves. If a pair the proxy
+groups keeps rescuing each other's misses for you, give them different
+`backbone` names: detection keeps a name you set unless the numbers contradict
+it, and only suggests merging two names that turn out to share a store.
+
+A named backbone is overridden only when the numbers contradict it (another
+server with the same name reads a different store). Such a server is
+corrected while running: the server's `430`s
 follow the evidence until it changes, and an INFO line says so. When servers
 with one name disagree, the name stays with the larger group. A server that
 gives no article numbers (some refuse `LIST ACTIVE`) keeps its configured

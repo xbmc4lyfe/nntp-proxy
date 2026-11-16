@@ -151,7 +151,7 @@ async fn command(
 /// `<group> <high> <low> <flag>`, only for the group asked about: some
 /// servers answer with a line that leaves the group name out.
 fn parse_active(line: &str, group: &str) -> Option<Watermarks> {
-    let mut fields = line.split_ascii_whitespace();
+    let mut fields = line.split_whitespace();
     if !fields.next()?.eq_ignore_ascii_case(group) {
         return None;
     }

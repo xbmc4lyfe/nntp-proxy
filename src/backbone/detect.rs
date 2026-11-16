@@ -19,9 +19,11 @@ use super::registry::Registry;
 const HIGH_TOLERANCE_PER_MILLION: u64 = 10;
 /// Absolute slack for the posts that arrive between two queries.
 const HIGH_SLACK: u64 = 100_000;
-/// Lowest numbers this close (relative to the range held) keep the same
-/// history.
-const LOW_TOLERANCE_PERCENT: u64 = 1;
+/// Lowest numbers this close (relative to the range held, per mille) keep
+/// the same history. Servers on one backbone with the same retention report
+/// the same lowest number, so this stays tight: early years held far fewer
+/// posts, and a loose tolerance there spans years of retention.
+const LOW_TOLERANCE_PER_MILLE: u64 = 1;
 
 /// One configured server as detection sees it.
 #[derive(Clone, Debug)]
@@ -62,6 +64,9 @@ pub(crate) enum Finding {
     Unchecked,
     /// The configured backbone contradicts the evidence.
     Misconfigured { configured: String, against: String },
+    /// The configured backbone is kept, but the evidence says its store also
+    /// goes by `other` here; naming both the same would share their `430`s.
+    SameStoreOtherName { other: String },
     /// No backbone configured; the evidence placed it.
     Detected,
     /// No backbone configured and no other server shares its store.
@@ -149,7 +154,7 @@ fn same_retention(a: Watermarks, b: Watermarks) -> bool {
         .high
         .saturating_sub(a.low)
         .max(b.high.saturating_sub(b.low));
-    let tolerance = (range / 100 * LOW_TOLERANCE_PERCENT).max(HIGH_SLACK);
+    let tolerance = (range / 1000 * LOW_TOLERANCE_PER_MILLE).max(HIGH_SLACK);
     a.low.abs_diff(b.low) <= tolerance
 }
 
@@ -175,24 +180,21 @@ pub(crate) fn decide(servers: &[ServerInput<'_>], registry: &Registry) -> Vec<Ve
     }
     let relation = |a: usize, b: usize| relations[a][b].0;
 
-    // Group servers whose numbers say they read one store.
-    let mut group_of: Vec<usize> = (0..count).collect();
-    fn root(group_of: &mut [usize], mut index: usize) -> usize {
-        while group_of[index] != index {
-            group_of[index] = group_of[group_of[index]];
-            index = group_of[index];
-        }
-        index
-    }
-    for a in 0..count {
-        for b in (a + 1)..count {
-            if relation(a, b) == Relation::Same {
-                let (ra, rb) = (root(&mut group_of, a), root(&mut group_of, b));
-                group_of[ra.max(rb)] = ra.min(rb);
-            }
+    // Group servers whose numbers say they read one store. Every pair in a
+    // group must match directly: matching within tolerance is not
+    // transitive, and a chain of near-matches could join two servers whose
+    // retention differs. A group is named by its first member's index.
+    let mut groups: Vec<usize> = (0..count).collect();
+    for index in 0..count {
+        if let Some(group) = (0..index).find(|&leader| {
+            groups[leader] == leader
+                && (0..index)
+                    .filter(|&member| groups[member] == leader)
+                    .all(|member| relation(index, member) == Relation::Same)
+        }) {
+            groups[index] = group;
         }
     }
-    let groups: Vec<usize> = (0..count).map(|index| root(&mut group_of, index)).collect();
     let groups = &groups;
     let members = move |group: usize| (0..count).filter(move |&index| groups[index] == group);
     let configured_as = move |index: usize, name: &str| matches!(&servers[index].configured, Configured::Named(n) if n == name);
@@ -270,8 +272,13 @@ pub(crate) fn decide(servers: &[ServerInput<'_>], registry: &Registry) -> Vec<Ve
             continue;
         };
         let agreed = hints.all(|hint| hint.is_none_or(|hint| hint == first));
+        // A configured name is taken even when none of its servers gave
+        // numbers: a hint must not join this group to servers no evidence
+        // links it to.
         let taken = names.iter().flatten().any(|name| name == first)
-            || owner_of_name.iter().any(|(name, _)| name == first);
+            || servers
+                .iter()
+                .any(|server| server.configured == Configured::Named(first.to_owned()));
         if agreed && !taken {
             names[group] = Some(first.to_owned());
         }
@@ -317,29 +324,27 @@ pub(crate) fn decide(servers: &[ServerInput<'_>], registry: &Registry) -> Vec<Ve
                             against: servers[other].name.to_owned(),
                         },
                     )
-                } else if peers.is_empty() || group_assignment == Assignment::Backbone(name.clone())
-                {
-                    // Nothing contradicts the configured name, and the
-                    // evidence either agrees or found no one to compare with.
+                } else {
+                    // Nothing contradicts the configured name, so it stays,
+                    // even when the store also goes by another name here:
+                    // a missed grouping only costs lookups, while merging
+                    // against the operator's choice could hide articles
+                    // (servers of one store can still differ in takedowns).
                     let checked = (0..count).any(|other| {
                         other != index
                             && servers[other].configured == Configured::Named(name.clone())
                             && relation(index, other) == Relation::Same
                     });
-                    let finding = if checked {
-                        Finding::Confirmed
-                    } else {
-                        Finding::Unchecked
+                    let finding = match &group_assignment {
+                        Assignment::Backbone(other) if *other != name => {
+                            Finding::SameStoreOtherName {
+                                other: other.clone(),
+                            }
+                        }
+                        _ if checked => Finding::Confirmed,
+                        _ => Finding::Unchecked,
                     };
                     (Assignment::Backbone(name), finding)
-                } else {
-                    (
-                        group_assignment,
-                        Finding::Misconfigured {
-                            configured: name,
-                            against: servers[peers[0]].name.to_owned(),
-                        },
-                    )
                 }
             } else if peers.is_empty() && !matches!(group_assignment, Assignment::Backbone(_)) {
                 (Assignment::Own, Finding::Alone)
@@ -573,6 +578,76 @@ mod tests {
             }
         );
         assert_eq!(verdicts[2].assignment, Assignment::Backbone("gamma".into()));
+    }
+
+    #[test]
+    fn a_chain_of_near_matches_does_not_join_servers_that_differ() {
+        // Each neighbour is within the retention tolerance of the next,
+        // but the ends are not.
+        let a = store(ALPHA, 2, 0, 1);
+        let b = store(ALPHA, 150_000_000, 0, 1);
+        let c = store(ALPHA, 300_000_000, 0, 1);
+        let verdicts = decide(
+            &[
+                input("a", None, &a),
+                input("b", None, &b),
+                input("c", None, &c),
+            ],
+            &registry(),
+        );
+        for verdict in &verdicts {
+            for peer in &verdict.peers {
+                assert!(
+                    !verdict.retention_differs.contains(peer),
+                    "a peer must never also differ in retention: {verdict:?}"
+                );
+            }
+        }
+        assert_ne!(verdicts[0].assignment, verdicts[2].assignment);
+    }
+
+    #[test]
+    fn a_hint_never_borrows_a_name_configured_on_a_server_without_numbers() {
+        let quiet = silent("LIST ACTIVE refused");
+        let mut a = store(GAMMA, 2, 0, 1);
+        a.greeting = Some("200 BetaNet ready".into());
+        let b = store(GAMMA, 2, 10, 1);
+        let verdicts = decide(
+            &[
+                input("quiet", Some("beta"), &quiet),
+                input("one", None, &a),
+                input("two", None, &b),
+            ],
+            &registry(),
+        );
+        assert_eq!(verdicts[0].assignment, Assignment::Backbone("beta".into()));
+        assert_eq!(verdicts[1].assignment, Assignment::SameAs(1));
+        assert_eq!(verdicts[2].assignment, Assignment::SameAs(1));
+    }
+
+    #[test]
+    fn two_names_on_one_store_are_kept_and_only_flagged() {
+        let a = store(ALPHA, 2, 0, 1);
+        let b = store(ALPHA, 2, 10, 1);
+        let verdicts = decide(
+            &[
+                input("one", Some("alpha"), &a),
+                input("two", Some("beta"), &b),
+            ],
+            &registry(),
+        );
+        assert_eq!(verdicts[0].assignment, Assignment::Backbone("alpha".into()));
+        assert_eq!(
+            verdicts[1].assignment,
+            Assignment::Backbone("beta".into()),
+            "an operator's distinct name is their opt-out from sharing"
+        );
+        assert_eq!(
+            verdicts[1].finding,
+            Finding::SameStoreOtherName {
+                other: "alpha".into()
+            }
+        );
     }
 
     #[test]
