@@ -376,5 +376,15 @@ async fn audits_split_servers_whose_numbers_match_but_articles_differ() -> Resul
         after.iter().all(|code| code == "220"),
         "after audits catch the sibling holding the 'missing' articles, it is asked again: {after:?}"
     );
+
+    // Later probes still report matching numbers; the split must hold.
+    for _ in 0..3 {
+        running.check.run().await;
+    }
+    let later = article_each(running.port, "later", 3).await?;
+    assert!(
+        later.iter().all(|code| code == "220"),
+        "a split pair stays split across probes: {later:?}"
+    );
     Ok(())
 }

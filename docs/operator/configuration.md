@@ -477,9 +477,9 @@ checked for that:
 - **A pair that rescues is split.** Once one server has had at least 3
   articles its sibling answered `430` for, and they are at least 2% of the
   checks between them, the two stop sharing `430`s, with an INFO line, even
-  if their numbers match or the config names one backbone for both. The
-  counts halve at every 6-hourly probe, so a pair that stops differing joins
-  up again.
+  if their numbers match or the config names one backbone for both.  Counts
+  below that bar halve at every 6-hourly probe; a pair once split stays split
+  until the proxy restarts, since apart they no longer produce evidence.
 
 To keep two servers apart regardless, give them different `backbone` names:
 detection keeps a name you set unless the evidence contradicts it, and only

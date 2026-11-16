@@ -143,9 +143,20 @@ impl Detector {
             .await;
         let mut state = self.state.lock().await;
         state.fingerprints = fingerprints;
-        // Old audits fade, so a pair that stopped differing can rejoin.
-        for counts in state.audits.values_mut() {
-            *counts = (counts.0 / 2, counts.1 / 2);
+        // Audits below the bar fade, so stray rescues do not add up over
+        // days. A pair already split keeps its evidence: apart, they no
+        // longer share a slot, so no new audit could ever confirm it again,
+        // and decaying it would rejoin them every interval. A restart clears
+        // it, and audits then re-establish it if they still differ.
+        let split: Vec<(usize, usize)> = state
+            .rescues()
+            .iter()
+            .map(|rescue| (rescue.missing, rescue.has))
+            .collect();
+        for (pair, counts) in &mut state.audits {
+            if !split.contains(pair) {
+                *counts = (counts.0 / 2, counts.1 / 2);
+            }
         }
         self.apply(&state, first);
     }
