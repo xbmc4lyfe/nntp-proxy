@@ -210,6 +210,7 @@ impl NntpProxyBuilder {
             crate::cache::AvailabilityLayout::from_servers(&servers)
                 .context("Failed to construct backend availability layout")?
         };
+        log_backbones(&servers);
 
         let router = Arc::new({
             let mut r = router::BackendSelector::with_strategy(backend_strategy)
@@ -489,6 +490,30 @@ impl BuildContext {
             reader_message_id_failover: self.reader_message_id_failover,
             active_clients: Arc::new(AtomicUsize::new(0)),
         }
+    }
+}
+
+/// Name the servers that share `430`s through a backbone, so a typo that
+/// splits one backbone in two (or joins two) shows at startup.
+fn log_backbones(servers: &[Server]) {
+    let mut backbones: std::collections::BTreeMap<String, Vec<&str>> =
+        std::collections::BTreeMap::new();
+    for server in servers {
+        if let Some(backbone) = server.backbone.as_deref().map(str::trim)
+            && !backbone.is_empty()
+        {
+            backbones
+                .entry(backbone.to_ascii_lowercase())
+                .or_default()
+                .push(server.name.as_str());
+        }
+    }
+    for (backbone, members) in backbones {
+        tracing::info!(
+            backbone = %backbone,
+            servers = %members.join(", "),
+            "Servers on one backbone share 430s: a miss on one skips the rest"
+        );
     }
 }
 

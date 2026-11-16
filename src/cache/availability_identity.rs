@@ -48,6 +48,19 @@ impl From<&HostName> for AvailabilityIdentity {
 }
 
 impl AvailabilityIdentity {
+    /// The identity whose `430`s a server shares: its backbone when one is
+    /// configured, otherwise its host. Backbone identities carry a prefix
+    /// with `=`, which no hostname contains, so a backbone can never collide
+    /// with a host of the same spelling.
+    pub(crate) fn for_server(server: &Server) -> Self {
+        match server.backbone.as_deref().map(str::trim) {
+            Some(backbone) if !backbone.is_empty() => {
+                Self(format!("backbone={}", backbone.to_ascii_lowercase()))
+            }
+            _ => Self::from(&server.host),
+        }
+    }
+
     /// Persistence preserves the configured hostname identity without DNS
     /// resolution, applying hostname case and trailing-dot canonicalization.
     pub(crate) fn from_persisted_host(host: String) -> Result<Self> {
@@ -166,14 +179,14 @@ impl AvailabilityLayout {
         let mut identities = Vec::new();
 
         for server in servers {
-            let identity = AvailabilityIdentity::from(&server.host);
+            let identity = AvailabilityIdentity::for_server(server);
             if !identities.contains(&identity) {
                 identities.push(identity);
             }
         }
         let mut backend_slots = Vec::with_capacity(servers.len());
         for server in servers {
-            let identity = AvailabilityIdentity::from(&server.host);
+            let identity = AvailabilityIdentity::for_server(server);
             let slot = identities
                 .iter()
                 .position(|existing| existing == &identity)
@@ -211,7 +224,7 @@ impl AvailabilityLayout {
             loaded.unwrap_or_else(|| (Vec::new(), RegistryEpoch::fresh(None)));
         let mut configured: Vec<AvailabilityIdentity> = Vec::with_capacity(servers.len());
         for server in servers {
-            let identity = AvailabilityIdentity::from(&server.host);
+            let identity = AvailabilityIdentity::for_server(server);
             if !configured.contains(&identity) {
                 configured.push(identity);
             }
@@ -256,7 +269,7 @@ impl AvailabilityLayout {
         let mut backend_slots = Vec::with_capacity(servers.len());
         let mut configured_mask = AvailabilityMask::empty();
         for server in servers {
-            let identity = AvailabilityIdentity::from(&server.host);
+            let identity = AvailabilityIdentity::for_server(server);
             let index = identities
                 .iter()
                 .position(|candidate| candidate == &identity)

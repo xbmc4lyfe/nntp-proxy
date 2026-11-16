@@ -321,6 +321,81 @@ mod tests {
     }
 
     #[test]
+    fn servers_on_one_backbone_share_a_slot_across_hosts() {
+        let servers = [
+            Server::builder("news.reseller-a.example", Port::try_new(119).unwrap())
+                .backbone("Omicron")
+                .build()
+                .unwrap(),
+            Server::builder("news.reseller-b.example", Port::try_new(563).unwrap())
+                .backbone(" omicron ")
+                .build()
+                .unwrap(),
+            Server::builder("news.reseller-c.example", Port::try_new(119).unwrap())
+                .backbone("abavia")
+                .build()
+                .unwrap(),
+            Server::builder("news.reseller-a.example", Port::try_new(119).unwrap())
+                .build()
+                .unwrap(),
+        ];
+        let layout = AvailabilityLayout::from_servers(&servers).unwrap();
+        let slot = |index| layout.slot_for_backend(BackendId::from_index(index));
+
+        assert_eq!(slot(0), slot(1), "same backbone, any spelling or host");
+        assert_ne!(slot(0), slot(2), "different backbone");
+        assert_ne!(slot(0), slot(3), "no backbone: keyed by host, not joined");
+        assert_eq!(layout.identity_count(), 3);
+    }
+
+    #[test]
+    fn a_backbone_never_collides_with_a_host_of_the_same_name() {
+        let servers = [
+            Server::builder("omicron", Port::try_new(119).unwrap())
+                .build()
+                .unwrap(),
+            Server::builder("news.example", Port::try_new(119).unwrap())
+                .backbone("omicron")
+                .build()
+                .unwrap(),
+        ];
+        let layout = AvailabilityLayout::from_servers(&servers).unwrap();
+        assert_ne!(
+            layout.slot_for_backend(BackendId::from_index(0)),
+            layout.slot_for_backend(BackendId::from_index(1))
+        );
+    }
+
+    #[test]
+    fn a_430_on_one_backbone_server_skips_its_siblings_but_not_other_backbones() {
+        let servers = [
+            Server::builder("a.example", Port::try_new(119).unwrap())
+                .backbone("omicron")
+                .build()
+                .unwrap(),
+            Server::builder("b.example", Port::try_new(119).unwrap())
+                .backbone("omicron")
+                .build()
+                .unwrap(),
+            Server::builder("c.example", Port::try_new(119).unwrap())
+                .backbone("eweka")
+                .build()
+                .unwrap(),
+        ];
+        let layout = AvailabilityLayout::from_servers(&servers).unwrap();
+        let slot = |index| layout.slot_for_backend(BackendId::from_index(index));
+        let configured = AvailabilityMask::from_slots(&[slot(0), slot(1), slot(2)]);
+        let mut availability = ArticleAvailability::new();
+        availability.record_missing_slot(slot(0));
+
+        assert!(!availability.should_try_slot(slot(1)));
+        assert!(availability.should_try_slot(slot(2)));
+        assert!(!availability.all_exhausted(configured));
+        availability.record_missing_slot(slot(2));
+        assert!(availability.all_exhausted(configured));
+    }
+
+    #[test]
     fn different_hosts_do_not_share_an_availability_slot() {
         let servers = [
             Server::builder("news-a.example", Port::try_new(119).unwrap())
