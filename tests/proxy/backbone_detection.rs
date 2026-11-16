@@ -338,3 +338,43 @@ async fn off_never_probes_or_regroups() -> Result<()> {
     assert!(after.iter().all(|code| code == "220"), "{after:?}");
     Ok(())
 }
+
+#[tokio::test]
+async fn audits_split_servers_whose_numbers_match_but_articles_differ() -> Result<()> {
+    let running = start(
+        &[
+            Mock {
+                name: "reseller-a",
+                tier: 0,
+                backbone: None,
+                store: STORE_A,
+                has_articles: false,
+            },
+            Mock {
+                name: "reseller-b",
+                tier: 1,
+                backbone: None,
+                store: STORE_A,
+                has_articles: true,
+            },
+        ],
+        BackboneDetection::Apply,
+    )
+    .await?;
+    running.check.run().await;
+    let grouped = article_each(running.port, "grouped", 3).await?;
+    assert!(grouped.iter().all(|code| code == "430"), "{grouped:?}");
+
+    // Enough shared-backbone misses for the sampler to keep several.
+    let misses = article_each(running.port, "miss", 200).await?;
+    assert!(misses.iter().all(|code| code == "430"));
+
+    running.check.audit_now().await;
+
+    let after = article_each(running.port, "after", 3).await?;
+    assert!(
+        after.iter().all(|code| code == "220"),
+        "after audits catch the sibling holding the 'missing' articles, it is asked again: {after:?}"
+    );
+    Ok(())
+}

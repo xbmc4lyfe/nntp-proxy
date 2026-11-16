@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Backbone audits: the proxy samples recent `430`s from backbones shared by several servers and every 10 minutes asks the rest of that backbone for those articles. A pair where one keeps having articles the other answered `430` for (at least 3, and at least 2% of checks) stops sharing `430`s, even when their article numbers match or the config names one backbone for both, catching resellers of one backbone with different takedowns. See [Backbones](docs/operator/configuration.md#detection).
+
 - Backbone detection (`[routing] backbone_detection`, default `"annotate"`): about 15 seconds after startup and every 6 hours, the proxy compares each server's `LIST ACTIVE` article numbers and retention on a few busy groups. Servers reading one article store share their `430`s, even with `backbone` unset (now the same as `"auto"`). A configured `backbone` that the numbers contradict is corrected while running, with an INFO line. Servers are regrouped without a restart, and findings are written into the config file as `# backbone-check` comments (`"apply"` only logs; `"off"` disables detection). Known backbones and reseller brands are in `src/backbone/backbones.toml`, used only to name groups. See [Backbones](docs/operator/configuration.md#backbones).
 
 - `connection_cap = "adaptive"` resets after 15 minutes unused: a cap probed above `max_connections` returns to it once no connection has been checked out for that long, and the next busy spell probes again from there. A cap learned during one download held for the rest of the process even when the account's situation had changed.

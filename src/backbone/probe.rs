@@ -101,6 +101,36 @@ pub(crate) async fn fingerprint(
     fingerprint
 }
 
+/// Whether a server has an article: `Some` for a clear answer, `None` when
+/// the lookup was refused or failed, which says nothing about the article.
+pub(crate) async fn has_article(
+    provider: &DeadpoolConnectionProvider,
+    buffer_pool: &BufferPool,
+    backend: BackendId,
+    message_id: &str,
+) -> Option<bool> {
+    for verb in [b"STAT".as_slice(), b"HEAD".as_slice()] {
+        let request = RequestContext::from_verb_args(verb, message_id.as_bytes());
+        match command(provider, buffer_pool, backend, &request)
+            .await
+            .ok()?
+        {
+            Reply::Lines(_) => return Some(true),
+            Reply::Line(line) => {
+                match crate::protocol::StatusCode::parse(line.as_bytes()).map(|code| code.as_u16())
+                {
+                    Some(223 | 221) => return Some(true),
+                    Some(430) => return Some(false),
+                    // Some servers refuse STAT; HEAD answers the same question.
+                    Some(500 | 501) if verb == b"STAT" => {}
+                    _ => return None,
+                }
+            }
+        }
+    }
+    None
+}
+
 enum Reply {
     /// A single-line reply, status included.
     Line(String),

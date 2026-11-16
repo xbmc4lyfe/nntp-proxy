@@ -62,8 +62,13 @@ pub(crate) enum Finding {
     Confirmed,
     /// The configured backbone has nothing to compare against.
     Unchecked,
-    /// The configured backbone contradicts the evidence.
-    Misconfigured { configured: String, against: String },
+    /// The configured backbone contradicts the evidence: `against` is also
+    /// set to it but serves different articles.
+    Misconfigured {
+        configured: String,
+        against: String,
+        why: Contradiction,
+    },
     /// The configured backbone is kept, but the evidence says its store also
     /// goes by `other` here; naming both the same would share their `430`s.
     SameStoreOtherName { other: String },
@@ -73,6 +78,26 @@ pub(crate) enum Finding {
     Alone,
     /// The server gave no article numbers, so it could not be checked.
     NoNumbers { reason: String },
+}
+
+/// What showed two servers with one configured name apart.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Contradiction {
+    /// Their article numbers differ.
+    Numbers,
+    /// Same numbering, but they keep different amounts of history.
+    Retention,
+    /// One had articles the other answered `430` for, in live audits.
+    Articles { rescues: u32, checks: u32 },
+}
+
+/// Audit evidence that `has` holds articles `missing` answered `430` for.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct Rescue {
+    pub(crate) missing: usize,
+    pub(crate) has: usize,
+    pub(crate) rescues: u32,
+    pub(crate) checks: u32,
 }
 
 /// The decision for one server.
@@ -98,6 +123,9 @@ enum Relation {
     Different,
     /// No group in common to compare.
     Unknown,
+    /// Audits caught one with articles the other lacked: whatever the
+    /// numbers say, they do not serve the same articles.
+    Rescued,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -165,7 +193,11 @@ fn has_numbers(server: &ServerInput<'_>) -> bool {
 }
 
 /// Decide every server's assignment from the evidence.
-pub(crate) fn decide(servers: &[ServerInput<'_>], registry: &Registry) -> Vec<Verdict> {
+pub(crate) fn decide(
+    servers: &[ServerInput<'_>],
+    registry: &Registry,
+    rescues: &[Rescue],
+) -> Vec<Verdict> {
     let count = servers.len();
     let mut relations = vec![vec![(Relation::Unknown, PairChecks::default()); count]; count];
     for a in 0..count {
@@ -178,7 +210,15 @@ pub(crate) fn decide(servers: &[ServerInput<'_>], registry: &Registry) -> Vec<Ve
             }
         }
     }
+    for rescue in rescues {
+        if rescue.missing < count && rescue.has < count && rescue.missing != rescue.has {
+            relations[rescue.missing][rescue.has].0 = Relation::Rescued;
+            relations[rescue.has][rescue.missing].0 = Relation::Rescued;
+        }
+    }
     let relation = |a: usize, b: usize| relations[a][b].0;
+    let apart =
+        move |a: usize, b: usize| !matches!(relation(a, b), Relation::Same | Relation::Unknown);
 
     // Group servers whose numbers say they read one store. Every pair in a
     // group must match directly: matching within tolerance is not
@@ -236,12 +276,21 @@ pub(crate) fn decide(servers: &[ServerInput<'_>], registry: &Registry) -> Vec<Ve
                 return None;
             };
             if !has_numbers(&servers[index]) {
-                return None;
+                // It cannot be placed by numbers, so only an audit can
+                // show it apart from another server with its name.
+                return (0..count).find(|&other| {
+                    other != index
+                        && configured_as(other, name)
+                        && relation(index, other) == Relation::Rescued
+                });
             }
             let (_, owner) = owner_of_name.iter().find(|(owned, _)| owned == name)?;
             (groups[index] != *owner).then(|| {
+                // Name the server it actually differs from.
                 members(*owner)
-                    .find(|&m| configured_as(m, name))
+                    .filter(|&m| configured_as(m, name))
+                    .find(|&m| apart(index, m))
+                    .or_else(|| members(*owner).find(|&m| configured_as(m, name)))
                     .unwrap_or(*owner)
             })
         })
@@ -308,7 +357,32 @@ pub(crate) fn decide(servers: &[ServerInput<'_>], registry: &Registry) -> Vec<Ve
                 Configured::Auto => None,
             };
 
-            let (assignment, finding) = if !has_numbers(server) {
+            let why = |other: usize| match relation(index, other) {
+                Relation::Rescued => {
+                    let (rescues, checks) = rescues
+                        .iter()
+                        .filter(|r| {
+                            (r.missing, r.has) == (index, other)
+                                || (r.missing, r.has) == (other, index)
+                        })
+                        .fold((0, 0), |(a, b), r| (a + r.rescues, b + r.checks));
+                    Contradiction::Articles { rescues, checks }
+                }
+                Relation::SameNumberingOtherRetention => Contradiction::Retention,
+                _ => Contradiction::Numbers,
+            };
+            let (assignment, finding) = if let (Some(other), Configured::Named(name), false) =
+                (contradicted[index], &server.configured, has_numbers(server))
+            {
+                (
+                    Assignment::Own,
+                    Finding::Misconfigured {
+                        configured: name.clone(),
+                        against: servers[other].name.to_owned(),
+                        why: why(other),
+                    },
+                )
+            } else if !has_numbers(server) {
                 let reason = server
                     .fingerprint
                     .and_then(|f| f.no_numbers_reason.clone())
@@ -322,6 +396,7 @@ pub(crate) fn decide(servers: &[ServerInput<'_>], registry: &Registry) -> Vec<Ve
                         Finding::Misconfigured {
                             configured: name,
                             against: servers[other].name.to_owned(),
+                            why: why(other),
                         },
                     )
                 } else {
@@ -437,6 +512,7 @@ mod tests {
                 input("three", None, &c),
             ],
             &registry(),
+            &[],
         );
         assert_eq!(verdicts[0].finding, Finding::Confirmed);
         assert_eq!(verdicts[2].assignment, Assignment::Backbone("alpha".into()));
@@ -453,6 +529,7 @@ mod tests {
         let verdicts = decide(
             &[input("one", None, &a), input("two", None, &b)],
             &registry(),
+            &[],
         );
         assert_eq!(verdicts[0].finding, Finding::Alone);
         assert_eq!(verdicts[0].assignment, Assignment::Own);
@@ -469,6 +546,7 @@ mod tests {
                 input("two", Some("alpha"), &b),
             ],
             &registry(),
+            &[],
         );
         // A one-against-one split: the first configured server keeps the
         // name, the other is moved out, so neither shares the other's 430s.
@@ -478,7 +556,8 @@ mod tests {
             verdicts[1].finding,
             Finding::Misconfigured {
                 configured: "alpha".into(),
-                against: "one".into()
+                against: "one".into(),
+                why: Contradiction::Numbers,
             }
         );
     }
@@ -493,6 +572,7 @@ mod tests {
                 input("short", Some("alpha"), &short),
             ],
             &registry(),
+            &[],
         );
         assert_ne!(verdicts[0].assignment, verdicts[1].assignment);
         assert_eq!(verdicts[1].retention_differs, ["full"]);
@@ -509,6 +589,7 @@ mod tests {
                 input("quiet", Some("alpha"), &quiet),
             ],
             &registry(),
+            &[],
         );
         assert_eq!(verdicts[1].assignment, Assignment::Backbone("alpha".into()));
         assert!(matches!(verdicts[1].finding, Finding::NoNumbers { .. }));
@@ -519,7 +600,7 @@ mod tests {
     #[test]
     fn a_server_without_numbers_and_no_config_stays_on_its_own() {
         let quiet = silent("timed out");
-        let verdicts = decide(&[input("quiet", None, &quiet)], &registry());
+        let verdicts = decide(&[input("quiet", None, &quiet)], &registry(), &[]);
         assert_eq!(verdicts[0].assignment, Assignment::Own);
     }
 
@@ -530,6 +611,7 @@ mod tests {
         let verdicts = decide(
             &[input("one", None, &a), input("two", None, &b)],
             &registry(),
+            &[],
         );
         assert_eq!(verdicts[0].assignment, Assignment::SameAs(0));
         assert_eq!(verdicts[1].assignment, Assignment::SameAs(0));
@@ -547,7 +629,7 @@ mod tests {
             host: "news.betanet.example",
             ..input("lone", None, &lone)
         });
-        let verdicts = decide(&inputs, &registry());
+        let verdicts = decide(&inputs, &registry(), &[]);
         assert_eq!(verdicts[1].assignment, Assignment::Backbone("beta".into()));
         assert_eq!(
             verdicts[2].assignment,
@@ -568,13 +650,15 @@ mod tests {
                 input("three", Some("gamma"), &c),
             ],
             &registry(),
+            &[],
         );
         assert_eq!(verdicts[1].assignment, Assignment::Backbone("alpha".into()));
         assert_eq!(
             verdicts[1].finding,
             Finding::Misconfigured {
                 configured: "gamma".into(),
-                against: "three".into()
+                against: "three".into(),
+                why: Contradiction::Numbers,
             }
         );
         assert_eq!(verdicts[2].assignment, Assignment::Backbone("gamma".into()));
@@ -594,6 +678,7 @@ mod tests {
                 input("c", None, &c),
             ],
             &registry(),
+            &[],
         );
         for verdict in &verdicts {
             for peer in &verdict.peers {
@@ -619,6 +704,7 @@ mod tests {
                 input("two", None, &b),
             ],
             &registry(),
+            &[],
         );
         assert_eq!(verdicts[0].assignment, Assignment::Backbone("beta".into()));
         assert_eq!(verdicts[1].assignment, Assignment::SameAs(1));
@@ -635,6 +721,7 @@ mod tests {
                 input("two", Some("beta"), &b),
             ],
             &registry(),
+            &[],
         );
         assert_eq!(verdicts[0].assignment, Assignment::Backbone("alpha".into()));
         assert_eq!(
@@ -648,6 +735,81 @@ mod tests {
                 other: "alpha".into()
             }
         );
+    }
+
+    fn rescue(missing: usize, has: usize) -> Rescue {
+        Rescue {
+            missing,
+            has,
+            rescues: 4,
+            checks: 20,
+        }
+    }
+
+    #[test]
+    fn audited_rescues_split_a_pair_whose_numbers_match() {
+        let a = store(ALPHA, 2, 0, 1);
+        let b = store(ALPHA, 2, 10, 1);
+        let verdicts = decide(
+            &[input("one", None, &a), input("two", None, &b)],
+            &registry(),
+            &[rescue(0, 1)],
+        );
+        assert_eq!(verdicts[0].assignment, Assignment::Own);
+        assert_eq!(verdicts[1].assignment, Assignment::Own);
+    }
+
+    #[test]
+    fn audited_rescues_move_one_server_out_of_a_configured_backbone() {
+        let a = store(ALPHA, 2, 0, 1);
+        let b = store(ALPHA, 2, 10, 1);
+        let c = store(ALPHA, 2, 20, 1);
+        let verdicts = decide(
+            &[
+                input("one", Some("alpha"), &a),
+                input("two", Some("alpha"), &b),
+                input("three", Some("alpha"), &c),
+            ],
+            &registry(),
+            &[rescue(2, 0)],
+        );
+        assert_eq!(verdicts[0].assignment, Assignment::Backbone("alpha".into()));
+        assert_eq!(verdicts[1].assignment, Assignment::Backbone("alpha".into()));
+        assert_eq!(verdicts[2].assignment, Assignment::Own);
+        assert_eq!(
+            verdicts[2].finding,
+            Finding::Misconfigured {
+                configured: "alpha".into(),
+                against: "one".into(),
+                why: Contradiction::Articles {
+                    rescues: 4,
+                    checks: 20
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn audited_rescues_move_a_server_without_numbers_out_of_its_backbone() {
+        let quiet = silent("LIST ACTIVE refused");
+        let a = store(ALPHA, 2, 0, 1);
+        let verdicts = decide(
+            &[
+                input("one", Some("alpha"), &a),
+                input("quiet", Some("alpha"), &quiet),
+            ],
+            &registry(),
+            &[rescue(0, 1)],
+        );
+        assert_eq!(verdicts[0].assignment, Assignment::Backbone("alpha".into()));
+        assert_eq!(verdicts[1].assignment, Assignment::Own);
+        assert!(matches!(
+            verdicts[1].finding,
+            Finding::Misconfigured {
+                why: Contradiction::Articles { .. },
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -664,6 +826,7 @@ mod tests {
                 input("four", None, &d),
             ],
             &registry(),
+            &[],
         );
         assert_eq!(verdicts[0].assignment, Assignment::Backbone("alpha".into()));
         assert_ne!(verdicts[2].assignment, verdicts[0].assignment);

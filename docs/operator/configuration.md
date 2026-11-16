@@ -467,10 +467,23 @@ server's own connection pool:
 
 Matching numbers show one store, not one set of removals: servers of one
 backbone in different regions can act on takedown notices differently, so a
-`430` from one may hide an article another still serves. If a pair the proxy
-groups keeps rescuing each other's misses for you, give them different
-`backbone` names: detection keeps a name you set unless the numbers contradict
-it, and only suggests merging two names that turn out to share a store.
+`430` from one may hide an article another still serves. Live traffic is
+checked for that:
+
+- **Audits.** The proxy keeps a small sample of recent `430`s from backbones
+  shared by several servers (one in 32). Every 10 minutes it asks every
+  server of that backbone whether it has each sampled article (`STAT`, or
+  `HEAD` where `STAT` is refused).
+- **A pair that rescues is split.** Once one server has had at least 3
+  articles its sibling answered `430` for, and they are at least 2% of the
+  checks between them, the two stop sharing `430`s, with an INFO line, even
+  if their numbers match or the config names one backbone for both. The
+  counts halve at every 6-hourly probe, so a pair that stops differing joins
+  up again.
+
+To keep two servers apart regardless, give them different `backbone` names:
+detection keeps a name you set unless the evidence contradicts it, and only
+suggests merging two names that turn out to share a store.
 
 A named backbone is overridden only when the numbers contradict it (another
 server with the same name reads a different store). Such a server is
