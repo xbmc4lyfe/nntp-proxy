@@ -98,6 +98,16 @@ fn inside_strings(lines: &[&str]) -> Vec<bool> {
                     .get(at..at + 3)
                     .is_some_and(|run| run.iter().all(|c| *c == quote))
             };
+            // A multi-line string may end with up to two content quotes
+            // right before its delimiter, so a closing run of three to five
+            // quotes is consumed whole.
+            let run_end = |at: usize, quote: char| {
+                let mut end = at;
+                while end < chars.len() && end - at < 5 && chars[end] == quote {
+                    end += 1;
+                }
+                end
+            };
             let mut at = 0;
             while at < chars.len() {
                 match state {
@@ -106,7 +116,7 @@ fn inside_strings(lines: &[&str]) -> Vec<bool> {
                             at += 2;
                         } else if triple(at, '"') {
                             state = In::Code;
-                            at += 3;
+                            at = run_end(at, '"');
                         } else {
                             at += 1;
                         }
@@ -114,7 +124,7 @@ fn inside_strings(lines: &[&str]) -> Vec<bool> {
                     In::MultiLiteral => {
                         if triple(at, '\'') {
                             state = In::Code;
-                            at += 3;
+                            at = run_end(at, '\'');
                         } else {
                             at += 1;
                         }
@@ -446,9 +456,32 @@ max_connections = 10
         let fake = "[extra]\nmotd = \"\"\"\nx \\\"\"\" y\n[[servers]]\nname = \"beta\"\n\"\"\"\n";
         let config = format!("{fake}{CONFIG}");
         let out = annotate(&config, "beta", "detected omicron", "2026-11-16").unwrap();
-        assert_eq!(&out[..fake.len()], fake, "the string is untouched:\n{out}");
-        assert!(out[fake.len()..].contains("name = \"beta\"\n# backbone-check"));
+        let rest = out
+            .strip_prefix(fake)
+            .unwrap_or_else(|| panic!("the string is untouched:\n{out}"));
+        assert!(rest.contains("name = \"beta\"\n# backbone-check"));
         toml::from_str::<toml::Value>(&out).expect("still parses");
+    }
+
+    #[test]
+    fn a_closing_run_of_four_quotes_ends_the_string_whole() {
+        // A multi-line string closing with a content quote plus the
+        // delimiter, then a second one holding a fake beta block.
+        for quote in ['"', '\''] {
+            let q3 = quote.to_string().repeat(3);
+            let q4 = quote.to_string().repeat(4);
+            let fake = format!(
+                "[extra]\nvalues = [{q3}a{q4}, {q3}\n[[servers]]\nname = \"beta\"\n{q3}]\n"
+            );
+            toml::from_str::<toml::Value>(&fake).expect("the fixture is valid TOML");
+            let config = format!("{fake}{CONFIG}");
+            let out = annotate(&config, "beta", "detected omicron", "2026-11-16").unwrap();
+            let rest = out
+                .strip_prefix(fake.as_str())
+                .unwrap_or_else(|| panic!("the string is untouched:\n{out}"));
+            assert!(rest.contains("name = \"beta\"\n# backbone-check"));
+            toml::from_str::<toml::Value>(&out).expect("still parses");
+        }
     }
 
     #[test]
