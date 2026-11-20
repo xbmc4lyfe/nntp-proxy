@@ -43,6 +43,10 @@ pub struct Detector {
     pub(crate) registry: &'static Registry,
     pub(crate) sampler: Arc<MissSampler>,
     pub(crate) state: tokio::sync::Mutex<Evidence>,
+    /// The round of the last notes written to the config file. Notes are
+    /// written after the state lock is released, so this keeps two rounds
+    /// from writing at once and an older round from overwriting a newer one.
+    pub(crate) written: Arc<std::sync::Mutex<u64>>,
 }
 
 /// What the checks have learned so far.
@@ -52,6 +56,8 @@ pub(crate) struct Evidence {
     fingerprints: Vec<Option<Fingerprint>>,
     /// Per ordered pair (missing, checked): rescues and checks from audits.
     audits: BTreeMap<(usize, usize), (u32, u32)>,
+    /// Counts the rounds that produced notes, in the order they decided.
+    round: u64,
 }
 
 impl Evidence {
@@ -158,7 +164,11 @@ impl Detector {
                 *counts = (counts.0 / 2, counts.1 / 2);
             }
         }
-        self.apply(&state, first);
+        let notes = self.apply(&state, first);
+        state.round += 1;
+        let round = state.round;
+        drop(state);
+        self.write_notes(round, notes).await;
     }
 
     /// Ask every server sharing a sampled miss's backbone whether it has the
@@ -223,12 +233,17 @@ impl Detector {
                     "Backbone audit: a server had articles its backbone sibling answered 430 for; they no longer share 430s"
                 );
             }
-            self.apply(&state, false);
+            let notes = self.apply(&state, false);
+            state.round += 1;
+            let round = state.round;
+            drop(state);
+            self.write_notes(round, notes).await;
         }
     }
 
-    /// Decide from the evidence and regroup, log and annotate.
-    fn apply(&self, state: &Evidence, first: bool) {
+    /// Decide from the evidence, regroup and log; returns the notes for the
+    /// config file, which the caller writes after releasing the lock.
+    fn apply(&self, state: &Evidence, first: bool) -> Vec<(String, String)> {
         let rescues = state.rescues();
         let inputs: Vec<ServerInput<'_>> = self
             .servers
@@ -271,11 +286,29 @@ impl Detector {
             notes.push((server.name.as_str().to_owned(), note));
         }
 
-        if self.mode == BackboneDetection::Annotate
-            && let Some(path) = &self.config_path
-        {
-            self.annotate(path, &notes);
+        notes
+    }
+
+    /// Write notes into the config file on a blocking thread, so slow disk
+    /// I/O never stalls a runtime worker.
+    async fn write_notes(&self, round: u64, notes: Vec<(String, String)>) {
+        if self.mode != BackboneDetection::Annotate {
+            return;
         }
+        let Some(path) = self.config_path.clone() else {
+            return;
+        };
+        let written = Arc::clone(&self.written);
+        let _ = tokio::task::spawn_blocking(move || {
+            let mut last = written
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if round > *last {
+                *last = round;
+                annotate_file(&path, &notes);
+            }
+        })
+        .await;
     }
 
     fn identity(&self, index: usize, assignment: &Assignment) -> AvailabilityIdentity {
@@ -285,72 +318,71 @@ impl Detector {
             Assignment::Own => AvailabilityIdentity::from(&self.servers[index].host),
         }
     }
+}
 
-    fn annotate(&self, path: &std::path::Path, notes: &[(String, String)]) {
-        static UNWRITABLE_REPORTED: AtomicBool = AtomicBool::new(false);
-        let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
-        let text = match std::fs::read_to_string(path) {
-            Ok(text) => text,
-            Err(error) => {
-                warn!(path = %path.display(), %error, "Backbone check could not read the config file to annotate it");
-                return;
-            }
-        };
-        let mut updated = text.clone();
-        for (server, note) in notes {
-            if let Some(next) = super::annotate::annotate(&updated, server, note, &date) {
-                updated = next;
-            }
-        }
-        if updated == text {
+fn annotate_file(path: &std::path::Path, notes: &[(String, String)]) {
+    static UNWRITABLE_REPORTED: AtomicBool = AtomicBool::new(false);
+    let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) => {
+            warn!(path = %path.display(), %error, "Backbone check could not read the config file to annotate it");
             return;
         }
-        // Skip this round if the operator saved the file while we worked;
-        // the next check annotates their version.
-        if std::fs::read_to_string(path).ok().as_deref() != Some(text.as_str()) {
-            return;
+    };
+    let mut updated = text.clone();
+    for (server, note) in notes {
+        if let Some(next) = super::annotate::annotate(&updated, server, note, &date) {
+            updated = next;
         }
-        // A copy of the file as it was before the first note, kept once.
-        // A copy of the file as it was before the first note, kept once,
-        // named after the whole file name so `a.conf` and `a.toml` differ.
-        let backup = {
-            let mut name = path.as_os_str().to_owned();
-            name.push(".before-backbone-check");
-            PathBuf::from(name)
-        };
-        if !backup.exists() {
-            let _ = std::fs::copy(path, &backup);
+    }
+    if updated == text {
+        return;
+    }
+    // Skip this round if the operator saved the file while we worked;
+    // the next check annotates their version.
+    if std::fs::read_to_string(path).ok().as_deref() != Some(text.as_str()) {
+        return;
+    }
+    // A copy of the file as it was before the first note, kept once,
+    // named after the whole file name so `a.conf` and `a.toml` differ.
+    let backup = {
+        let mut name = path.as_os_str().to_owned();
+        name.push(".before-backbone-check");
+        PathBuf::from(name)
+    };
+    if !backup.exists() {
+        let _ = std::fs::copy(path, &backup);
+    }
+    // Written in place, not renamed over: a config bind-mounted into a
+    // container is a single file whose inode must stay.
+    if let Err(error) = std::fs::write(path, &updated) {
+        // A refused write (read-only file) leaves the original; a
+        // partial one is put back.
+        let intact = std::fs::read_to_string(path).ok().as_deref() == Some(text.as_str())
+            || std::fs::write(path, &text).is_ok();
+        if !intact {
+            warn!(path = %path.display(), backup = %backup.display(), %error, "Backbone check could not write the config file or put the original back; restore it from the backup");
+        } else if !UNWRITABLE_REPORTED.swap(true, Ordering::Relaxed) {
+            info!(
+                path = %path.display(),
+                %error,
+                "Backbone check cannot write to the config file; the findings above are in the log instead. Set routing.backbone_detection = \"apply\" to stop trying"
+            );
         }
-        // Written in place, not renamed over: a config bind-mounted into a
-        // container is a single file whose inode must stay.
-        if let Err(error) = std::fs::write(path, &updated) {
-            // A refused write (read-only file) leaves the original; a
-            // partial one is put back.
-            let intact = std::fs::read_to_string(path).ok().as_deref() == Some(text.as_str())
-                || std::fs::write(path, &text).is_ok();
-            if !intact {
-                warn!(path = %path.display(), backup = %backup.display(), %error, "Backbone check could not write the config file or put the original back; restore it from the backup");
-            } else if !UNWRITABLE_REPORTED.swap(true, Ordering::Relaxed) {
-                info!(
-                    path = %path.display(),
-                    %error,
-                    "Backbone check cannot write to the config file; the findings above are in the log instead. Set routing.backbone_detection = \"apply\" to stop trying"
-                );
-            }
-            return;
+        return;
+    }
+    // Read back: a short write is undone with the original, but text
+    // that is neither ours nor the original is an operator's save that
+    // landed meanwhile, and is left alone.
+    match std::fs::read_to_string(path) {
+        Ok(now) if now == updated => {
+            info!(path = %path.display(), "Backbone check wrote its findings into the config file as comments");
         }
-        // Read back: a short write is undone with the original, but text
-        // that is neither ours nor the original is an operator's save that
-        // landed meanwhile, and is left alone.
-        match std::fs::read_to_string(path) {
-            Ok(now) if now == updated => {
-                info!(path = %path.display(), "Backbone check wrote its findings into the config file as comments");
-            }
-            Ok(now) if now != text && updated.strip_prefix(now.as_str()).is_none() => {}
-            _ => {
-                if std::fs::write(path, &text).is_err() {
-                    warn!(path = %path.display(), backup = %backup.display(), "Backbone check could not verify its write to the config file or put the original back; restore it from the backup");
-                }
+        Ok(now) if now != text && updated.strip_prefix(now.as_str()).is_none() => {}
+        _ => {
+            if std::fs::write(path, &text).is_err() {
+                warn!(path = %path.display(), backup = %backup.display(), "Backbone check could not verify its write to the config file or put the original back; restore it from the backup");
             }
         }
     }

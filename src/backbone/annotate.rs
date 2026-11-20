@@ -77,37 +77,85 @@ fn is_note(line: &str) -> bool {
 }
 
 /// For each line, whether it begins inside a multi-line string, where
-/// nothing is a header, key or note.
+/// nothing is a header, key or note. Tracks TOML's four string kinds
+/// (with escapes in the basic ones) and comments, so a `"""` inside a
+/// one-line string or after a backslash does not open or close one.
 fn inside_strings(lines: &[&str]) -> Vec<bool> {
-    let mut open: Option<&str> = None;
+    #[derive(Clone, Copy, PartialEq)]
+    enum In {
+        Code,
+        MultiBasic,
+        MultiLiteral,
+    }
+    let mut state = In::Code;
     lines
         .iter()
         .map(|line| {
-            let starts_inside = open.is_some();
-            let mut rest = *line;
-            loop {
-                match open {
-                    Some(delimiter) => match rest.find(delimiter) {
-                        Some(at) => {
-                            rest = &rest[at + delimiter.len()..];
-                            open = None;
-                        }
-                        None => break,
-                    },
-                    None => {
-                        let code = rest.split('#').next().unwrap_or("");
-                        let next = ["\"\"\"", "'''"]
-                            .into_iter()
-                            .filter_map(|d| code.find(d).map(|at| (at, d)))
-                            .min();
-                        match next {
-                            Some((at, delimiter)) => {
-                                rest = &rest[at + delimiter.len()..];
-                                open = Some(delimiter);
-                            }
-                            None => break,
+            let starts_inside = state != In::Code;
+            let chars: Vec<char> = line.chars().collect();
+            let triple = |at: usize, quote: char| {
+                chars
+                    .get(at..at + 3)
+                    .is_some_and(|run| run.iter().all(|c| *c == quote))
+            };
+            // A multi-line string may end with up to two content quotes
+            // right before its delimiter, so a closing run of three to five
+            // quotes is consumed whole.
+            let run_end = |at: usize, quote: char| {
+                let mut end = at;
+                while end < chars.len() && end - at < 5 && chars[end] == quote {
+                    end += 1;
+                }
+                end
+            };
+            let mut at = 0;
+            while at < chars.len() {
+                match state {
+                    In::MultiBasic => {
+                        if chars[at] == '\\' {
+                            at += 2;
+                        } else if triple(at, '"') {
+                            state = In::Code;
+                            at = run_end(at, '"');
+                        } else {
+                            at += 1;
                         }
                     }
+                    In::MultiLiteral => {
+                        if triple(at, '\'') {
+                            state = In::Code;
+                            at = run_end(at, '\'');
+                        } else {
+                            at += 1;
+                        }
+                    }
+                    In::Code => match chars[at] {
+                        '#' => break,
+                        '"' if triple(at, '"') => {
+                            state = In::MultiBasic;
+                            at += 3;
+                        }
+                        '\'' if triple(at, '\'') => {
+                            state = In::MultiLiteral;
+                            at += 3;
+                        }
+                        '"' => {
+                            // A one-line basic string: skip to its closing quote.
+                            at += 1;
+                            while at < chars.len() && chars[at] != '"' {
+                                at += if chars[at] == '\\' { 2 } else { 1 };
+                            }
+                            at += 1;
+                        }
+                        '\'' => {
+                            at += 1;
+                            while at < chars.len() && chars[at] != '\'' {
+                                at += 1;
+                            }
+                            at += 1;
+                        }
+                        _ => at += 1,
+                    },
                 }
             }
             starts_inside
@@ -393,6 +441,47 @@ max_connections = 10
         .unwrap();
         assert!(!out.chars().any(|c| c.is_control() && c != '\n'));
         toml::from_str::<toml::Value>(&out).expect("the annotated file still parses");
+    }
+
+    #[test]
+    fn triple_quotes_inside_a_one_line_string_open_nothing() {
+        let config = format!("[proxy]\nnote = 'a\"\"\"b'\n{CONFIG}");
+        let out = annotate(&config, "beta", "detected omicron", "2026-11-16").unwrap();
+        assert!(out.contains("name = \"beta\"\n# backbone-check"));
+    }
+
+    #[test]
+    fn an_escaped_quote_does_not_close_a_multi_line_string() {
+        // A string holding `\"""` and a fake beta block, before the real file.
+        let fake = "[extra]\nmotd = \"\"\"\nx \\\"\"\" y\n[[servers]]\nname = \"beta\"\n\"\"\"\n";
+        let config = format!("{fake}{CONFIG}");
+        let out = annotate(&config, "beta", "detected omicron", "2026-11-16").unwrap();
+        let rest = out
+            .strip_prefix(fake)
+            .unwrap_or_else(|| panic!("the string is untouched:\n{out}"));
+        assert!(rest.contains("name = \"beta\"\n# backbone-check"));
+        toml::from_str::<toml::Value>(&out).expect("still parses");
+    }
+
+    #[test]
+    fn a_closing_run_of_four_quotes_ends_the_string_whole() {
+        // A multi-line string closing with a content quote plus the
+        // delimiter, then a second one holding a fake beta block.
+        for quote in ['"', '\''] {
+            let q3 = quote.to_string().repeat(3);
+            let q4 = quote.to_string().repeat(4);
+            let fake = format!(
+                "[extra]\nvalues = [{q3}a{q4}, {q3}\n[[servers]]\nname = \"beta\"\n{q3}]\n"
+            );
+            toml::from_str::<toml::Value>(&fake).expect("the fixture is valid TOML");
+            let config = format!("{fake}{CONFIG}");
+            let out = annotate(&config, "beta", "detected omicron", "2026-11-16").unwrap();
+            let rest = out
+                .strip_prefix(fake.as_str())
+                .unwrap_or_else(|| panic!("the string is untouched:\n{out}"));
+            assert!(rest.contains("name = \"beta\"\n# backbone-check"));
+            toml::from_str::<toml::Value>(&out).expect("still parses");
+        }
     }
 
     #[test]

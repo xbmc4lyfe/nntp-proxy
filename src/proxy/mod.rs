@@ -84,6 +84,7 @@ impl NntpProxy {
             registry: crate::backbone::Registry::builtin(),
             sampler: self.availability_layout.miss_sampler(),
             state: tokio::sync::Mutex::default(),
+            written: Arc::default(),
         }
     }
 }
