@@ -898,7 +898,9 @@ fn report_periodic_save<T>(
                     event = file.failed_event(),
                     path = %path.display(),
                     count,
-                    error = %error,
+                    // `{:#}` keeps the cause (e.g. "No space left on
+                    // device"); plain Display shows only the outer context.
+                    error = %format_args!("{error:#}"),
                     "Failed to save persisted state"
                 );
             }
@@ -916,7 +918,7 @@ fn report_shutdown_save_failure(
         event = file.failed_event(),
         path = %path.display(),
         count = 1_u64,
-        error = %error,
+        error = %format_args!("{error:#}"),
         "Failed to save persisted state on shutdown"
     );
     remember_first_persistence_error(first_error, error);
@@ -1411,7 +1413,10 @@ mod tests {
         let (output, guard) = crate::logging::test_support::capture_json();
         let gate = crate::logging::EventGate::default();
         let path = std::path::Path::new("stats.json");
-        let fail = || Ok(Err(anyhow::anyhow!("No space left on device")));
+        let fail = || {
+            Ok(Err(anyhow::anyhow!("No space left on device")
+                .context("Failed to write stats to stats.json.1.tmp")))
+        };
 
         // Saves run every 30 s: one line at the first failure, one a minute later.
         for _ in 0..4 {
@@ -1428,6 +1433,11 @@ mod tests {
         assert_eq!(failures[0]["count"], 1);
         assert_eq!(failures[0]["path"], "stats.json");
         assert_eq!(failures[0]["message"], "Failed to save persisted state");
+        assert_eq!(
+            failures[0]["error"],
+            "Failed to write stats to stats.json.1.tmp: No space left on device",
+            "the cause is logged, not just the outer context"
+        );
         // Failures at 30 s and 60 s; the 60 s one opens the next window.
         assert_eq!(failures[1]["count"], 2);
 
