@@ -522,6 +522,125 @@ async fn query_all_backends_racing(
     RacingQueryOutcome::Missing(learned)
 }
 
+/// A `STAT` precheck: every tier answers the same presence question, so a
+/// tier waiting for its slowest backend before the next one starts only adds
+/// latency to every `430`. A tier starts as soon as the tier above returns its
+/// first `430` (a hit before that keeps lower tiers idle), and the request is
+/// missing as soon as every availability slot has a `430` from one of its
+/// servers. A slow sibling on an answered slot is not waited on, and lower
+/// tiers are still only asked once a higher tier has said `430`.
+async fn query_stat_staggered(
+    deps: &OwnedDeps,
+    request: &RequestContext,
+    msg_id: &MessageId<'_>,
+    initial_availability: &ArticleAvailability,
+) -> RacingQueryOutcome {
+    let tiers: Vec<u8> = deps.router.tiers().collect();
+    let mut learned = *initial_availability;
+    let mut pending = FuturesUnordered::new();
+    let mut next_tier = 0;
+
+    let launch_next_tier =
+        |next_tier: &mut usize,
+         learned: &ArticleAvailability,
+         pending: &mut FuturesUnordered<tokio::task::JoinHandle<(usize, QueryResult)>>| {
+            // An empty tier (every slot already missing) passes its turn on.
+            while let Some(&tier) = tiers.get(*next_tier) {
+                let tier_index = *next_tier;
+                *next_tier += 1;
+                let before = pending.len();
+                for backend in eligible_backends_in_tier(deps, tier, learned) {
+                    let deps = deps.clone();
+                    let request = request.clone_for_background_probe();
+                    pending.push(tokio::spawn(async move {
+                        (tier_index, query_backend(&deps, backend, &request).await)
+                    }));
+                }
+                if pending.len() > before {
+                    break;
+                }
+            }
+        };
+
+    launch_next_tier(&mut next_tier, &learned, &mut pending);
+
+    while let Some(result) = pending.next().await {
+        let Ok((tier_index, result)) = result else {
+            continue;
+        };
+        let answered_430 = match result {
+            QueryResult::Found(id, response) => {
+                drain_stat_queries(deps, msg_id, pending);
+                return RacingQueryOutcome::Hit(id, response, learned);
+            }
+            QueryResult::Missing(backend) => {
+                deps.cache
+                    .record_availability_missing(msg_id.to_owned(), backend.availability_slot())
+                    .await;
+                learned.record_missing_slot(backend.availability_slot());
+                if all_slots_missing(deps, &tiers, &learned) {
+                    drain_stat_queries(deps, msg_id, pending);
+                    return RacingQueryOutcome::Missing(learned);
+                }
+                true
+            }
+            QueryResult::Error => false,
+        };
+        // The newest tier hands on at its first `430`, or once a higher
+        // tier's `430`s cover every slot it holds: a backend there that can
+        // only error (a provider refusing STAT) must not keep lower tiers
+        // from being asked.
+        let newest_tier_answered = answered_430 && tier_index + 1 == next_tier;
+        let newest_tier_covered = eligible_backends_in_tier(deps, tiers[next_tier - 1], &learned)
+            .next()
+            .is_none();
+        if newest_tier_answered || newest_tier_covered {
+            launch_next_tier(&mut next_tier, &learned, &mut pending);
+        }
+    }
+
+    if all_slots_missing(deps, &tiers, &learned) {
+        RacingQueryOutcome::Missing(learned)
+    } else {
+        RacingQueryOutcome::Inconclusive(learned)
+    }
+}
+
+fn all_slots_missing(deps: &OwnedDeps, tiers: &[u8], learned: &ArticleAvailability) -> bool {
+    tiers.iter().all(|&tier| {
+        eligible_backends_in_tier(deps, tier, learned)
+            .next()
+            .is_none()
+    })
+}
+
+/// Let queries the answer no longer needs finish in the background, so their
+/// connections go back to the pool and their `430`s are still recorded.
+fn drain_stat_queries(
+    deps: &OwnedDeps,
+    msg_id: &MessageId<'_>,
+    mut pending: FuturesUnordered<tokio::task::JoinHandle<(usize, QueryResult)>>,
+) {
+    if pending.is_empty() {
+        return;
+    }
+    let cache = deps.cache.clone();
+    let msg_id = msg_id.to_owned();
+    tokio::spawn(async move {
+        while let Some(result) = pending.next().await {
+            let Ok((_, result)) = result else {
+                continue;
+            };
+            let Some((backend, hit)) = record_precheck_result(&cache, msg_id.clone(), result).await
+            else {
+                continue;
+            };
+            let tier = crate::cache::ttl::CacheTier::new(0);
+            cache_precheck_hit(&cache, msg_id.clone(), backend, hit, tier).await;
+        }
+    });
+}
+
 async fn query_tier_backends(
     deps: &OwnedDeps,
     request: &RequestContext,
@@ -630,7 +749,11 @@ pub(crate) async fn precheck(
     }
 
     let owned = deps.clone_deps();
-    let outcome = query_all_backends_racing(&owned, request, msg_id, availability).await;
+    let outcome = if request.is_stat() {
+        query_stat_staggered(&owned, request, msg_id, availability).await
+    } else {
+        query_all_backends_racing(&owned, request, msg_id, availability).await
+    };
 
     // Cache the found result and return it
     match outcome {
@@ -1660,6 +1783,195 @@ mod tests {
         assert!(
             cache.get(&msg_id).await.is_none(),
             "availability-only index should persist negatives, not optimistic positive hits"
+        );
+    }
+
+    /// Backend that answers every `STAT` with `reply` after `delay`. Returns
+    /// its address and the number of connections accepted.
+    async fn spawn_delayed_stat_server(
+        reply: &'static [u8],
+        delay: Duration,
+    ) -> (std::net::SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let accept_count = Arc::clone(&accepts);
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                accept_count.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut reader = BufReader::new(stream);
+                    if reader.get_mut().write_all(b"200 mock\r\n").await.is_err() {
+                        return;
+                    }
+                    let mut command = Vec::new();
+                    loop {
+                        command.clear();
+                        match reader.read_until(b'\n', &mut command).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(_) => {}
+                        }
+                        let response = match crate::protocol::RequestContext::parse(&command)
+                            .map(|request| request.kind())
+                        {
+                            Some(crate::protocol::RequestKind::Stat) => {
+                                tokio::time::sleep(delay).await;
+                                reply
+                            }
+                            _ => b"200 mock setup complete\r\n".as_slice(),
+                        };
+                        if reader.get_mut().write_all(response).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (addr, accepts)
+    }
+
+    /// Precheck deps over backends given as (address, tier, availability slot).
+    fn staggered_deps(backends: &[(std::net::SocketAddr, u8, usize)]) -> OwnedDeps {
+        use crate::pool::DeadpoolConnectionProvider;
+        use crate::types::ServerName;
+
+        let mut selector = BackendSelector::new();
+        for (index, (addr, tier, slot)) in backends.iter().enumerate() {
+            let provider = DeadpoolConnectionProvider::new(
+                "127.0.0.1".to_string(),
+                addr.port(),
+                format!("test-{index}"),
+                1,
+                None,
+                None,
+            );
+            selector.add_backend_with_slot(
+                ServerName::try_new(format!("server-{index}")).unwrap(),
+                provider,
+                *tier,
+                crate::cache::AvailabilitySlot::new(*slot).unwrap(),
+            );
+        }
+        OwnedDeps {
+            router: Arc::new(selector),
+            cache: Arc::new(UnifiedCache::memory(100, Duration::from_secs(60))),
+            buffer_pool: BufferPool::new(BufferSize::try_new(4096).unwrap(), 8),
+            metrics: MetricsCollector::new(backends.len()),
+        }
+    }
+
+    async fn run_stat_staggered(deps: &OwnedDeps) -> (RacingQueryOutcome, Duration) {
+        let request =
+            RequestContext::parse(b"STAT <staggered@example.com>\r\n").expect("valid request line");
+        let msg_id = MessageId::from_borrowed("<staggered@example.com>").unwrap();
+        let start = tokio::time::Instant::now();
+        let outcome =
+            query_stat_staggered(deps, &request, &msg_id, &ArticleAvailability::new()).await;
+        (outcome, start.elapsed())
+    }
+
+    const MISSING: &[u8] = b"430 No such article\r\n";
+    const PRESENT: &[u8] = b"223 0 <staggered@example.com>\r\n";
+
+    /// A lower tier starts at the first `430` above it, so a missing article
+    /// costs the slowest backend's time, not the sum of each tier's slowest.
+    #[tokio::test]
+    async fn stat_lower_tier_starts_at_the_first_430_above_it() {
+        let (slow, _) = spawn_delayed_stat_server(MISSING, Duration::from_millis(600)).await;
+        let (fast, _) = spawn_delayed_stat_server(MISSING, Duration::from_millis(50)).await;
+        let (lower, _) = spawn_delayed_stat_server(MISSING, Duration::from_millis(300)).await;
+        let deps = staggered_deps(&[(slow, 0, 0), (fast, 0, 1), (lower, 1, 2)]);
+
+        let (outcome, elapsed) = run_stat_staggered(&deps).await;
+
+        let RacingQueryOutcome::Missing(availability) = outcome else {
+            panic!("every backend said 430: {outcome:?}");
+        };
+        assert_eq!(availability.missing_bits(), 0b111);
+        assert!(
+            elapsed < Duration::from_millis(850),
+            "tier 1 ran alongside tier 0's slow backend: {elapsed:?}"
+        );
+    }
+
+    /// A hit before any `430` answers the STAT without asking lower tiers.
+    #[tokio::test]
+    async fn stat_hit_before_any_430_leaves_lower_tiers_idle() {
+        let (primary, _) = spawn_delayed_stat_server(PRESENT, Duration::from_millis(50)).await;
+        let (lower, lower_accepts) =
+            spawn_delayed_stat_server(MISSING, Duration::from_millis(10)).await;
+        let deps = staggered_deps(&[(primary, 0, 0), (lower, 1, 1)]);
+
+        let (outcome, _) = run_stat_staggered(&deps).await;
+
+        assert!(
+            matches!(outcome, RacingQueryOutcome::Hit(id, _, _) if id == BackendId::from_index(0))
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            lower_accepts.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a lower tier is only asked after a 430"
+        );
+    }
+
+    /// A `430` from one server on a slot answers for the slot, so a silent
+    /// sibling on the same backbone is not waited on.
+    #[tokio::test]
+    async fn stat_missing_does_not_wait_for_a_sibling_on_an_answered_slot() {
+        let (answers, _) = spawn_delayed_stat_server(MISSING, Duration::from_millis(50)).await;
+        let (silent, _) = spawn_silent_stat_server().await;
+        let deps = staggered_deps(&[(answers, 0, 0), (silent, 0, 0)]);
+
+        let (outcome, elapsed) = run_stat_staggered(&deps).await;
+
+        assert!(matches!(outcome, RacingQueryOutcome::Missing(a) if a.missing_bits() == 0b1));
+        assert!(
+            elapsed < Duration::from_millis(1000),
+            "waited on the silent sibling: {elapsed:?}"
+        );
+    }
+
+    /// A tier whose only backend errors, on a slot a higher tier has since
+    /// answered `430` for, must still hand on to the tier below it.
+    #[tokio::test]
+    async fn stat_tier_covered_by_higher_430s_hands_on_despite_errors() {
+        let (first, _) = spawn_delayed_stat_server(MISSING, Duration::from_millis(10)).await;
+        let (late, _) = spawn_delayed_stat_server(MISSING, Duration::from_millis(300)).await;
+        let (refuses, _) =
+            spawn_delayed_stat_server(b"500 STAT not supported\r\n", Duration::from_millis(10))
+                .await;
+        let (lowest, lowest_accepts) =
+            spawn_delayed_stat_server(MISSING, Duration::from_millis(10)).await;
+        let deps = staggered_deps(&[(first, 0, 0), (late, 0, 1), (refuses, 1, 1), (lowest, 2, 2)]);
+
+        let (outcome, _) = run_stat_staggered(&deps).await;
+
+        assert!(
+            matches!(outcome, RacingQueryOutcome::Missing(a) if a.missing_bits() == 0b111),
+            "{outcome:?}"
+        );
+        assert_eq!(lowest_accepts.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// A tier that cannot say `430` for its slot leaves the answer open.
+    #[tokio::test]
+    async fn stat_unanswered_slot_is_inconclusive() {
+        let (missing, _) = spawn_delayed_stat_server(MISSING, Duration::from_millis(10)).await;
+        let (refuses, _) =
+            spawn_delayed_stat_server(b"500 STAT not supported\r\n", Duration::from_millis(10))
+                .await;
+        let deps = staggered_deps(&[(missing, 0, 0), (refuses, 0, 1)]);
+
+        let (outcome, _) = run_stat_staggered(&deps).await;
+
+        assert!(
+            matches!(outcome, RacingQueryOutcome::Inconclusive(a) if a.missing_bits() == 0b1),
+            "{outcome:?}"
         );
     }
 }
