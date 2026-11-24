@@ -150,6 +150,23 @@ impl std::fmt::Display for BackendSelectionStrategy {
     }
 }
 
+/// Whether each backend keeps a few connections downloads may not hold, so
+/// STAT probes never queue behind a full-speed download.
+///
+/// `auto` sizes it per backend like RustyGet's light pool: none at three
+/// connections or fewer, one up to eight, two above, shrinking to one (none
+/// on a small backend) while downloads wait and the reserve goes unused.
+/// See `pool::stat_reserve`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum StatReserve {
+    /// Downloads may hold every connection.
+    #[default]
+    Off,
+    /// Keep a reserve sized per backend.
+    Auto,
+}
+
 /// When ARTICLE/BODY requests dispatch background STAT probes to lower tiers.
 ///
 /// The probes record lower-tier `430`s before the primary tier answers, so a
@@ -385,6 +402,9 @@ pub struct Routing {
     /// Background lower-tier STAT probes for ARTICLE/BODY requests.
     #[serde(default)]
     pub lower_tier_stat_prefetch: LowerTierStatPrefetch,
+    /// Connections each backend keeps for STAT probes.
+    #[serde(default)]
+    pub stat_reserve: StatReserve,
     /// Queue behavior for routing decisions.
     #[serde(default)]
     pub queue: RoutingQueue,
@@ -411,6 +431,7 @@ impl Default for Routing {
             backend_selection: BackendSelectionStrategy::default(),
             adaptive_precheck: defaults::adaptive_precheck(),
             lower_tier_stat_prefetch: LowerTierStatPrefetch::default(),
+            stat_reserve: StatReserve::default(),
             queue: RoutingQueue::default(),
             reader_message_id_failover: false,
             article: RoutingArticle::default(),
@@ -1992,6 +2013,14 @@ mod tests {
         "#;
         let disk_cache: DiskCache = toml::from_str(toml).unwrap();
         assert_eq!(disk_cache.compression, CompressionCodec::None);
+    }
+
+    #[test]
+    fn test_routing_stat_reserve_defaults_off_and_accepts_auto() {
+        assert_eq!(Routing::default().stat_reserve, StatReserve::Off);
+        let routing: Routing = toml::from_str("stat_reserve = \"auto\"").unwrap();
+        assert_eq!(routing.stat_reserve, StatReserve::Auto);
+        assert!(toml::from_str::<Routing>("stat_reserve = \"always\"").is_err());
     }
 
     #[test]

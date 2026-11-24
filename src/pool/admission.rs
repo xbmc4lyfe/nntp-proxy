@@ -183,6 +183,7 @@ pub struct CheckoutBudget {
     wait: Duration,
     backlog: BacklogPolicy,
     bound: WaitBound,
+    work: super::stat_reserve::Work,
 }
 
 impl CheckoutBudget {
@@ -192,7 +193,33 @@ impl CheckoutBudget {
             wait,
             backlog,
             bound: WaitBound::Attempt,
+            work: super::stat_reserve::Work::Download,
         }
+    }
+
+    /// Mark this checkout as a latency-bound check that may use the
+    /// backend's STAT reserve.
+    #[must_use]
+    pub const fn light(self) -> Self {
+        Self {
+            work: super::stat_reserve::Work::Light,
+            ..self
+        }
+    }
+
+    /// Take `spent` (time already waited for a STAT reserve permit) off the
+    /// wait, keeping what bounds it.
+    #[must_use]
+    pub(crate) fn less(self, spent: Duration) -> Self {
+        Self {
+            wait: self.wait.saturating_sub(spent),
+            ..self
+        }
+    }
+
+    #[must_use]
+    pub const fn work(self) -> super::stat_reserve::Work {
+        self.work
     }
 
     /// Shorten the wait to `remaining` when that is less than the current wait.
@@ -968,10 +995,13 @@ impl ArticleBudget {
     /// Budget for a `STAT` probe that runs inside this request.
     #[must_use]
     pub fn probe(&self) -> CheckoutBudget {
-        self.bounded(CheckoutBudget::new(
-            crate::constants::pool::STAT_PROBE_CHECKOUT_WAIT,
-            self.backlog,
-        ))
+        self.bounded(
+            CheckoutBudget::new(
+                crate::constants::pool::STAT_PROBE_CHECKOUT_WAIT,
+                self.backlog,
+            )
+            .light(),
+        )
     }
 
     fn bounded(&self, budget: CheckoutBudget) -> CheckoutBudget {
