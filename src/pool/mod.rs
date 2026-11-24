@@ -23,6 +23,7 @@ pub(crate) mod login_backoff;
 pub mod prewarming;
 pub mod provider;
 pub(crate) mod slot_gate;
+pub mod stat_reserve;
 
 pub(crate) use buffer::AppendOutcome;
 pub use buffer::{

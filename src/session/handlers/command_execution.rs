@@ -575,6 +575,13 @@ impl ClientSession {
                 (*state.unavailable_backends, state.budget.checkout())
             }
         };
+        // A routed STAT is the same latency-bound check as its precheck, so it
+        // may use the STAT reserve instead of queueing behind downloads.
+        let checkout = if request.is_stat() {
+            checkout.light()
+        } else {
+            checkout
+        };
         let lookup = if crate::command::CommandHandler::article_lookup_request(request).is_some() {
             crate::router::RouteLookup::Article
         } else {

@@ -68,6 +68,9 @@ pub struct DeadpoolConnectionProvider {
     is_shutting_down: Arc<std::sync::atomic::AtomicBool>,
     /// Service-time estimate and busy counters shared by every clone.
     load: Arc<super::admission::BackendLoad>,
+    /// Connections downloads may not hold, kept for STAT probes; off unless
+    /// the proxy enables it.
+    stat_reserve: Arc<super::stat_reserve::StatReserve>,
     /// Summarises cooldown removals so a burst logs one line, not one each.
     pool_reduced: Arc<crate::logging::EventGate>,
     /// Rate-limited reports for checkout failures the manager never sees.
@@ -587,6 +590,7 @@ impl DeadpoolConnectionProvider {
             is_shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             load: Arc::default(),
             pool_reduced: Arc::default(),
+            stat_reserve: Arc::default(),
             checkout_events: Arc::default(),
         }
     }
@@ -699,6 +703,7 @@ impl DeadpoolConnectionProvider {
             is_shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             load: Arc::default(),
             pool_reduced: Arc::default(),
+            stat_reserve: Arc::default(),
             checkout_events: Arc::default(),
         })
     }
@@ -912,6 +917,47 @@ impl DeadpoolConnectionProvider {
     /// Returns [`crate::connection_error::ConnectionError`] when the backend is
     /// skipped as backlogged or no healthy connection is acquired in time.
     pub async fn checkout_for_attempt(
+        &self,
+        budget: super::admission::CheckoutBudget,
+    ) -> Result<
+        crate::pool::connection_guard::IdleConnection,
+        crate::connection_error::ConnectionError,
+    > {
+        use crate::connection_error::ConnectionError;
+
+        let started = tokio::time::Instant::now();
+        let permit = match budget.work() {
+            super::stat_reserve::Work::Light => self.stat_reserve.light(self.max_connections_now()),
+            super::stat_reserve::Work::Download if budget.is_idle_only() => {
+                match self.stat_reserve.try_download(self.max_connections_now()) {
+                    Some(permit) => permit,
+                    None => return Err(self.backlog_skip(self.estimated_wait())),
+                }
+            }
+            super::stat_reserve::Work::Download => {
+                match self
+                    .stat_reserve
+                    .download(|| self.max_connections_now(), budget.wait())
+                    .await
+                {
+                    Some(permit) => permit,
+                    None => {
+                        self.note_pool_wait_timeout();
+                        return Err(ConnectionError::PoolExhausted {
+                            backend: self.name.to_string(),
+                            max_size: self.pool.status().max_size,
+                        });
+                    }
+                }
+            }
+        };
+        let budget = budget.less(started.elapsed());
+        self.checkout_with_budget(budget)
+            .await
+            .map(|conn| conn.with_reserve(permit))
+    }
+
+    async fn checkout_with_budget(
         &self,
         budget: super::admission::CheckoutBudget,
     ) -> Result<
@@ -1170,11 +1216,48 @@ impl DeadpoolConnectionProvider {
         crate::pool::connection_guard::IdleConnection,
         crate::connection_error::ConnectionError,
     > {
+        let wait = self
+            .pool
+            .timeouts()
+            .wait
+            .unwrap_or(std::time::Duration::MAX);
+        let Some(permit) = self
+            .stat_reserve
+            .download(|| self.max_connections_now(), wait)
+            .await
+        else {
+            return Err(crate::connection_error::ConnectionError::PoolExhausted {
+                backend: self.name.to_string(),
+                max_size: self.pool.status().max_size,
+            });
+        };
         let conn = self.get_pooled_connection().await?;
-        Ok(crate::pool::connection_guard::IdleConnection::new(
-            conn,
-            self.clone(),
-        ))
+        Ok(
+            crate::pool::connection_guard::IdleConnection::new(conn, self.clone())
+                .with_reserve(permit),
+        )
+    }
+
+    /// Keep a few connections for STAT probes: downloads may then hold at
+    /// most the pool size minus the reserve. See [`super::stat_reserve`].
+    pub fn enable_stat_reserve(&self) {
+        self.stat_reserve.enable(self.max_connections_now());
+    }
+
+    /// The STAT reserve's current size (0 when off).
+    #[must_use]
+    pub fn stat_reserve_size(&self) -> usize {
+        if self.stat_reserve.is_enabled() {
+            self.stat_reserve.size()
+        } else {
+            0
+        }
+    }
+
+    /// How many connections the pool may hold right now (adaptive cap and
+    /// cooldowns included).
+    fn max_connections_now(&self) -> usize {
+        self.pool.status().max_size
     }
 
     #[must_use]
@@ -2373,6 +2456,58 @@ mod tests {
         assert!(provider.get_pooled_connection().await.is_ok());
     }
 
+    /// With the STAT reserve on, downloads stop at the pool size minus the
+    /// reserve, and a STAT probe still gets a connection at once.
+    #[tokio::test]
+    async fn stat_reserve_keeps_a_connection_for_probes_under_a_full_download() {
+        use super::super::admission::{BacklogPolicy, CheckoutBudget};
+        let addr = spawn_mock_nntp_server().await;
+        let provider = provider_with_cooldown(addr, 4, None);
+        provider.enable_stat_reserve();
+        assert_eq!(provider.stat_reserve_size(), 1);
+        let wait = std::time::Duration::from_millis(100);
+        let download = CheckoutBudget::new(wait, BacklogPolicy::Queue);
+
+        let mut held = Vec::new();
+        for _ in 0..3 {
+            held.push(provider.checkout_for_attempt(download).await.unwrap());
+        }
+        assert!(
+            matches!(
+                provider.checkout_for_attempt(download).await,
+                Err(crate::connection_error::ConnectionError::PoolExhausted { .. })
+            ),
+            "the fourth connection is the reserve"
+        );
+        let started = std::time::Instant::now();
+        let probe = provider
+            .checkout_for_attempt(download.light())
+            .await
+            .expect("a probe takes the reserved connection");
+        assert!(started.elapsed() < wait, "the probe did not wait");
+        probe.release();
+        for conn in held {
+            conn.release();
+        }
+        assert!(provider.checkout_for_attempt(download).await.is_ok());
+    }
+
+    /// Off by default: downloads may hold every connection.
+    #[tokio::test]
+    async fn stat_reserve_is_off_by_default() {
+        use super::super::admission::{BacklogPolicy, CheckoutBudget};
+        let addr = spawn_mock_nntp_server().await;
+        let provider = provider_with_cooldown(addr, 4, None);
+        assert_eq!(provider.stat_reserve_size(), 0);
+        let download =
+            CheckoutBudget::new(std::time::Duration::from_millis(100), BacklogPolicy::Queue);
+        let mut held = Vec::new();
+        for _ in 0..4 {
+            held.push(provider.checkout_for_attempt(download).await.unwrap());
+        }
+        assert_eq!(held.len(), 4);
+    }
+
     #[tokio::test]
     async fn bounded_checkout_wait_does_not_cancel_connection_setup() {
         let wait = std::time::Duration::from_millis(50);
@@ -3236,6 +3371,7 @@ mod tests {
             is_shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             load: Arc::default(),
             pool_reduced: Arc::default(),
+            stat_reserve: Arc::default(),
             checkout_events: Arc::default(),
         }
     }

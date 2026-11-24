@@ -169,6 +169,16 @@ impl NntpProxyBuilder {
             .collect();
 
         let connection_providers = connection_providers?;
+        if self.config.routing.stat_reserve == crate::config::StatReserve::Auto {
+            for provider in &connection_providers {
+                provider.enable_stat_reserve();
+                info!(
+                    "STAT reserve for '{}': {} connection(s) downloads may not hold",
+                    provider.name(),
+                    provider.stat_reserve_size()
+                );
+            }
+        }
 
         let buffer_pool = BufferPool::new(
             BufferSize::try_new(self.buffer_size.unwrap_or(memory.buffer_pool_size))

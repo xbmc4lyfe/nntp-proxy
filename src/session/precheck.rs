@@ -49,6 +49,10 @@ pub(crate) enum DirectResponse {
     SingleLine(Box<[u8]>),
 }
 
+/// A precheck step at least this slow is logged at debug level, so slow
+/// STATs can be told apart: connection wait, backend reply or tier order.
+const SLOW_STEP: std::time::Duration = std::time::Duration::from_millis(300);
+
 /// Result of querying a backend for an article.
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
@@ -237,10 +241,20 @@ async fn bounded_backend_query(
     backend: &ArticleBackend,
     request: &RequestContext,
 ) -> Result<QueryAttemptResult, ()> {
-    let Ok(conn) = provider
+    let checkout_started = tokio::time::Instant::now();
+    let checkout = provider
         .checkout_for_attempt(deps.router.article_admission().probe())
-        .await
-    else {
+        .await;
+    let checkout_wait = checkout_started.elapsed();
+    if checkout_wait >= SLOW_STEP {
+        tracing::debug!(
+            backend = backend.backend_id().as_index(),
+            wait_ms = checkout_wait.as_millis() as u64,
+            ok = checkout.is_ok(),
+            "precheck waited for a connection"
+        );
+    }
+    let Ok(conn) = checkout else {
         return Ok(QueryAttemptResult::Error);
     };
     // The query passes the same instant to its status-line read, so a reply
@@ -564,10 +578,25 @@ async fn query_stat_staggered(
 
     launch_next_tier(&mut next_tier, &learned, &mut pending);
 
+    let started = tokio::time::Instant::now();
     while let Some(result) = pending.next().await {
         let Ok((tier_index, result)) = result else {
             continue;
         };
+        if started.elapsed() >= SLOW_STEP {
+            let (backend, outcome) = match &result {
+                QueryResult::Found(id, _) => (Some(id.as_index()), "found"),
+                QueryResult::Missing(backend) => (Some(backend.backend_id().as_index()), "430"),
+                QueryResult::Error => (None, "error"),
+            };
+            tracing::debug!(
+                ?backend,
+                tier = tiers.get(tier_index).copied(),
+                outcome,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "slow STAT precheck answer"
+            );
+        }
         let answered_430 = match result {
             QueryResult::Found(id, response) => {
                 drain_stat_queries(deps, msg_id, pending);
@@ -602,6 +631,10 @@ async fn query_stat_staggered(
     if all_slots_missing(deps, &tiers, &learned) {
         RacingQueryOutcome::Missing(learned)
     } else {
+        tracing::debug!(
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "STAT precheck inconclusive; routing the STAT"
+        );
         RacingQueryOutcome::Inconclusive(learned)
     }
 }

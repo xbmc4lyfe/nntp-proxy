@@ -81,6 +81,9 @@ pub struct ConnectionGuard {
     /// When the current exchange began, so a completed exchange can feed the
     /// pool's service-time estimate.
     exchange_started: Option<std::time::Instant>,
+    /// Counts this checkout against its backend's STAT reserve until the
+    /// guard is gone.
+    _reserve: Option<crate::pool::stat_reserve::ReservePermit>,
 }
 
 /// A checked-out connection that has not started protocol I/O.
@@ -312,8 +315,15 @@ impl IdleConnection {
                 provider,
                 phase: ConnectionPhase::Idle,
                 exchange_started: None,
+                _reserve: None,
             },
         }
+    }
+
+    /// Attach the checkout's STAT reserve permit.
+    pub(crate) fn with_reserve(mut self, permit: crate::pool::stat_reserve::ReservePermit) -> Self {
+        self.guard._reserve = Some(permit);
+        self
     }
 
     /// Begin a protocol exchange, consuming the idle-only capability.
